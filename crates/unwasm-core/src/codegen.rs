@@ -474,7 +474,7 @@ pub fn generate_host(module: &Module) -> Result<String> {
         .count();
     let _ = writeln!(
         out,
-        "impl Imports for Host {{\n    // {total} methods, {answered} of them answered by the library above\n    // and {} left for you. {} of the module's {} imports are Emscripten\n    // exception trampolines and are generated, so they are not here.",
+        "// A `todo!()` body uses none of its arguments, and a skeleton that\n// warned about every one of them would bury the compiler output a reader\n// needs. The names stay, because they are what you fill the body in with.\n#[allow(unused_variables)]\nimpl Imports for Host {{\n    // {total} methods, {answered} of them answered by the library above\n    // and {} left for you. {} of the module's {} imports are Emscripten\n    // exception trampolines and are generated, so they are not here.",
         total - answered,
         analysis.invokes.len(),
         module.func_imports.len()

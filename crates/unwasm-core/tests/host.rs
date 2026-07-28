@@ -497,3 +497,18 @@ fn the_whole_mechanical_set_is_answered_with_the_real_signatures() {
         assert!(body.contains(expected), "missing `{expected}`:\n{body}");
     }
 }
+
+#[test]
+fn the_skeleton_does_not_warn_about_the_arguments_it_does_not_use() {
+    // A `todo!()` body uses none of its arguments. Compiling the VoIP module's
+    // host produced 162 warnings, which buries the output a reader needs — and
+    // the names have to stay, because they are what the body gets filled in
+    // with.
+    let wasm = common::assemble("host-warnings", SAMPLE);
+    let module = Module::parse(&wasm).expect("valid");
+    let skeleton = codegen::generate_host(&module).expect("generates");
+    assert!(
+        skeleton.contains("#[allow(unused_variables)]\nimpl Imports for Host"),
+        "{skeleton}"
+    );
+}

@@ -732,8 +732,10 @@ import stays the host's to implement.
 - **Compile time still scales with the module**, just not catastrophically:
   23 seconds for 2.0 MiB of wasm. The 9.4 MiB VoIP module would be several
   minutes, if the rest of it were supported.
-- **The VoIP module compiles and instantiates; half its host is written for
-  you.** `unwasm host` implements 51 of its 102 imports — WASI, the C++
+- **The VoIP module compiles, instantiates and runs its `start` with the
+  generated host.** 2.47 million lines of Rust plus a 102-method host, built in
+  21m41s and instantiating 160 pages of shared memory. Half its host is written
+  for you. `unwasm host` implements 51 of its 102 imports — WASI, the C++
   runtime, Emscripten's runtime, embind's registrations — and leaves 51,
   which are WhatsApp's own callbacks, `stat` (a struct layout nobody should
   guess at) and `emscripten_asm_const_*` (which runs JavaScript the module
