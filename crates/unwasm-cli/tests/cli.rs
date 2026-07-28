@@ -743,3 +743,136 @@ fn inspect_prints_a_method_under_its_class_with_its_types() {
     );
     assert!(stdout.contains("class Uint8List"), "{stdout}");
 }
+
+// ---- signatures ----
+
+/// A body long enough to clear the fingerprint floor.
+fn long_body() -> String {
+    let mut text = String::new();
+    for _ in 0..8 {
+        text.push_str(" local.get 0 i32.const 1 i32.add local.set 0");
+    }
+    text.push_str(" local.get 0");
+    text
+}
+
+#[test]
+fn signatures_writes_a_catalogue_and_decompile_reads_it_back() {
+    let named = fixture(
+        "signatures-named",
+        &format!(
+            "(module (func $strlen_like (export \"a\") (param i32) (result i32){}))",
+            long_body()
+        ),
+    );
+    let (ok, stdout, stderr) = run(&["signatures", named.to_str().expect("utf-8 path")]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.trim().ends_with(" strlen_like"), "{stdout}");
+    let (fingerprint, _) = stdout.trim().split_once(' ').expect("<hex> <name>");
+    assert_eq!(fingerprint.len(), 16, "padded, so the file sorts sensibly");
+
+    // Written to a file, that file names the same function in a module that
+    // has no name section of its own.
+    let catalogue = scratch().join("catalogue.txt");
+    let (ok, stdout, stderr) = run(&[
+        "signatures",
+        named.to_str().expect("utf-8 path"),
+        "-o",
+        catalogue.to_str().expect("utf-8 path"),
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("1 signatures"), "{stdout}");
+
+    let anonymous = fixture(
+        "signatures-anonymous",
+        &format!(
+            "(module (func (export \"a\") (param i32) (result i32){}))",
+            long_body()
+        ),
+    );
+    let (ok, stdout, stderr) = run(&[
+        "decompile",
+        anonymous.to_str().expect("utf-8 path"),
+        "--signatures",
+        catalogue.to_str().expect("utf-8 path"),
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("fn f0_strlen_like"), "{stdout}");
+}
+
+#[test]
+fn signatures_says_so_when_there_is_nothing_to_catalogue() {
+    let path = fixture("signatures-nothing", SAMPLE);
+    let (ok, _, stderr) = run(&["signatures", path.to_str().expect("utf-8 path")]);
+    assert!(!ok, "a catalogue of nothing is a mistake, not a result");
+    assert!(stderr.contains("names none of its functions"), "{stderr}");
+    assert!(stderr.contains("-g2"), "and says how to fix it: {stderr}");
+}
+
+#[test]
+fn signatures_rejects_arguments_it_does_not_know() {
+    let path = fixture("signatures-args", SAMPLE);
+    let (ok, _, stderr) = run(&["signatures", path.to_str().expect("utf-8 path"), "--wat"]);
+    assert!(!ok);
+    assert!(stderr.contains("unexpected argument `--wat`"), "{stderr}");
+
+    let (ok, _, stderr) = run(&["signatures"]);
+    assert!(!ok);
+    assert!(stderr.contains("needs a module path"), "{stderr}");
+
+    let (ok, _, stderr) = run(&["signatures", path.to_str().expect("utf-8 path"), "-o"]);
+    assert!(!ok);
+    assert!(stderr.contains("-o needs a path"), "{stderr}");
+}
+
+#[test]
+fn a_catalogue_that_is_not_one_is_refused_with_the_line_that_is_wrong() {
+    let path = fixture("signatures-bad-catalogue", SAMPLE);
+    let broken = scratch().join("broken.txt");
+
+    std::fs::write(&broken, "deadbeef strlen\nnotafingerprint x\n").expect("writing");
+    let (ok, _, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--signatures",
+        broken.to_str().expect("utf-8 path"),
+    ]);
+    assert!(!ok);
+    assert!(
+        stderr.contains(":2: `notafingerprint` is not a fingerprint"),
+        "{stderr}"
+    );
+
+    std::fs::write(&broken, "\nlonely\n").expect("writing");
+    let (ok, _, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--signatures",
+        broken.to_str().expect("utf-8 path"),
+    ]);
+    assert!(!ok);
+    assert!(
+        stderr.contains(":2: expected `<fingerprint> <name>`"),
+        "a blank line is skipped, and the count still points at line 2: {stderr}"
+    );
+
+    let (ok, _, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--signatures",
+        "/nonexistent/catalogue.txt",
+    ]);
+    assert!(!ok);
+    assert!(
+        stderr.contains("reading /nonexistent/catalogue.txt"),
+        "{stderr}"
+    );
+
+    let (ok, _, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--signatures",
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("--signatures needs a path"), "{stderr}");
+}

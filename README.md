@@ -375,6 +375,51 @@ $ unwasm table voip.wasm --type "(i32,i32,i32) -> ()"
 
 Each function also says where it sits: `/// In the function table at slot 7897`.
 
+### Recognising library code, and what that is actually worth
+
+Most of a 9 MiB module is not the application: it is libc, libc++ and whatever
+else was linked in. Those halves have names in a module you build yourself, and
+none at all in a shipped one — but the bodies are the same code. A **signature
+catalogue** carries the names across.
+
+```console
+$ emcc -g2 ... -o reference.wasm       # a build of your own, names kept
+$ unwasm signatures reference.wasm -o libc.sigs
+wrote libc.sigs (1841 signatures)
+$ unwasm decompile voip.wasm -o out/ --signatures libc.sigs
+```
+
+A fingerprint is the opcode sequence with everything a rebuild renumbers left
+out: constants, load and store offsets, callee indices, global and data-segment
+indices. What stays is the shape — the operators, the control flow, and the
+*kind* of each access, since a byte load and a word load are not the same
+function however alike the rest reads.
+
+The measurements, because the honest answer is "narrower than it sounds":
+
+| catalogue from | matches |
+| --- | --- |
+| another build of the same source, same toolchain | ~91% |
+| a different emscripten version | 2 of 33 |
+
+End to end, a catalogue of the 14 functions one `printf` drags in, applied to a
+236 KiB capture built by a different emscripten version, names two of its 478:
+`__towrite` and `frexp` — both leaves, both plausible, and both a rounding error
+against the module. `tests/captured.rs` runs exactly that.
+
+So a match is strong evidence and a miss is no evidence at all. This names
+functions; it never marks one as unrecognised, and it never overrides a name the
+module gave itself. A fingerprint two differently-named functions share is
+dropped rather than resolved — the constants were what told them apart, and the
+constants are exactly what a fingerprint leaves out. Functions shorter than
+twenty instructions are not catalogued at all, since every *return the first
+argument* in a module fingerprints alike.
+
+A coarser fingerprint was tried to close the cross-version gap and abandoned:
+matched against a module sharing no code whatsoever it produced seven matches
+out of ten, so what it closed was noise. Build the reference yourself; do not
+expect a catalogue to recognise someone else's toolchain.
+
 ## Usage
 
 ```console
@@ -385,6 +430,8 @@ $ unwasm decompile module.wasm    # to stdout
 $ unwasm decompile module.wasm -o out.rs      # one file
 $ unwasm decompile module.wasm -o out/        # mod.rs, parts, names.json
 $ unwasm decompile module.wasm -o out/ --only 10532,12114
+$ unwasm signatures reference.wasm -o libc.sigs   # a catalogue, from a build with names
+$ unwasm decompile module.wasm --signatures libc.sigs
 ```
 
 The output is a self-contained Rust module — no dependencies, runtime embedded:
@@ -448,7 +495,7 @@ those are compared as `nan`, not as bits.
 ## Building and testing
 
 ```sh
-cargo test --workspace                                  # 178 tests, ~15s
+cargo test --workspace                                  # 393 tests, ~15s
 cargo test --test captured -- --ignored --nocapture     # the real modules
 cargo test --test emscripten -- --ignored --nocapture   # the real toolchain
 cargo clippy --workspace --all-targets -- -D warnings
@@ -576,9 +623,11 @@ import stays the host's to implement.
   patterns, vtables from `call_indirect` plus the element segments, class names
   from the C++ RTTI in the data segments, and embind's `_embind_register_*`
   calls — which are high-level types the binary declares about itself.
-- **Library identification.** A FLIRT-like signature over normalised opcode
-  sequences, so libc, libc++, libjpeg and PJSIP are recognised and *not*
-  decompiled. On a 9 MiB module that is most of the output.
+- **Leaving recognised library code out.** `--signatures` names it; it is still
+  decompiled in full. Stubbing it instead would cut most of the output on a
+  9 MiB module — but only for a run that is being read rather than run, and only
+  where the catalogue's recall can be trusted, which across toolchains it
+  cannot.
 
 Every one of those is a guess about intent. They are only worth attempting on
 top of something already known to run — which is what level 0 is for, and why

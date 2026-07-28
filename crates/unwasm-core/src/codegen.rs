@@ -318,7 +318,29 @@ pub fn generate(module: &Module) -> Result<String> {
 ///
 /// As [`generate`].
 pub fn generate_files(module: &Module, layout: Layout) -> Result<Vec<GeneratedFile>> {
-    Generator::new(module, layout).run()
+    generate_with(module, layout, None, &Signatures::new())
+}
+
+/// Generates with both selections a caller can make: which functions to write
+/// out in full, and what to name the ones the module does not name.
+///
+/// The other four entry points are this one with one or both left out. They
+/// exist because most callers want one of the two, and combining them is
+/// otherwise four functions rather than one.
+///
+/// # Errors
+///
+/// As [`generate`].
+pub fn generate_with(
+    module: &Module,
+    layout: Layout,
+    only: Option<&std::collections::BTreeSet<u32>>,
+    signatures: &Signatures,
+) -> Result<Vec<GeneratedFile>> {
+    let mut generator = Generator::new(module, layout);
+    generator.only = only.cloned();
+    generator.signatures = signatures.clone();
+    generator.run()
 }
 
 /// Generates only the named functions, leaving the rest as stubs.
@@ -336,9 +358,64 @@ pub fn generate_only(
     layout: Layout,
     only: &std::collections::BTreeSet<u32>,
 ) -> Result<Vec<GeneratedFile>> {
-    let mut generator = Generator::new(module, layout);
-    generator.only = Some(only.clone());
-    generator.run()
+    generate_with(module, layout, Some(only), &Signatures::new())
+}
+
+/// A catalogue of fingerprints to names, for recognising library code.
+///
+/// Built from a module that kept its name section — usually one compiled on
+/// purpose with the same toolchain as the target. What it buys is a real name
+/// for a function that has none: `memcpy` rather than `f8421`.
+pub type Signatures = std::collections::HashMap<u64, String>;
+
+/// Extracts a signature catalogue from a module that has names.
+///
+/// Only functions long enough to be distinctive, and only ones the module
+/// names — there is nothing to catalogue otherwise.
+///
+/// A fingerprint two differently-named functions share is dropped rather than
+/// resolved: the constants are what told them apart, and they are exactly what
+/// the fingerprint leaves out. Keeping either name would put a wrong one on
+/// half the matches, and a wrong name is worse than `f8421`.
+#[must_use]
+pub fn extract_signatures(module: &Module) -> Signatures {
+    let import_count = module.func_imports.len() as u32;
+    let mut signatures = Signatures::new();
+    let mut ambiguous = std::collections::HashSet::new();
+    for (at, func) in module.funcs.iter().enumerate() {
+        if func.body.len() < analysis::FINGERPRINT_FLOOR {
+            continue;
+        }
+        let Some(name) = module.func_name(import_count + at as u32) else {
+            continue;
+        };
+        let fingerprint = analysis::fingerprint(func);
+        match signatures.get(&fingerprint) {
+            Some(existing) if existing == name => {}
+            Some(_) => {
+                signatures.remove(&fingerprint);
+                ambiguous.insert(fingerprint);
+            }
+            None if ambiguous.contains(&fingerprint) => {}
+            None => {
+                signatures.insert(fingerprint, name.to_string());
+            }
+        }
+    }
+    signatures
+}
+
+/// Generates with a signature catalogue, naming what it recognises.
+///
+/// # Errors
+///
+/// As [`generate`].
+pub fn generate_with_signatures(
+    module: &Module,
+    layout: Layout,
+    signatures: &Signatures,
+) -> Result<Vec<GeneratedFile>> {
+    generate_with(module, layout, None, signatures)
 }
 
 struct Generator<'a> {
@@ -349,6 +426,10 @@ struct Generator<'a> {
     parts: Vec<GeneratedFile>,
     /// Which functions to decompile, when only some were asked for.
     only: Option<std::collections::BTreeSet<u32>>,
+    /// Fingerprints of known library code, to name what it recognises.
+    signatures: Signatures,
+    /// The names those fingerprints matched, by function index.
+    recognised: std::collections::BTreeMap<u32, String>,
     /// Where each function ended up, for the index.
     located: Vec<(u32, String, String, usize)>,
 }
@@ -362,11 +443,35 @@ impl<'a> Generator<'a> {
             out: String::new(),
             parts: Vec::new(),
             only: None,
+            signatures: Signatures::new(),
+            recognised: Default::default(),
             located: Vec::new(),
         }
     }
 
+    /// Matches the module's functions against the signature catalogue.
+    fn recognise(&mut self) {
+        if self.signatures.is_empty() {
+            return;
+        }
+        let import_count = self.module.func_imports.len() as u32;
+        for (at, func) in self.module.funcs.iter().enumerate() {
+            if func.body.len() < analysis::FINGERPRINT_FLOOR {
+                continue;
+            }
+            let index = import_count + at as u32;
+            // What the module says about itself wins; this fills gaps.
+            if self.module.func_name(index).is_some() {
+                continue;
+            }
+            if let Some(name) = self.signatures.get(&analysis::fingerprint(func)) {
+                self.recognised.insert(index, name.clone());
+            }
+        }
+    }
+
     fn run(mut self) -> Result<Vec<GeneratedFile>> {
+        self.recognise();
         self.header();
         self.registered_api();
         self.shared_state();
@@ -403,11 +508,16 @@ impl<'a> Generator<'a> {
                 .filter(|(_, func)| *func == index)
                 .map(|(slot, _)| slot.to_string())
                 .collect();
-            let source = match self.analysis.derived_names.get(index).map(|d| d.source) {
-                Some(crate::analysis::NameSource::Assert) => "assert",
-                Some(crate::analysis::NameSource::Message { .. }) => "message",
-                None if self.module.func_name(*index).is_some() => "name section",
-                None => "none",
+            let source = if self.module.func_name(*index).is_some() {
+                "name section"
+            } else if self.recognised.contains_key(index) {
+                "signature"
+            } else {
+                match self.analysis.derived_names.get(index).map(|d| d.source) {
+                    Some(crate::analysis::NameSource::Assert) => "assert",
+                    Some(crate::analysis::NameSource::Message { .. }) => "message",
+                    None => "none",
+                }
             };
             let numbers = |set: &std::collections::BTreeSet<u32>| {
                 set.iter()
@@ -724,7 +834,7 @@ impl<'a> Generator<'a> {
             let _ = writeln!(
                 self.out,
                 "        instance.{}();",
-                function_ident(start, &self.analysis)
+                function_ident_with(start, &self.analysis, &self.recognised)
             );
         }
         self.out.push_str("        instance\n    }\n\n");
@@ -763,7 +873,7 @@ impl<'a> Generator<'a> {
                     let body = self.function(index, func)?;
                     self.located.push((
                         index,
-                        function_ident(index, &self.analysis),
+                        function_ident_with(index, &self.analysis, &self.recognised),
                         "mod.rs".to_string(),
                         self.out.lines().count() + 1,
                     ));
@@ -798,7 +908,7 @@ impl<'a> Generator<'a> {
             let file = format!("part{}.rs", self.parts.len());
             self.located.push((
                 index,
-                function_ident(index, &self.analysis),
+                function_ident_with(index, &self.analysis, &self.recognised),
                 file,
                 lines + 5,
             ));
@@ -872,7 +982,7 @@ impl<'a> Generator<'a> {
                 escape_doc(&export.name),
                 signature_of(ty),
                 return_type(ty),
-                function_ident(export.index, &self.analysis),
+                function_ident_with(export.index, &self.analysis, &self.recognised),
                 args.join(", ")
             );
         }
@@ -963,11 +1073,12 @@ impl<'a> Generator<'a> {
                 .global,
             &self.analysis,
         );
-        let set_threw_ident = function_ident(
+        let set_threw_ident = function_ident_with(
             self.analysis
                 .set_threw
                 .expect("a trampoline is only generated with one"),
             &self.analysis,
+            &self.recognised,
         );
         let zero = ty.results.first().map_or("", |result| result.zero());
 
@@ -1020,7 +1131,7 @@ impl<'a> Generator<'a> {
                 let _ = writeln!(
                     self.out,
                     "            Some({index}) => self.{}({}),",
-                    function_ident(index, &self.analysis),
+                    function_ident_with(index, &self.analysis, &self.recognised),
                     args.join(", ")
                 );
             }
@@ -1074,7 +1185,12 @@ impl<'a> Generator<'a> {
             let named: Vec<String> = callers
                 .iter()
                 .take(NAMED)
-                .map(|caller| format!("`{}`", function_ident(*caller, &self.analysis)))
+                .map(|caller| {
+                    format!(
+                        "`{}`",
+                        function_ident_with(*caller, &self.analysis, &self.recognised)
+                    )
+                })
                 .collect();
             let _ = writeln!(
                 out,
@@ -1090,7 +1206,12 @@ impl<'a> Generator<'a> {
             let named: Vec<String> = calls
                 .iter()
                 .take(NAMED)
-                .map(|callee| format!("`{}`", function_ident(*callee, &self.analysis)))
+                .map(|callee| {
+                    format!(
+                        "`{}`",
+                        function_ident_with(*callee, &self.analysis, &self.recognised)
+                    )
+                })
                 .collect();
             let through_the_table = indirect
                 .map(|types| {
@@ -1145,6 +1266,15 @@ impl<'a> Generator<'a> {
         let mut out = String::new();
         if let Some(name) = self.module.func_name(index) {
             let _ = writeln!(out, "    /// `{}`", escape_doc(name));
+        } else if let Some(name) = self.recognised.get(&index) {
+            // Recognised by its shape, not by anything the module said. The
+            // catalogue is only as good as the toolchain it came from, so the
+            // comment says where the name is from.
+            let _ = writeln!(
+                out,
+                "    /// Function #{index}, recognised as `{}`: its body fingerprints\n    /// identically to that function in the signature catalogue.",
+                escape_doc(name)
+            );
         } else if let Some(derived) = self.analysis.derived_names.get(&index) {
             // The name is a guess, so the reason travels with it. Without the
             // evidence a reader has to take `parse_xmpp_offer` on trust, and
@@ -1225,14 +1355,24 @@ impl<'a> Generator<'a> {
         let _ = writeln!(
             out,
             "    pub(crate) fn {}(&mut self{}) {} {{",
-            function_ident(index, &self.analysis),
+            function_ident_with(index, &self.analysis, &self.recognised),
             signature_of(ty),
             return_type(ty)
         );
 
         let asked_for = self.only.as_ref().is_none_or(|only| only.contains(&index));
         if asked_for {
-            out.push_str(&Body::new(self.module, &self.analysis, func, ty, index).emit()?);
+            out.push_str(
+                &Body::new(
+                    self.module,
+                    &self.analysis,
+                    &self.recognised,
+                    func,
+                    ty,
+                    index,
+                )
+                .emit()?,
+            );
         } else {
             // Not decompiled, and saying so rather than looking decompiled. The
             // signature and the name stay, so callers still compile and the
@@ -1335,6 +1475,9 @@ struct Frame {
 struct Body<'a> {
     module: &'a Module,
     analysis: &'a Analysis,
+    /// Names a signature catalogue recognised, so a call site spells the callee
+    /// the same way its definition does.
+    recognised: &'a std::collections::BTreeMap<u32, String>,
     /// This function's C stack frame, when it has one.
     frame: Option<&'a StackFrame>,
     func: &'a Func,
@@ -1358,6 +1501,7 @@ impl<'a> Body<'a> {
     fn new(
         module: &'a Module,
         analysis: &'a Analysis,
+        recognised: &'a std::collections::BTreeMap<u32, String>,
         func: &'a Func,
         ty: &'a crate::module::FuncType,
         index: u32,
@@ -1365,6 +1509,7 @@ impl<'a> Body<'a> {
         Self {
             module,
             analysis,
+            recognised,
             frame: analysis.frames.get(&index),
             func,
             ty,
@@ -2042,7 +2187,7 @@ impl<'a> Body<'a> {
         self.spill_stack();
         let call = format!(
             "self.{}({})",
-            function_ident(index, self.analysis),
+            function_ident_with(index, self.analysis, self.recognised),
             arguments
                 .iter()
                 .map(|value| value.code.clone())
@@ -2239,6 +2384,18 @@ pub fn function_ident(index: u32, analysis: &Analysis) -> String {
     match analysis.derived_names.get(&index) {
         Some(derived) => format!("f{index}_{}", sanitize(&derived.name)),
         None => format!("f{index}"),
+    }
+}
+
+/// As [`function_ident`], with a name a signature catalogue recognised.
+fn function_ident_with(
+    index: u32,
+    analysis: &Analysis,
+    recognised: &std::collections::BTreeMap<u32, String>,
+) -> String {
+    match recognised.get(&index) {
+        Some(name) => format!("f{index}_{}", sanitize(name)),
+        None => function_ident(index, analysis),
     }
 }
 

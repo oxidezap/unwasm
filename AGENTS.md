@@ -235,23 +235,27 @@ them would turn "could reach anything with this shape" into "calls this", which
 is a much stronger claim than the module makes. What a signature could reach is
 the table's business, and `unwasm table --type` is where to ask.
 
+## A fingerprint is precise and has poor recall
+
+`analysis::fingerprint` is the opcode sequence with everything a rebuild
+renumbers left out. Across builds of the same toolchain it matches ~91%; across
+emscripten versions, 2 of 33. Do not try to close that gap by coarsening it —
+that was tried, and against a module sharing no code at all it matched seven of
+ten. Precision is the whole value: a wrong name is worse than `f8421`, which is
+also why a fingerprint two names share is dropped rather than resolved, and why
+what the module says about itself is never overridden.
+
 ## Open work
 
 1. **Host the VoIP module.** `unwasm host` writes the skeleton; what is left is
    filling it. 67 of the 102 are mechanical (WASI, the C++ runtime, Emscripten's
    runtime, embind/emval) and `wa-wasm-oracle` implements most of them already.
    35 are WhatsApp's own callbacks and only the application can answer those.
-2. **Read what embind registers.** The `_embind_register_*` calls are the one
-   place a stripped module describes its own high-level API — classes, methods,
-   signatures. `wa-wasm-oracle` recovers this at run time; doing it statically
-   would name types, not just functions.
-3. **Promote frame slots to variables**, with the caveat recorded above about
-   byte-exactness.
-4. **Identify library code** so libc, libc++ and PJSIP are recognised and left
-   undecompiled. On a 9 MiB module that is most of the output.
 2. **Level 1 proper**: turn shadow-stack slots into named locals, now that the
    stack pointer is identified. The frame size is in the prologue; what is
-   missing is tracking which offsets from it are distinct variables.
-3. **Library identification.** A FLIRT-like signature over normalised opcode
-   sequences would let libc, libc++ and PJSIP be recognised and left
-   undecompiled. On a 9 MiB module that is most of the output.
+   missing is tracking which offsets from it are distinct variables — with the
+   caveat recorded above about byte-exactness.
+3. **Leave recognised library code out.** `unwasm signatures` names it, but it
+   is still decompiled in full. Stubbing it would cut most of a 9 MiB module —
+   for a run being read, not run, and only as far as the catalogue's recall
+   goes.

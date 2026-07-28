@@ -17,6 +17,7 @@ usage:
   unwasm host      <module.wasm> [-o <host.rs>]
   unwasm table     <module.wasm> [--type <signature>]
   unwasm calls     <module.wasm> <index>
+  unwasm signatures <module.wasm> [-o <sigs.txt>]
   unwasm inspect   <module.wasm>
 
   -o <out>       a path ending in .rs writes one file; any other path is a
@@ -25,6 +26,7 @@ usage:
   --split <n>    roughly how many lines to put in each part file. Implies a
                  directory. Without it, a directory gets the layout the
                  module's size calls for.
+  --signatures <file>  name library code using a catalogue from `signatures`.
   --only <list>  decompile only these function indices, comma-separated. The
                  rest keep their signatures and become `unimplemented!()`, so
                  the result still compiles - for reading three functions out of
@@ -38,6 +40,14 @@ grepping the output.
 signature. `call_indirect` takes a table index rather than a function index, so
 this is what says which slot a call site reaches — and which slot a callback
 has to go into. `--type \"(i32,i32,i32)->()\"` narrows it to one signature.
+
+`signatures` writes a catalogue of fingerprint-to-name from a module that kept
+its names, and `decompile --signatures <file>` uses one to name library code in
+a module that did not. A fingerprint is the shape of a function's body with the
+things that move between builds left out. It matches ~91% across builds of the
+same toolchain and only a handful across different emscripten versions, so it
+is worth generating from a build of your own rather than expecting it to
+recognise someone else's.
 
 `calls` answers the question a call site cannot: what reaches this function.
 The module says what each function calls; nothing in it says what calls a given
@@ -79,6 +89,7 @@ fn run(arguments: &[String]) -> Result<String, String> {
         Some("host") => host(&arguments[1..]),
         Some("table") => table(&arguments[1..]),
         Some("calls") => calls(&arguments[1..]),
+        Some("signatures") => signatures(&arguments[1..]),
         Some("inspect") => inspect(&arguments[1..]),
         Some("-h" | "--help" | "help") | None => Ok(USAGE.to_string()),
         Some(other) => Err(format!("unknown command `{other}`\n\n{USAGE}")),
@@ -90,6 +101,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
     let mut destination = None;
     let mut split = None;
     let mut only: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let mut catalogue: Option<codegen::Signatures> = None;
     let mut rest = arguments[1..].iter();
     while let Some(argument) = rest.next() {
         match argument.as_str() {
@@ -103,6 +115,10 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
                         .parse::<usize>()
                         .map_err(|_| format!("--split needs a number, not `{value}`"))?,
                 );
+            }
+            "--signatures" => {
+                let value = rest.next().ok_or("--signatures needs a path")?;
+                catalogue = Some(read_signatures(value)?);
             }
             "--only" => {
                 let value = rest.next().ok_or("--only needs a list of indices")?;
@@ -126,12 +142,17 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
         if split.is_some() {
             return Err("--split writes several files, so it needs -o <directory>".to_string());
         }
-        if !only.is_empty() {
-            let files = codegen::generate_only(&module, codegen::Layout::Single, &only)
-                .map_err(|error| error.to_string())?;
-            return Ok(files[0].contents.clone());
+        if only.is_empty() && catalogue.is_none() {
+            return codegen::generate(&module).map_err(|error| error.to_string());
         }
-        return codegen::generate(&module).map_err(|error| error.to_string());
+        let files = codegen::generate_with(
+            &module,
+            codegen::Layout::Single,
+            (!only.is_empty()).then_some(&only),
+            catalogue.as_ref().unwrap_or(&codegen::Signatures::new()),
+        )
+        .map_err(|error| error.to_string())?;
+        return Ok(files[0].contents.clone());
     };
 
     // A `.rs` destination is one file; anything else is a directory. The
@@ -147,11 +168,12 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
         }
     };
 
-    let files = if only.is_empty() {
-        codegen::generate_files(&module, layout)
-    } else {
-        codegen::generate_only(&module, layout, &only)
-    }
+    let files = codegen::generate_with(
+        &module,
+        layout,
+        (!only.is_empty()).then_some(&only),
+        catalogue.as_ref().unwrap_or(&codegen::Signatures::new()),
+    )
     .map_err(|error| error.to_string())?;
     let lines: usize = files.iter().map(|file| file.contents.lines().count()).sum();
 
@@ -208,6 +230,65 @@ fn host(arguments: &[String]) -> Result<String, String> {
         }
         None => Ok(skeleton),
     }
+}
+
+fn signatures(arguments: &[String]) -> Result<String, String> {
+    let path = arguments.first().ok_or("signatures needs a module path")?;
+    let mut destination = None;
+    let mut rest = arguments[1..].iter();
+    while let Some(argument) = rest.next() {
+        match argument.as_str() {
+            "-o" | "--output" => {
+                destination = Some(rest.next().ok_or("-o needs a path")?.clone());
+            }
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+    }
+
+    let module = read(path)?;
+    let catalogue = codegen::extract_signatures(&module);
+    if catalogue.is_empty() {
+        return Err(format!(
+            "{path} names none of its functions, so there is nothing to catalogue. \
+             Build the reference with `-g2` to keep the name section."
+        ));
+    }
+    let mut lines: Vec<String> = catalogue
+        .iter()
+        .map(|(fingerprint, name)| format!("{fingerprint:016x} {name}"))
+        .collect();
+    lines.sort();
+    let text = format!("{}\n", lines.join("\n"));
+
+    match destination {
+        Some(destination) => {
+            std::fs::write(&destination, &text)
+                .map_err(|error| format!("writing {destination}: {error}"))?;
+            Ok(format!(
+                "wrote {destination} ({} signatures)\n",
+                catalogue.len()
+            ))
+        }
+        None => Ok(text),
+    }
+}
+
+/// Reads a catalogue back.
+fn read_signatures(path: &str) -> Result<codegen::Signatures, String> {
+    let text = std::fs::read_to_string(path).map_err(|error| format!("reading {path}: {error}"))?;
+    let mut catalogue = codegen::Signatures::new();
+    for (at, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (fingerprint, name) = line
+            .split_once(' ')
+            .ok_or_else(|| format!("{path}:{}: expected `<fingerprint> <name>`", at + 1))?;
+        let fingerprint = u64::from_str_radix(fingerprint, 16)
+            .map_err(|_| format!("{path}:{}: `{fingerprint}` is not a fingerprint", at + 1))?;
+        catalogue.insert(fingerprint, name.to_string());
+    }
+    Ok(catalogue)
 }
 
 fn calls(arguments: &[String]) -> Result<String, String> {

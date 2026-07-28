@@ -134,3 +134,87 @@ fn main() {
         bytes_of_memory
     );
 }
+
+#[test]
+#[ignore = "needs emcc and the capture directory"]
+fn a_catalogue_from_our_own_emscripten_names_musl_in_a_capture() {
+    // End to end, at the scale it is meant for: build a reference with names,
+    // catalogue it, and apply it to a stripped 236 KiB capture that was built
+    // by a different emscripten version. The numbers here are the honest ones —
+    // a handful out of hundreds — and the point of the test is that the
+    // pipeline works and that a match is a *plausible* one, not that recall is
+    // good. See the fingerprint doc comment for the measurements.
+    let Some(capture) = common::captured("COs9e0Kj0ic") else {
+        eprintln!("skipping: capture unavailable (set WA_WASM_DIR)");
+        return;
+    };
+    let reference = common::compile_emscripten(
+        "signature-reference",
+        r#"#include <stdio.h>
+           #include <stdlib.h>
+           #include <string.h>
+           #include <math.h>
+           // Exported rather than `main`, because the harness passes
+           // `--no-entry` and an entry point nothing exports is dropped whole.
+           __attribute__((export_name("go")))
+           int go(int n) {
+               char *p = malloc(64);
+               strcpy(p, "x");
+               printf("%s %f %d\n", p, sqrt((double)n), (int)strlen(p));
+               free(p);
+               return n;
+           }"#,
+        "c",
+        // `-g2` keeps the name section; without it there is nothing to
+        // catalogue, and `signatures` says so rather than writing an empty file.
+        &["-O2", "-g2"],
+    );
+
+    let reference = Module::parse(&reference).expect("the reference decodes");
+    let catalogue = codegen::extract_signatures(&reference);
+    assert!(
+        catalogue.len() > 5,
+        "a libc of one printf is still a few functions: {catalogue:?}"
+    );
+
+    let capture = Module::parse(&capture).expect("the capture decodes");
+    let named = codegen::generate_with_signatures(&capture, codegen::Layout::Single, &catalogue)
+        .expect("generates");
+    let plain = codegen::generate_files(&capture, codegen::Layout::Single).expect("generates");
+
+    let recognised: Vec<&str> = named[0]
+        .contents
+        .lines()
+        .filter_map(|line| line.split_once("recognised as `"))
+        .filter_map(|(_, rest)| rest.split_once('`'))
+        .map(|(name, _)| name)
+        .collect();
+    eprintln!("recognised {}: {recognised:?}", recognised.len());
+    assert!(
+        !recognised.is_empty(),
+        "across emscripten versions this is a handful, but it is not zero"
+    );
+    assert!(
+        recognised
+            .iter()
+            .all(|name| catalogue.values().any(|v| v == name)),
+        "every name claimed came from the catalogue"
+    );
+
+    // A name is a name: with the doc comments dropped and the recognised names
+    // spelled back out of the identifiers, the two are the same file. This is
+    // the same property the differential tests hold over the annotations —
+    // recognising a function must not change what it does.
+    let strip = |text: &str| -> String {
+        let mut text: String = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("///"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        for name in &recognised {
+            text = text.replace(&format!("_{name}"), "");
+        }
+        text
+    };
+    assert_eq!(strip(&named[0].contents), strip(&plain[0].contents));
+}
