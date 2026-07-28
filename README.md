@@ -60,6 +60,9 @@ Concretely:
 - **The whole MVP instruction set**, plus sign extension and the saturating
   truncations: 136 numeric opcodes, all of memory, `call_indirect`, `br_table`,
   passive segments.
+- **Threads, as far as one thread can go**: shared and imported memories, and
+  all 67 atomic instructions. See below for where that stops being faithful and
+  what happens there.
 - **Structure is taken, not recovered.** wasm's `block`/`loop`/`if` become
   Rust's labelled blocks and loops; `br` becomes `break 'bN` or `continue 'bN`.
   There is no CFG reconstruction in this codebase, because there is no CFG in
@@ -75,8 +78,7 @@ Concretely:
 
 ### On the real modules
 
-Five of the six WhatsApp Web captures decompile, and the sixth is refused by
-name:
+Every WhatsApp Web capture decompiles:
 
 ```
 COs9e0Kj0ic:   478 functions,  73703 lines of Rust  (VOPRF/crypto, 236 KiB)
@@ -84,8 +86,11 @@ php8T1oSIZM:   321 functions,  79486 lines          (mozjpeg, 376 KiB)
 9Nbh3eMuVjD:  7865 functions, 977766 lines          (2.9 MiB)
 ayqr5HQtlkb:  3055 functions, 660186 lines          (2.0 MiB)
 rogm88TRRiw:  2157 functions, 508994 lines          (2.1 MiB)
-D5pLH9sfOOl:  refused — shared imported memory      (VoIP/PJSIP, 9.4 MiB)
+D5pLH9sfOOl: 13347 functions, 3611088 lines         (VoIP/PJSIP, 9.4 MiB)
 ```
+
+All six decompile. The last one took a shared imported memory and 1070 atomic
+instructions; see below.
 
 `COs9e0Kj0ic` compiles with rustc in about 2.5 seconds and instantiates, which
 runs the module's own `__wasm_call_ctors` and every static initialiser with it.
@@ -283,16 +288,37 @@ toolchain we target emits), and two checks that the decoder already guarantees.
 Both are kept. Deleting a defence to raise a percentage is how a decoder change
 becomes a panic two years later.
 
+### Atomics on one thread
+
+A decompilation runs one thread, and under one thread almost every atomic does
+exactly what its plain counterpart does — there is nobody to interleave with.
+Three things are not "almost":
+
+- **Alignment.** An atomic access must be naturally aligned or it traps, where a
+  plain one is happy anywhere. That is a real behavioural difference and it is
+  in the runtime, with tests on both sides of it.
+- **`memory.atomic.notify`** wakes zero threads. Not a stub returning zero — the
+  correct answer when nobody else is running.
+- **`memory.atomic.wait32`/`wait64`** is exactly right in two of its three
+  outcomes: the value already changed (`1`, and no waiting was needed), or the
+  timeout was zero (`2`, which expires immediately whoever is running). The
+  third would end only when another thread notifies, and there is no other
+  thread — so it traps, saying that. Returning "timed out" there would be
+  inventing an event that did not happen.
+
+All 67 are compared instruction by instruction against V8 running a real shared
+memory, so the two sides differ only where the thread count makes them.
+
 ## Known limits
 
 - **Compile time still scales with the module**, just not catastrophically:
   23 seconds for 2.0 MiB of wasm. The 9.4 MiB VoIP module would be several
   minutes, if the rest of it were supported.
-- **The VoIP module needs the whole threading model.** It imports
-  `(memory 160 32768 shared)` and its `target_features` asks for `atomics`,
-  `reference-types` and `multivalue`. Imported memory alone would not be
-  enough, and what "faithful" means for atomics in a single-threaded target is
-  a design question rather than an implementation one.
+- **The VoIP module decompiles but cannot yet run**: it needs 228 host imports,
+  of which 125 are `invoke_*` exception trampolines that could be generated
+  mechanically. Its `target_features` also asks for `reference-types` and
+  `multivalue`, but the module uses neither — one `funcref` declaration and zero
+  multi-result blocks in 13347 functions.
 - **No SIMD, no reference types, no exceptions, no multi-value.** Each is
   refused by name.
 - **Level 0 only.** Linear memory is bytes; a C local that lived in the shadow

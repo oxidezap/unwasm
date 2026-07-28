@@ -336,10 +336,16 @@ impl<'a> Generator<'a> {
     fn instance_impl(&mut self) -> Result<()> {
         self.out
             .push_str("impl<H: Imports> Instance<H> {\n    /// Instantiates the module: memory, data segments, table, then `start`.\n    pub fn with_host(host: H) -> Self {\n");
-        let memory = self.module.memory.unwrap_or(crate::module::MemoryDef {
-            min_pages: 0,
-            max_pages: None,
-        });
+        let memory = self
+            .module
+            .memory
+            .clone()
+            .unwrap_or(crate::module::MemoryDef {
+                min_pages: 0,
+                max_pages: None,
+                shared: false,
+                imported: None,
+            });
         let max = match memory.max_pages {
             Some(pages) => format!("Some({pages})"),
             None => "None".to_string(),
@@ -1210,7 +1216,113 @@ impl<'a> Body<'a> {
                 // disagree on exactly that call.
                 self.line(&format!("self.data_dropped[{segment}] = true;"));
             }
+            Op::Atomic { op: atomic, mem } => self.emit_atomic(*atomic, mem.offset)?,
+            Op::AtomicFence => {
+                // A fence orders memory between threads. With one thread there
+                // is nothing to order — but it is recorded rather than dropped,
+                // because "the module asked for a fence here" is a fact about
+                // the module.
+                self.line("// atomic.fence: nothing to order on a single thread");
+            }
             Op::Num(num) => self.emit_num(*num)?,
+        }
+        Ok(())
+    }
+
+    /// Emits one atomic instruction.
+    ///
+    /// Under a single thread the arithmetic is the plain arithmetic; what the
+    /// runtime adds is the alignment check, which an atomic has and its plain
+    /// counterpart does not. The two blocking instructions are the only place
+    /// the thread count is observable, and they are handled there.
+    fn emit_atomic(&mut self, atomic: crate::module::Atomic, offset: u64) -> Result<()> {
+        use crate::module::AtomicKind;
+
+        let width = atomic.width;
+        let result = atomic.ty;
+        // An i64 operation's values are i64; an i32's are i32 and go through
+        // the runtime's i64 interface, which is why each one casts on the way
+        // in and on the way out.
+        let cast_in = if result == ValType::I32 {
+            " as i64"
+        } else {
+            ""
+        };
+        let cast_out = if result == ValType::I32 {
+            " as i32"
+        } else {
+            ""
+        };
+
+        match atomic.kind {
+            AtomicKind::Load => {
+                let address = self.pop()?;
+                self.push_temp(
+                    &format!(
+                        "self.memory.atomic_load({}, {offset}, {width}){cast_out}",
+                        address.code
+                    ),
+                    result,
+                );
+            }
+            AtomicKind::Store => {
+                let mut values = self.pop_n(2)?;
+                self.spill_operands(&mut values);
+                self.spill_stack();
+                self.line(&format!(
+                    "self.memory.atomic_store({}, {offset}, {width}, {}{cast_in});",
+                    values[0].code, values[1].code
+                ));
+            }
+            AtomicKind::Rmw(kind) => {
+                let mut values = self.pop_n(2)?;
+                self.spill_operands(&mut values);
+                self.spill_stack();
+                self.push_temp(
+                    &format!(
+                        "self.memory.atomic_rmw({}, {offset}, {width}, rt::Rmw::{}, {}{cast_in}){cast_out}",
+                        values[0].code,
+                        kind.rt_name(),
+                        values[1].code
+                    ),
+                    result,
+                );
+            }
+            AtomicKind::Cmpxchg => {
+                let mut values = self.pop_n(3)?;
+                self.spill_operands(&mut values);
+                self.spill_stack();
+                self.push_temp(
+                    &format!(
+                        "self.memory.atomic_cmpxchg({}, {offset}, {width}, {}{cast_in}, {}{cast_in}){cast_out}",
+                        values[0].code, values[1].code, values[2].code
+                    ),
+                    result,
+                );
+            }
+            AtomicKind::Notify => {
+                let mut values = self.pop_n(2)?;
+                self.spill_operands(&mut values);
+                self.spill_stack();
+                // The count of threads to wake is popped and unused: with one
+                // thread the answer is zero however many were asked for.
+                self.push_temp(
+                    &format!("self.memory.atomic_notify({}, {offset})", values[0].code),
+                    ValType::I32,
+                );
+            }
+            AtomicKind::Wait => {
+                let mut values = self.pop_n(3)?;
+                self.spill_operands(&mut values);
+                self.spill_stack();
+                self.push_temp(
+                    &format!(
+                        "self.memory.atomic_wait({}, {offset}, {width}, {}{cast_in}, {})",
+                        values[0].code, values[1].code, values[2].code
+                    ),
+                    ValType::I32,
+                );
+            }
         }
         Ok(())
     }
@@ -1879,6 +1991,8 @@ mod ir_tests {
             memory: Some(MemoryDef {
                 min_pages: 1,
                 max_pages: None,
+                shared: false,
+                imported: None,
             }),
             ..Module::default()
         };

@@ -1,0 +1,379 @@
+//! Atomics, against the engine.
+//!
+//! A decompilation runs one thread, and under one thread almost every atomic
+//! instruction does exactly what its plain counterpart does. "Almost" is what
+//! these tests are for:
+//!
+//! - an atomic access must be naturally aligned or it traps, where a plain one
+//!   is happy anywhere;
+//! - a narrow read-modify-write wraps at the access width, not the value's;
+//! - `memory.atomic.notify` wakes nobody, which is the right answer with one
+//!   thread rather than a convenient one;
+//! - `memory.atomic.wait*` is exactly right in two of its three outcomes, and
+//!   traps in the third rather than inventing a notification.
+//!
+//! Node runs the reference side with a real shared memory, so the comparison is
+//! against an engine that does have threads.
+
+mod common;
+
+use common::{Arg::I32, Arg::I64, assert_agrees, call};
+
+/// A module with a shared memory the harness supplies, as the VoIP module's
+/// host does.
+const HEADER: &str = r#"(module
+    (import "env" "memory" (memory 1 4 shared))"#;
+
+#[test]
+fn atomic_loads_and_stores_agree() {
+    let wat = format!(
+        r#"{HEADER}
+    (func (export "roundtrip") (param i32) (result i32)
+        local.get 0 i32.const -1 i32.atomic.store
+        local.get 0 i32.atomic.load)
+    (func (export "narrow") (param i32) (result i32)
+        local.get 0 i32.const 258 i32.atomic.store8
+        local.get 0 i32.const 65534 i32.atomic.store16 offset=4
+        local.get 0 i32.atomic.load8_u
+        local.get 0 i32.atomic.load16_u offset=4
+        i32.add)
+    (func (export "wide") (param i32) (result i64)
+        local.get 0 i64.const -2 i64.atomic.store
+        local.get 0 i64.atomic.load)
+    (func (export "wide_narrow") (param i32) (result i64)
+        local.get 0 i64.const 300 i64.atomic.store32
+        local.get 0 i64.atomic.load32_u
+        local.get 0 i64.atomic.load8_u
+        i64.add)
+)"#
+    );
+    let wasm = common::assemble("atomic-mem", &wat);
+    let mut calls = Vec::new();
+    for address in [0, 8, 64, 4096] {
+        calls.push(call("roundtrip", &[I32(address)]));
+        calls.push(call("narrow", &[I32(address)]));
+        calls.push(call("wide", &[I32(address)]));
+        calls.push(call("wide_narrow", &[I32(address)]));
+    }
+    assert_agrees("atomic-mem", &wasm, &calls);
+}
+
+/// The one thing an atomic does that its plain counterpart does not.
+#[test]
+fn an_unaligned_atomic_traps_on_both_sides() {
+    let wat = format!(
+        r#"{HEADER}
+    (func (export "plain") (param i32) (result i32)
+        local.get 0 i32.const 7 i32.store
+        local.get 0 i32.load)
+    (func (export "atomic") (param i32) (result i32)
+        local.get 0 i32.atomic.load)
+    (func (export "atomic_16") (param i32) (result i32)
+        local.get 0 i32.atomic.load16_u)
+    (func (export "atomic_offset") (param i32) (result i32)
+        local.get 0 i32.atomic.load offset=2)
+)"#
+    );
+    let wasm = common::assemble("atomic-align", &wat);
+    let mut calls = Vec::new();
+    for address in [0, 1, 2, 3, 4, 8] {
+        // The plain access succeeds at every one of these; the atomic does not.
+        calls.push(call("plain", &[I32(address)]));
+        calls.push(call("atomic", &[I32(address)]));
+        calls.push(call("atomic_16", &[I32(address)]));
+        calls.push(call("atomic_offset", &[I32(address)]));
+    }
+    assert_agrees("atomic-align", &wasm, &calls);
+}
+
+#[test]
+fn read_modify_write_agrees_at_every_width() {
+    let wat = format!(
+        r#"{HEADER}
+    (func (export "rmw32") (param i32) (param i32) (result i32)
+        local.get 0 local.get 1 i32.atomic.store
+        local.get 0 i32.const 5 i32.atomic.rmw.add drop
+        local.get 0 i32.const 3 i32.atomic.rmw.sub drop
+        local.get 0 i32.const 255 i32.atomic.rmw.and drop
+        local.get 0 i32.const 256 i32.atomic.rmw.or drop
+        local.get 0 i32.const 4095 i32.atomic.rmw.xor drop
+        local.get 0 i32.atomic.load)
+    (func (export "exchange") (param i32) (param i32) (result i32)
+        local.get 0 local.get 1 i32.atomic.store
+        local.get 0 i32.const 99 i32.atomic.rmw.xchg)
+    (func (export "narrow_rmw") (param i32) (param i32) (result i32)
+        local.get 0 local.get 1 i32.atomic.store8
+        local.get 0 i32.const 10 i32.atomic.rmw8.add_u drop
+        local.get 0 i32.atomic.load8_u)
+    (func (export "wide_rmw") (param i32) (param i64) (result i64)
+        local.get 0 local.get 1 i64.atomic.store
+        local.get 0 i64.const 7 i64.atomic.rmw.add drop
+        local.get 0 i64.const 1 i64.atomic.rmw32.xor_u drop
+        local.get 0 i64.atomic.load)
+)"#
+    );
+    let wasm = common::assemble("atomic-rmw", &wat);
+    let mut calls = Vec::new();
+    for value in [0, 1, -1, 250, i32::MAX, i32::MIN] {
+        calls.push(call("rmw32", &[I32(0), I32(value)]));
+        calls.push(call("exchange", &[I32(8), I32(value)]));
+        calls.push(call("narrow_rmw", &[I32(16), I32(value)]));
+        calls.push(call("wide_rmw", &[I32(24), I64(i64::from(value))]));
+    }
+    assert_agrees("atomic-rmw", &wasm, &calls);
+}
+
+#[test]
+fn compare_and_exchange_agrees() {
+    let wat = format!(
+        r#"{HEADER}
+    (func (export "swap") (param i32) (param i32) (param i32) (result i32)
+        local.get 0 local.get 1 i32.atomic.store
+        local.get 0 local.get 2 i32.const 42 i32.atomic.rmw.cmpxchg drop
+        local.get 0 i32.atomic.load)
+    (func (export "returns_old") (param i32) (param i32) (param i32) (result i32)
+        local.get 0 local.get 1 i32.atomic.store
+        local.get 0 local.get 2 i32.const 42 i32.atomic.rmw.cmpxchg)
+    (func (export "narrow_swap") (param i32) (param i32) (result i32)
+        local.get 0 i32.const 66 i32.atomic.store8
+        local.get 0 local.get 1 i32.const 77 i32.atomic.rmw8.cmpxchg_u drop
+        local.get 0 i32.atomic.load8_u)
+)"#
+    );
+    let wasm = common::assemble("atomic-cmpxchg", &wat);
+    let mut calls = Vec::new();
+    for (stored, expected) in [(7, 7), (7, 8), (0, 0), (-1, -1), (-1, 0)] {
+        calls.push(call("swap", &[I32(0), I32(stored), I32(expected)]));
+        calls.push(call("returns_old", &[I32(4), I32(stored), I32(expected)]));
+    }
+    // The high bits of the expected value are not part of a one-byte compare —
+    // 0xFF42 must not match a stored 0x42.
+    for expected in [66, 0xFF42u32 as i32, 67] {
+        calls.push(call("narrow_swap", &[I32(8), I32(expected)]));
+    }
+    assert_agrees("atomic-cmpxchg", &wasm, &calls);
+}
+
+/// The two outcomes of `wait` that need no second thread, and `notify`, which
+/// has nobody to wake.
+#[test]
+fn waiting_and_notifying_agree_where_one_thread_can_answer() {
+    let wat = format!(
+        r#"{HEADER}
+    ;; The value has already changed: not-equal, and no waiting happens.
+    (func (export "wait_not_equal") (param i32) (result i32)
+        local.get 0 i32.const 1 i32.atomic.store
+        local.get 0 i32.const 999 i64.const -1 memory.atomic.wait32)
+    ;; A zero timeout expires immediately however many threads are running.
+    (func (export "wait_zero_timeout") (param i32) (result i32)
+        local.get 0 i32.const 1 i32.atomic.store
+        local.get 0 i32.const 1 i64.const 0 memory.atomic.wait32)
+    (func (export "wait64_not_equal") (param i32) (result i32)
+        local.get 0 i64.const 1 i64.atomic.store
+        local.get 0 i64.const 999 i64.const -1 memory.atomic.wait64)
+    ;; Nobody is waiting on it, so nobody is woken.
+    (func (export "notify_nobody") (param i32) (result i32)
+        local.get 0 i32.const 1 memory.atomic.notify)
+    (func (export "fenced") (param i32) (result i32)
+        atomic.fence
+        local.get 0 i32.const 5 i32.atomic.store
+        atomic.fence
+        local.get 0 i32.atomic.load)
+)"#
+    );
+    let wasm = common::assemble("atomic-wait", &wat);
+    let mut calls = Vec::new();
+    for address in [0, 8, 64] {
+        calls.push(call("wait_not_equal", &[I32(address)]));
+        calls.push(call("wait_zero_timeout", &[I32(address)]));
+        calls.push(call("wait64_not_equal", &[I32(address)]));
+        calls.push(call("notify_nobody", &[I32(address)]));
+        calls.push(call("fenced", &[I32(address)]));
+    }
+    assert_agrees("atomic-wait", &wasm, &calls);
+}
+
+/// The outcome one thread cannot have: a wait that would only end when another
+/// thread notifies.
+#[test]
+fn a_wait_that_would_block_forever_traps_and_says_why() {
+    let wat = format!(
+        r#"{HEADER}
+    (func (export "wait_forever") (param i32) (result i32)
+        local.get 0 i32.const 0 i64.const -1 memory.atomic.wait32)
+)"#
+    );
+    let wasm = common::assemble("atomic-block", &wat);
+    const DRIVER: &str = r#"
+mod generated;
+fn main() {
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut instance = generated::Instance::new();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| instance.wait_forever(0)));
+    match outcome {
+        Ok(value) => println!("returned {value}"),
+        Err(payload) => println!("{}", payload.downcast_ref::<String>().cloned().unwrap_or_default()),
+    }
+}
+"#;
+    let output = common::run_with_driver("atomic-block", &wasm, DRIVER);
+    assert!(
+        output.contains("would block forever"),
+        "a wait with no possible notifier must say so rather than time out: {output}"
+    );
+    assert!(
+        output.contains("single thread"),
+        "and must say why: {output}"
+    );
+}
+
+/// A shared memory the module declares itself, rather than importing.
+#[test]
+fn a_module_that_declares_its_own_shared_memory_works_too() {
+    let wasm = common::assemble(
+        "own-shared",
+        r#"(module
+            (memory (export "memory") 1 2 shared)
+            (func (export "bump") (param i32) (result i32)
+                local.get 0 i32.const 1 i32.atomic.rmw.add))"#,
+    );
+    let calls: Vec<_> = (0..3).map(|_| call("bump", &[I32(0)])).collect();
+    assert_agrees("own-shared", &wasm, &calls);
+}
+
+/// Every atomic instruction, one function each, against the engine.
+///
+/// The differential tests above cover the shapes that matter semantically.
+/// This covers the *table*: sixty-three opcodes whose lowering is a line each,
+/// and a line that names the wrong width or the wrong type would produce
+/// plausible output and wrong answers.
+#[test]
+fn the_whole_atomic_table_agrees() {
+    // (text name, what it pops after the address, whether it pushes)
+    #[derive(Clone, Copy)]
+    enum Shape {
+        Load,
+        Store(&'static str),
+        Rmw(&'static str),
+        Cmpxchg(&'static str),
+        Wait(&'static str),
+        Notify,
+    }
+    use Shape::{Cmpxchg, Load, Notify, Rmw, Store, Wait};
+
+    let mut instructions: Vec<(String, Shape, &str)> = Vec::new();
+    for (ty, widths) in [
+        ("i32", vec!["", "8_u", "16_u"]),
+        ("i64", vec!["", "8_u", "16_u", "32_u"]),
+    ] {
+        for width in widths {
+            instructions.push((format!("{ty}.atomic.load{width}"), Load, ty));
+        }
+    }
+    for (ty, widths) in [
+        ("i32", vec!["", "8", "16"]),
+        ("i64", vec!["", "8", "16", "32"]),
+    ] {
+        for width in widths {
+            let value = if ty == "i32" {
+                "i32.const 7"
+            } else {
+                "i64.const 7"
+            };
+            instructions.push((format!("{ty}.atomic.store{width}"), Store(value), ty));
+        }
+    }
+    for (ty, widths) in [
+        ("i32", vec![("", ""), ("8", "_u"), ("16", "_u")]),
+        (
+            "i64",
+            vec![("", ""), ("8", "_u"), ("16", "_u"), ("32", "_u")],
+        ),
+    ] {
+        for (width, suffix) in widths {
+            let value = if ty == "i32" {
+                "i32.const 3"
+            } else {
+                "i64.const 3"
+            };
+            for operation in ["add", "sub", "and", "or", "xor", "xchg"] {
+                instructions.push((
+                    format!("{ty}.atomic.rmw{width}.{operation}{suffix}"),
+                    Rmw(value),
+                    ty,
+                ));
+            }
+            let pair = if ty == "i32" {
+                "i32.const 0 i32.const 5"
+            } else {
+                "i64.const 0 i64.const 5"
+            };
+            instructions.push((
+                format!("{ty}.atomic.rmw{width}.cmpxchg{suffix}"),
+                Cmpxchg(pair),
+                ty,
+            ));
+        }
+    }
+    instructions.push((
+        "memory.atomic.wait32".to_string(),
+        // An expected value the memory does not hold: not-equal, and no waiting.
+        Wait("i32.const 987654 i64.const -1"),
+        "i32",
+    ));
+    instructions.push((
+        "memory.atomic.wait64".to_string(),
+        Wait("i64.const 987654 i64.const -1"),
+        "i32",
+    ));
+    instructions.push(("memory.atomic.notify".to_string(), Notify, "i32"));
+
+    let mut wat = String::from("(module\n    (import \"env\" \"memory\" (memory 1 4 shared))\n");
+    for (at, (name, shape, ty)) in instructions.iter().enumerate() {
+        let result = match shape {
+            Store(_) => "",
+            Wait(_) | Notify => "i32",
+            _ => ty,
+        };
+        let (operands, tail) = match shape {
+            Load => (String::new(), String::new()),
+            Store(value) | Rmw(value) => ((*value).to_string(), String::new()),
+            Cmpxchg(pair) | Wait(pair) => ((*pair).to_string(), String::new()),
+            Notify => ("i32.const 1".to_string(), String::new()),
+        };
+        wat.push_str(&format!(
+            "    (func (export \"probe{at}\") (param i32){}\n        local.get 0 {operands} {name}{tail})\n",
+            if result.is_empty() {
+                String::new()
+            } else {
+                format!(" (result {result})")
+            }
+        ));
+    }
+    wat.push(')');
+
+    let wasm = common::assemble("atomic-sweep", &wat);
+    let module = unwasm_core::Module::parse(&wasm).expect("every instruction lowers");
+    let lowered: usize = module
+        .funcs
+        .iter()
+        .flat_map(|func| &func.body)
+        .filter(|op| matches!(op, unwasm_core::module::Op::Atomic { .. }))
+        .count();
+    assert_eq!(
+        lowered,
+        instructions.len(),
+        "an instruction was lowered to something other than an atomic"
+    );
+    // 7 loads + 7 stores + 49 read-modify-writes + wait32 + wait64 + notify.
+    // `atomic.fence` is the sixty-seventh and takes no operands, so it is
+    // covered separately.
+    assert_eq!(instructions.len(), 66, "the table changed size");
+
+    // Address 0 is aligned for every width, so each probe reaches its
+    // instruction rather than the alignment trap.
+    let calls: Vec<_> = (0..instructions.len())
+        .map(|at| call(&format!("probe{at}"), &[I32(0)]))
+        .collect();
+    assert_agrees("atomic-sweep", &wasm, &calls);
+}

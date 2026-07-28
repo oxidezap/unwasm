@@ -200,6 +200,146 @@ impl Memory {
         let to = self.range(dst, 0, len as u64);
         self.data[to..to + len].copy_from_slice(&segment[src..src + len]);
     }
+
+    // ---- atomics ----
+    //
+    // A decompilation runs one thread, and under one thread an atomic
+    // load, store or read-modify-write does exactly what the plain one does:
+    // there is nobody to interleave with. What is *not* the same is the
+    // alignment rule — an atomic access must be naturally aligned or it traps,
+    // where a plain one is happy anywhere — and the two blocking instructions,
+    // which are the only place the thread count is actually observable.
+
+    /// Bounds-checks and alignment-checks an atomic access.
+    ///
+    /// The alignment trap is the one thing an atomic does that its plain
+    /// counterpart does not, so it is the one thing a decompilation could
+    /// quietly get wrong.
+    fn atomic_at(&self, addr: i32, offset: u64, bytes: u32) -> usize {
+        let at = self.range(addr, offset, u64::from(bytes));
+        if !at.is_multiple_of(bytes as usize) {
+            trap("unaligned atomic operation");
+        }
+        at
+    }
+
+    /// Reads `bytes` bytes, zero-extended. Covers every `*.atomic.load*`.
+    pub fn atomic_load(&self, addr: i32, offset: u64, bytes: u32) -> i64 {
+        let at = self.atomic_at(addr, offset, bytes);
+        let mut value = 0u64;
+        for (step, byte) in self.data[at..at + bytes as usize].iter().enumerate() {
+            value |= u64::from(*byte) << (8 * step);
+        }
+        value as i64
+    }
+
+    /// Writes the low `bytes` bytes. Covers every `*.atomic.store*`.
+    pub fn atomic_store(&mut self, addr: i32, offset: u64, bytes: u32, value: i64) {
+        let at = self.atomic_at(addr, offset, bytes);
+        let value = value as u64;
+        for step in 0..bytes as usize {
+            self.data[at + step] = (value >> (8 * step)) as u8;
+        }
+    }
+
+    /// The read-modify-write operations, which differ only in the arithmetic.
+    pub fn atomic_rmw(&mut self, addr: i32, offset: u64, bytes: u32, op: Rmw, value: i64) -> i64 {
+        let old = self.atomic_load(addr, offset, bytes);
+        // The arithmetic happens at the access width, not at the value's: an
+        // `i32.atomic.rmw8.add_u` wraps at 256.
+        let (old_u, value_u) = (old as u64, value as u64);
+        let result = match op {
+            Rmw::Add => old_u.wrapping_add(value_u),
+            Rmw::Sub => old_u.wrapping_sub(value_u),
+            Rmw::And => old_u & value_u,
+            Rmw::Or => old_u | value_u,
+            Rmw::Xor => old_u ^ value_u,
+            Rmw::Xchg => value_u,
+        };
+        self.atomic_store(addr, offset, bytes, result as i64);
+        old
+    }
+
+    /// `*.atomic.rmw*.cmpxchg*`. Returns the old value either way, which is how
+    /// the caller learns whether the exchange happened.
+    pub fn atomic_cmpxchg(
+        &mut self,
+        addr: i32,
+        offset: u64,
+        bytes: u32,
+        expected: i64,
+        replacement: i64,
+    ) -> i64 {
+        let old = self.atomic_load(addr, offset, bytes);
+        // `expected` arrives at the value's width; the comparison is at the
+        // access width, so it is truncated the same way the load was.
+        let mask = if bytes >= 8 {
+            u64::MAX
+        } else {
+            (1u64 << (8 * bytes)) - 1
+        };
+        if old as u64 == expected as u64 & mask {
+            self.atomic_store(addr, offset, bytes, replacement);
+        }
+        old
+    }
+
+    /// `memory.atomic.notify`. Nobody is waiting, because nobody else is
+    /// running — so this wakes zero threads, which is the honest answer rather
+    /// than a convenient one.
+    pub fn atomic_notify(&self, addr: i32, offset: u64) -> i32 {
+        self.atomic_at(addr, offset, 4);
+        0
+    }
+
+    /// `memory.atomic.wait32` / `wait64`.
+    ///
+    /// Two of the three outcomes are exactly right with one thread:
+    ///
+    /// - the value has already changed → `1` (not-equal), which is the common
+    ///   case in an uncontended lock and needs no thread at all;
+    /// - a zero timeout → `2` (timed-out), because a zero timeout expires
+    ///   immediately whoever else is running.
+    ///
+    /// The third would block until another thread notifies, and there is no
+    /// other thread. Returning "timed-out" there would be inventing an event
+    /// that did not happen, so it traps and says why.
+    pub fn atomic_wait(
+        &self,
+        addr: i32,
+        offset: u64,
+        bytes: u32,
+        expected: i64,
+        timeout: i64,
+    ) -> i32 {
+        if self.atomic_load(addr, offset, bytes) != expected {
+            return 1;
+        }
+        if timeout == 0 {
+            return 2;
+        }
+        trap(
+            "memory.atomic.wait would block forever: this decompilation runs a single thread, \
+             and no other thread can notify it",
+        );
+    }
+}
+
+/// Which read-modify-write an atomic performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rmw {
+    /// `add`
+    Add,
+    /// `sub`
+    Sub,
+    /// `and`
+    And,
+    /// `or`
+    Or,
+    /// `xor`
+    Xor,
+    /// `xchg`: the old value out, the new one in.
+    Xchg,
 }
 
 /// `i32.div_s`. Traps on zero and on `i32::MIN / -1`, which has no result.
@@ -751,6 +891,151 @@ mod tests {
         assert_eq!(f32_nearest(-2.5), -2.0);
         assert_eq!(f64_nearest(2.5), 2.0);
         assert_eq!(f64_nearest(-3.5), -4.0);
+    }
+
+    #[test]
+    fn atomic_loads_and_stores_move_the_same_bytes_as_plain_ones() {
+        let mut memory = Memory::new(1, None);
+        memory.atomic_store(0, 0, 4, 0x1234_5678);
+        assert_eq!(memory.load32(0, 0), 0x1234_5678);
+        assert_eq!(memory.atomic_load(0, 0, 4), 0x1234_5678);
+        // Narrow accesses are zero-extended, never sign-extended: there is no
+        // signed atomic load in wasm.
+        memory.atomic_store(8, 0, 1, -1);
+        assert_eq!(memory.atomic_load(8, 0, 1), 255);
+        memory.atomic_store(16, 0, 2, -1);
+        assert_eq!(memory.atomic_load(16, 0, 2), 65535);
+        memory.atomic_store(24, 0, 8, -1);
+        assert_eq!(memory.atomic_load(24, 0, 8), -1);
+    }
+
+    #[test]
+    #[should_panic(expected = "unaligned atomic operation")]
+    fn an_unaligned_atomic_access_traps_where_a_plain_one_would_not() {
+        // The one thing an atomic does that its plain counterpart does not.
+        let mut memory = Memory::new(1, None);
+        memory.store32(1, 0, 7); // fine
+        memory.atomic_load(1, 0, 4); // not
+    }
+
+    #[test]
+    #[should_panic(expected = "unaligned atomic operation")]
+    fn the_static_offset_counts_towards_alignment() {
+        Memory::new(1, None).atomic_load(0, 2, 4);
+    }
+
+    #[test]
+    fn a_single_byte_atomic_is_aligned_anywhere() {
+        let mut memory = Memory::new(1, None);
+        memory.atomic_store(7, 0, 1, 3);
+        assert_eq!(memory.atomic_load(7, 0, 1), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds memory access")]
+    fn an_atomic_past_the_end_traps_like_any_other_access() {
+        Memory::new(1, None).atomic_load(PAGE_SIZE as i32, 0, 4);
+    }
+
+    #[test]
+    fn read_modify_write_returns_the_old_value_and_stores_the_new_one() {
+        let mut memory = Memory::new(1, None);
+        memory.atomic_store(0, 0, 4, 10);
+        assert_eq!(memory.atomic_rmw(0, 0, 4, Rmw::Add, 5), 10);
+        assert_eq!(memory.atomic_load(0, 0, 4), 15);
+        assert_eq!(memory.atomic_rmw(0, 0, 4, Rmw::Sub, 20), 15);
+        // The result is read back zero-extended, as every atomic load is; the
+        // generated code casts it to i32, where it is -5.
+        assert_eq!(memory.atomic_load(0, 0, 4), 0xFFFF_FFFB);
+        assert_eq!(memory.atomic_load(0, 0, 4) as i32, -5);
+        assert_eq!(memory.atomic_rmw(0, 0, 4, Rmw::And, 0xFF), 0xFFFF_FFFB);
+        assert_eq!(memory.atomic_load(0, 0, 4), 0xFB);
+        assert_eq!(memory.atomic_rmw(0, 0, 4, Rmw::Or, 0x100), 0xFB);
+        assert_eq!(memory.atomic_load(0, 0, 4), 0x1FB);
+        assert_eq!(memory.atomic_rmw(0, 0, 4, Rmw::Xor, 0xFF), 0x1FB);
+        assert_eq!(memory.atomic_load(0, 0, 4), 0x104);
+        assert_eq!(memory.atomic_rmw(0, 0, 4, Rmw::Xchg, 42), 0x104);
+        assert_eq!(memory.atomic_load(0, 0, 4), 42);
+    }
+
+    #[test]
+    fn a_narrow_read_modify_write_wraps_at_its_own_width() {
+        // `i32.atomic.rmw8.add_u` on 250 + 10 is 4, not 260: the arithmetic
+        // happens at the access width, not at the value's.
+        let mut memory = Memory::new(1, None);
+        memory.atomic_store(0, 0, 1, 250);
+        assert_eq!(memory.atomic_rmw(0, 0, 1, Rmw::Add, 10), 250);
+        assert_eq!(memory.atomic_load(0, 0, 1), 4);
+        // And the neighbouring byte is untouched.
+        assert_eq!(memory.data[1], 0);
+    }
+
+    #[test]
+    fn compare_and_exchange_swaps_only_on_a_match() {
+        let mut memory = Memory::new(1, None);
+        memory.atomic_store(0, 0, 4, 7);
+        assert_eq!(
+            memory.atomic_cmpxchg(0, 0, 4, 7, 9),
+            7,
+            "returns the old value"
+        );
+        assert_eq!(memory.atomic_load(0, 0, 4), 9, "and swapped");
+        assert_eq!(
+            memory.atomic_cmpxchg(0, 0, 4, 7, 11),
+            9,
+            "still the old value"
+        );
+        assert_eq!(memory.atomic_load(0, 0, 4), 9, "and did not swap");
+    }
+
+    #[test]
+    fn a_narrow_compare_and_exchange_compares_at_its_own_width() {
+        // The expected value arrives at the operand's width; only the low byte
+        // can possibly match a one-byte access.
+        let mut memory = Memory::new(1, None);
+        memory.atomic_store(0, 0, 1, 0x42);
+        assert_eq!(memory.atomic_cmpxchg(0, 0, 1, 0xFF42, 0x99), 0x42);
+        assert_eq!(
+            memory.atomic_load(0, 0, 1),
+            0x99,
+            "the high bits are not part of it"
+        );
+    }
+
+    #[test]
+    fn notify_wakes_nobody_because_nobody_is_there() {
+        assert_eq!(Memory::new(1, None).atomic_notify(0, 0), 0);
+    }
+
+    #[test]
+    fn waiting_on_a_value_that_already_changed_returns_not_equal() {
+        let mut memory = Memory::new(1, None);
+        memory.atomic_store(0, 0, 4, 5);
+        // The uncontended case, and the common one: no thread is needed to
+        // answer it.
+        assert_eq!(memory.atomic_wait(0, 0, 4, 99, -1), 1);
+    }
+
+    #[test]
+    fn waiting_with_a_zero_timeout_times_out_immediately() {
+        let mut memory = Memory::new(1, None);
+        memory.atomic_store(0, 0, 4, 5);
+        assert_eq!(memory.atomic_wait(0, 0, 4, 5, 0), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "would block forever")]
+    fn waiting_for_a_notification_that_can_never_come_traps() {
+        // Returning "timed out" here would be inventing an event.
+        let mut memory = Memory::new(1, None);
+        memory.atomic_store(0, 0, 4, 5);
+        memory.atomic_wait(0, 0, 4, 5, 1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "unaligned atomic operation")]
+    fn notify_checks_alignment_too() {
+        Memory::new(1, None).atomic_notify(2, 0);
     }
 
     #[test]

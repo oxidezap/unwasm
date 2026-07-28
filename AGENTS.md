@@ -156,14 +156,25 @@ looked good. The table is in `Layout::FUNCTIONS_PER_FILE`. Any change to it
 should be measured the same way rather than argued about — and the system time
 is the number to watch, since it was 1102s for one file and 12.6s for 192.
 
+## What a single thread can and cannot say about atomics
+
+Under one thread an atomic load, store or read-modify-write is its plain
+counterpart: there is nobody to interleave with. Three things are not:
+alignment (an atomic traps where a plain access does not), `notify` (wakes
+zero, correctly), and `wait` — right when the value already changed or the
+timeout is zero, and a trap otherwise, because the alternative is inventing a
+notification that never came. Do not "fix" that trap by returning 2.
+
+Measure before believing a feature list: the VoIP module's `target_features`
+asks for `reference-types` and `multivalue`, and the module uses neither — one
+`funcref` declaration and zero multi-result blocks across 13347 functions.
+
 ## Open work
 
-1. **The VoIP module needs more than imported memory.** It imports
-   `(memory 160 32768 shared)` and its `target_features` lists `atomics`,
-   `reference-types` and `multivalue`. That is the whole threading model, and
-   "faithful" for atomics in a single-threaded target is a design question, not
-   an implementation one — `wa-wasm-oracle` spent a day on exactly that
-   (`can_block`).
+1. **Generate the `invoke_*` trampolines.** 125 of the VoIP module's 228 imports
+   are Emscripten's exception trampolines, and they are mechanical: clear
+   `__THREW__`, call through the table, read it back. Generating them turns 228
+   imports to implement into about 100.
 2. **Level 1 proper**: turn shadow-stack slots into named locals, now that the
    stack pointer is identified. The frame size is in the prologue; what is
    missing is tracking which offsets from it are distinct variables.

@@ -239,14 +239,23 @@ fn reference_types_are_refused() {
 }
 
 #[test]
-fn an_imported_memory_is_refused_rather_than_invented() {
-    // This is what the 9.3 MiB VoIP module does: it expects the host to supply
-    // a shared memory. Emitting an empty one would run and be wrong.
-    let message = unsupported(
+fn an_imported_memory_is_read_with_the_limits_it_declares() {
+    // What the 9.4 MiB VoIP module does: the host supplies the memory. The
+    // limits are still the module's, and they are what the generated code
+    // instantiates with.
+    let module = parse(
         "import-mem",
-        "(module (import \"env\" \"memory\" (memory 1)))",
+        "(module (import \"env\" \"memory\" (memory 160 32768 shared)))",
+    )
+    .expect("valid");
+    let memory = module.memory.expect("declared by the import");
+    assert_eq!(memory.min_pages, 160);
+    assert_eq!(memory.max_pages, Some(32768));
+    assert!(memory.shared);
+    assert_eq!(
+        memory.imported,
+        Some(("env".to_string(), "memory".to_string()))
     );
-    assert!(message.contains("imported memory"), "{message}");
 }
 
 #[test]
@@ -264,9 +273,13 @@ fn an_imported_global_or_table_is_refused() {
 }
 
 #[test]
-fn a_shared_memory_is_refused() {
-    let message = unsupported("shared", "(module (memory 1 1 shared))");
-    assert!(message.contains("shared memory"), "{message}");
+fn a_shared_memory_is_read_and_marked_as_shared() {
+    // Shared says the module was built for threads. The decompilation runs
+    // one — a limit on the execution, not a reason to refuse to read the code.
+    let module = parse("shared", "(module (memory 1 1 shared))").expect("valid");
+    let memory = module.memory.expect("declared");
+    assert!(memory.shared);
+    assert!(memory.imported.is_none());
 }
 
 #[test]
@@ -291,15 +304,40 @@ fn exception_handling_is_refused() {
 }
 
 #[test]
-fn atomics_are_refused() {
-    // The threaded modules use these; refusing by name is how a reader learns
-    // which capability is missing rather than getting a subtly serial module.
-    let message = unsupported(
+fn every_atomic_instruction_is_recognised() {
+    // Sixty-four opcodes, and the module that needs them is the VoIP one.
+    let module = parse(
         "atomics",
-        "(module (memory 1 1 shared) (func (param i32) (result i32)
-            local.get 0 i32.const 1 i32.atomic.rmw.add))",
-    );
-    assert!(!message.is_empty());
+        r#"(module (memory 1 1 shared)
+            (func (param i32) (result i32)
+                local.get 0 i32.atomic.load
+                local.get 0 i32.atomic.load8_u i32.add
+                local.get 0 i32.atomic.load16_u i32.add
+                local.get 0 local.get 0 i32.atomic.store
+                local.get 0 local.get 0 i32.atomic.store8
+                local.get 0 i32.const 1 i32.atomic.rmw.add i32.add
+                local.get 0 i32.const 1 i32.atomic.rmw.sub i32.add
+                local.get 0 i32.const 1 i32.atomic.rmw.and i32.add
+                local.get 0 i32.const 1 i32.atomic.rmw.or i32.add
+                local.get 0 i32.const 1 i32.atomic.rmw.xor i32.add
+                local.get 0 i32.const 1 i32.atomic.rmw.xchg i32.add
+                local.get 0 i32.const 1 i32.const 2 i32.atomic.rmw.cmpxchg i32.add
+                local.get 0 i32.const 1 i32.const 2 i32.atomic.rmw8.cmpxchg_u i32.add
+                local.get 0 i64.atomic.load i32.wrap_i64 i32.add
+                local.get 0 i64.const 1 i64.atomic.rmw32.add_u i32.wrap_i64 i32.add
+                local.get 0 i32.const 1 i64.const 0 memory.atomic.wait32 i32.add
+                local.get 0 i64.const 1 i64.const 0 memory.atomic.wait64 i32.add
+                local.get 0 i32.const 1 memory.atomic.notify i32.add
+                atomic.fence))"#,
+    )
+    .expect("valid");
+    let body = &module.funcs[0].body;
+    let atomics = body
+        .iter()
+        .filter(|op| matches!(op, Op::Atomic { .. }))
+        .count();
+    assert_eq!(atomics, 18, "{body:?}");
+    assert!(body.contains(&Op::AtomicFence));
 }
 
 #[test]

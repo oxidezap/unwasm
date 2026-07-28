@@ -223,10 +223,31 @@ fn run_in_node(name: &str, wasm: &[u8], calls: &[Call], module: &Module) -> Vec<
         .collect::<Vec<_>>()
         .join(",");
 
+    // A module that imports its memory needs one supplied, with the limits it
+    // declared — the same ones the generated code instantiates with, so the two
+    // sides start from the same memory.
+    let memory_import = module
+        .memory
+        .as_ref()
+        .and_then(|memory| {
+            memory.imported.as_ref().map(|(from, field)| {
+                format!(
+                    "{{\"module\":\"{from}\",\"field\":\"{field}\",\"initial\":{},\"maximum\":{},\"shared\":{}}}",
+                    memory.min_pages,
+                    memory
+                        .max_pages
+                        .map_or("null".to_string(), |max| max.to_string()),
+                    memory.shared
+                )
+            })
+        })
+        .unwrap_or_else(|| "null".to_string());
+
     let output = tool("node")
         .arg(&driver)
         .arg(&binary)
         .arg(format!("[{plan}]"))
+        .arg(memory_import)
         .output()
         .expect("running node");
     assert!(
@@ -341,7 +362,11 @@ fn run_in_rust_with_layout(
     let exports_memory = module
         .exports
         .iter()
-        .any(|export| export.kind == unwasm_core::module::ExportKind::Memory);
+        .any(|export| export.kind == unwasm_core::module::ExportKind::Memory)
+        || module
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.imported.is_some());
     if exports_memory {
         main.push_str("    println!(\"memory {}\", checksum(&instance.memory.data));\n}\n");
     } else {
@@ -501,7 +526,16 @@ const fs = require('fs');
 const bytes = fs.readFileSync(process.argv[2]);
 const plan = JSON.parse(process.argv[3]);
 
-const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), {});
+const memoryImport = JSON.parse(process.argv[4] || 'null');
+const imports = {};
+if (memoryImport) {
+  const descriptor = {initial: memoryImport.initial};
+  if (memoryImport.maximum !== null) descriptor.maximum = memoryImport.maximum;
+  if (memoryImport.shared) descriptor.shared = true;
+  imports[memoryImport.module] = {[memoryImport.field]: new WebAssembly.Memory(descriptor)};
+}
+
+const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), imports);
 const f32bits = new DataView(new ArrayBuffer(8));
 
 for (const step of plan) {
@@ -541,7 +575,8 @@ for (const step of plan) {
   }
 }
 
-const memory = instance.exports.memory;
+const memory = instance.exports.memory
+  || (memoryImport && imports[memoryImport.module][memoryImport.field]);
 if (memory) {
   const data = new Uint8Array(memory.buffer);
   let hash = 0xcbf29ce484222325n;

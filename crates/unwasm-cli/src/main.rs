@@ -134,13 +134,20 @@ fn inspect(arguments: &[String]) -> Result<String, String> {
         module.globals.len(),
         module.datas.len()
     ));
-    match module.memory {
+    match &module.memory {
         Some(memory) => out.push_str(&format!(
-            "memory: {} pages initial{}\n",
+            "memory: {} pages initial{}{}{}\n",
             memory.min_pages,
             memory
                 .max_pages
-                .map_or(String::new(), |max| format!(", {max} maximum"))
+                .map_or(String::new(), |max| format!(", {max} maximum")),
+            if memory.shared { ", shared" } else { "" },
+            memory
+                .imported
+                .as_ref()
+                .map_or(String::new(), |(module, field)| {
+                    format!(", imported from {module}::{field}")
+                })
         )),
         None => out.push_str("memory: none\n"),
     }

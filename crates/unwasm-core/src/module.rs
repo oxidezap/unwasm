@@ -145,6 +145,68 @@ pub enum StoreKind {
     I64Store32,
 }
 
+/// What an atomic instruction does, apart from the width it does it at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicKind {
+    /// `*.atomic.load*`
+    Load,
+    /// `*.atomic.store*`
+    Store,
+    /// `*.atomic.rmw*.{add,sub,and,or,xor,xchg}`
+    Rmw(RmwKind),
+    /// `*.atomic.rmw*.cmpxchg*`
+    Cmpxchg,
+    /// `memory.atomic.wait32` / `wait64`
+    Wait,
+    /// `memory.atomic.notify`
+    Notify,
+}
+
+/// The arithmetic in a read-modify-write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs, reason = "one variant per wasm opcode suffix")]
+pub enum RmwKind {
+    Add,
+    Sub,
+    And,
+    Or,
+    Xor,
+    Xchg,
+}
+
+impl RmwKind {
+    /// The name of the matching runtime variant.
+    #[must_use]
+    pub fn rt_name(self) -> &'static str {
+        match self {
+            Self::Add => "Add",
+            Self::Sub => "Sub",
+            Self::And => "And",
+            Self::Or => "Or",
+            Self::Xor => "Xor",
+            Self::Xchg => "Xchg",
+        }
+    }
+}
+
+/// An atomic memory instruction.
+///
+/// Atomics are the last thing between this and the modules that use threads,
+/// and there are sixty-four of them — but they vary in only three ways: what
+/// they do, the type they do it to, and how many bytes they touch. Modelling
+/// that rather than the opcode list keeps the backend from growing sixty-four
+/// arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Atomic {
+    /// What it does.
+    pub kind: AtomicKind,
+    /// The value type: `i32` or `i64`. Also the type of the result.
+    pub ty: ValType,
+    /// Bytes accessed: 1, 2, 4 or 8. Narrower than the type means the value is
+    /// truncated going in and zero-extended coming out.
+    pub width: u32,
+}
+
 /// One instruction, narrowed to what the backend can emit.
 ///
 /// Structure stays implicit, as it is in the binary: `Block`/`Loop`/`If` open a
@@ -197,6 +259,12 @@ pub enum Op {
     MemoryFill,
     MemoryInit(u32),
     DataDrop(u32),
+    Atomic {
+        op: Atomic,
+        mem: MemArg,
+    },
+    /// `atomic.fence`. Orders nothing that a single thread can observe.
+    AtomicFence,
     /// Everything arithmetic, from [`crate::ops`].
     Num(NumOp),
 }
@@ -251,12 +319,18 @@ pub struct GlobalDef {
 }
 
 /// The module's memory.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct MemoryDef {
     /// Pages present at instantiation.
     pub min_pages: u32,
     /// Page ceiling, if declared.
     pub max_pages: Option<u32>,
+    /// Declared shared. A shared memory is what a threaded module asks for, and
+    /// it always declares a maximum — the engine must reserve the whole range
+    /// up front because it cannot move memory another thread is reading.
+    pub shared: bool,
+    /// Where it comes from, when the host supplies it rather than the module.
+    pub imported: Option<(String, String)>,
 }
 
 /// A data segment.
@@ -367,8 +441,15 @@ impl Module {
                                     type_index,
                                 });
                             }
-                            wasmparser::TypeRef::Memory(_) => {
-                                return Err(Error::unsupported("imported memory", location));
+                            wasmparser::TypeRef::Memory(memory) => {
+                                if module.memory.is_some() {
+                                    return Err(Error::unsupported("multiple memories", location));
+                                }
+                                module.memory = Some(lower_memory_type(
+                                    &memory,
+                                    Some((import.module.to_string(), import.name.to_string())),
+                                    &location,
+                                )?);
                             }
                             wasmparser::TypeRef::Global(_) => {
                                 return Err(Error::unsupported("imported global", location));
@@ -403,18 +484,7 @@ impl Module {
                         if module.memory.is_some() {
                             return Err(Error::unsupported("multiple memories", "memory section"));
                         }
-                        if memory.memory64 {
-                            return Err(Error::unsupported("64-bit memory", "memory section"));
-                        }
-                        if memory.shared {
-                            return Err(Error::unsupported("shared memory", "memory section"));
-                        }
-                        module.memory = Some(MemoryDef {
-                            min_pages: u32::try_from(memory.initial).map_err(|_| {
-                                Error::invalid("memory minimum overflows u32", "memory section")
-                            })?,
-                            max_pages: memory.maximum.map(|pages| pages as u32),
-                        });
+                        module.memory = Some(lower_memory_type(&memory, None, "memory section")?);
                     }
                 }
                 wasmparser::Payload::GlobalSection(reader) => {
@@ -560,6 +630,33 @@ impl Module {
             .find(|(at, _)| *at == index)
             .map(|(_, name)| name.as_str())
     }
+}
+
+/// Reads a memory type, whether it was declared or imported.
+///
+/// A shared memory is accepted rather than refused. It says the module was
+/// built for threads, and a decompilation of it runs one thread — which is a
+/// limitation of the *execution*, recorded in the output, not a reason to
+/// refuse to read the code. The instructions that can actually tell the
+/// difference are `memory.atomic.wait*`, and those say so when they are
+/// reached.
+fn lower_memory_type(
+    memory: &wasmparser::MemoryType,
+    imported: Option<(String, String)>,
+    location: &str,
+) -> Result<MemoryDef> {
+    if memory.memory64 {
+        return Err(Error::unsupported("64-bit memory", location.to_string()));
+    }
+    Ok(MemoryDef {
+        min_pages: u32::try_from(memory.initial)
+            .map_err(|_| Error::invalid("memory minimum overflows u32", location.to_string()))?,
+        max_pages: memory
+            .maximum
+            .map(|pages| u32::try_from(pages).unwrap_or(u32::MAX)),
+        shared: memory.shared,
+        imported,
+    })
 }
 
 fn lower_subtype(subtype: &wasmparser::SubType) -> Result<FuncType> {
@@ -744,6 +841,9 @@ fn lower_op(operator: &wasmparser::Operator<'_>, location: &str) -> Result<Op> {
         W::DataDrop { data_index } => Op::DataDrop(*data_index),
 
         other => {
+            if let Some(atomic) = lower_atomic(other, location)? {
+                return Ok(atomic);
+            }
             return Err(Error::unsupported(
                 format!("{other:?}"),
                 location.to_string(),
@@ -751,6 +851,407 @@ fn lower_op(operator: &wasmparser::Operator<'_>, location: &str) -> Result<Op> {
         }
     };
     Ok(op)
+}
+
+/// Lowers the sixty-four atomic instructions.
+///
+/// Written out rather than generated: concatenating identifiers in a macro
+/// needs a dependency, and this table is read far more often than it is
+/// changed. Each line says the same three things — what the instruction does,
+/// the type it does it to, and the bytes it touches.
+fn lower_atomic(operator: &wasmparser::Operator<'_>, location: &str) -> Result<Option<Op>> {
+    use wasmparser::Operator as W;
+
+    let op = match operator {
+        W::I32AtomicLoad { memarg } => {
+            atomic(*memarg, AtomicKind::Load, ValType::I32, 4, location)?
+        }
+        W::I32AtomicLoad8U { memarg } => {
+            atomic(*memarg, AtomicKind::Load, ValType::I32, 1, location)?
+        }
+        W::I32AtomicLoad16U { memarg } => {
+            atomic(*memarg, AtomicKind::Load, ValType::I32, 2, location)?
+        }
+        W::I64AtomicLoad { memarg } => {
+            atomic(*memarg, AtomicKind::Load, ValType::I64, 8, location)?
+        }
+        W::I64AtomicLoad8U { memarg } => {
+            atomic(*memarg, AtomicKind::Load, ValType::I64, 1, location)?
+        }
+        W::I64AtomicLoad16U { memarg } => {
+            atomic(*memarg, AtomicKind::Load, ValType::I64, 2, location)?
+        }
+        W::I64AtomicLoad32U { memarg } => {
+            atomic(*memarg, AtomicKind::Load, ValType::I64, 4, location)?
+        }
+        W::I32AtomicStore { memarg } => {
+            atomic(*memarg, AtomicKind::Store, ValType::I32, 4, location)?
+        }
+        W::I32AtomicStore8 { memarg } => {
+            atomic(*memarg, AtomicKind::Store, ValType::I32, 1, location)?
+        }
+        W::I32AtomicStore16 { memarg } => {
+            atomic(*memarg, AtomicKind::Store, ValType::I32, 2, location)?
+        }
+        W::I64AtomicStore { memarg } => {
+            atomic(*memarg, AtomicKind::Store, ValType::I64, 8, location)?
+        }
+        W::I64AtomicStore8 { memarg } => {
+            atomic(*memarg, AtomicKind::Store, ValType::I64, 1, location)?
+        }
+        W::I64AtomicStore16 { memarg } => {
+            atomic(*memarg, AtomicKind::Store, ValType::I64, 2, location)?
+        }
+        W::I64AtomicStore32 { memarg } => {
+            atomic(*memarg, AtomicKind::Store, ValType::I64, 4, location)?
+        }
+        W::I32AtomicRmwAdd { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Add),
+            ValType::I32,
+            4,
+            location,
+        )?,
+        W::I32AtomicRmwSub { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Sub),
+            ValType::I32,
+            4,
+            location,
+        )?,
+        W::I32AtomicRmwAnd { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::And),
+            ValType::I32,
+            4,
+            location,
+        )?,
+        W::I32AtomicRmwOr { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Or),
+            ValType::I32,
+            4,
+            location,
+        )?,
+        W::I32AtomicRmwXor { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Xor),
+            ValType::I32,
+            4,
+            location,
+        )?,
+        W::I32AtomicRmwXchg { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Xchg),
+            ValType::I32,
+            4,
+            location,
+        )?,
+        W::I32AtomicRmwCmpxchg { memarg } => {
+            atomic(*memarg, AtomicKind::Cmpxchg, ValType::I32, 4, location)?
+        }
+        W::I32AtomicRmw8AddU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Add),
+            ValType::I32,
+            1,
+            location,
+        )?,
+        W::I32AtomicRmw8SubU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Sub),
+            ValType::I32,
+            1,
+            location,
+        )?,
+        W::I32AtomicRmw8AndU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::And),
+            ValType::I32,
+            1,
+            location,
+        )?,
+        W::I32AtomicRmw8OrU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Or),
+            ValType::I32,
+            1,
+            location,
+        )?,
+        W::I32AtomicRmw8XorU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Xor),
+            ValType::I32,
+            1,
+            location,
+        )?,
+        W::I32AtomicRmw8XchgU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Xchg),
+            ValType::I32,
+            1,
+            location,
+        )?,
+        W::I32AtomicRmw8CmpxchgU { memarg } => {
+            atomic(*memarg, AtomicKind::Cmpxchg, ValType::I32, 1, location)?
+        }
+        W::I32AtomicRmw16AddU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Add),
+            ValType::I32,
+            2,
+            location,
+        )?,
+        W::I32AtomicRmw16SubU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Sub),
+            ValType::I32,
+            2,
+            location,
+        )?,
+        W::I32AtomicRmw16AndU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::And),
+            ValType::I32,
+            2,
+            location,
+        )?,
+        W::I32AtomicRmw16OrU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Or),
+            ValType::I32,
+            2,
+            location,
+        )?,
+        W::I32AtomicRmw16XorU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Xor),
+            ValType::I32,
+            2,
+            location,
+        )?,
+        W::I32AtomicRmw16XchgU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Xchg),
+            ValType::I32,
+            2,
+            location,
+        )?,
+        W::I32AtomicRmw16CmpxchgU { memarg } => {
+            atomic(*memarg, AtomicKind::Cmpxchg, ValType::I32, 2, location)?
+        }
+        W::I64AtomicRmwAdd { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Add),
+            ValType::I64,
+            8,
+            location,
+        )?,
+        W::I64AtomicRmwSub { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Sub),
+            ValType::I64,
+            8,
+            location,
+        )?,
+        W::I64AtomicRmwAnd { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::And),
+            ValType::I64,
+            8,
+            location,
+        )?,
+        W::I64AtomicRmwOr { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Or),
+            ValType::I64,
+            8,
+            location,
+        )?,
+        W::I64AtomicRmwXor { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Xor),
+            ValType::I64,
+            8,
+            location,
+        )?,
+        W::I64AtomicRmwXchg { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Xchg),
+            ValType::I64,
+            8,
+            location,
+        )?,
+        W::I64AtomicRmwCmpxchg { memarg } => {
+            atomic(*memarg, AtomicKind::Cmpxchg, ValType::I64, 8, location)?
+        }
+        W::I64AtomicRmw8AddU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Add),
+            ValType::I64,
+            1,
+            location,
+        )?,
+        W::I64AtomicRmw8SubU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Sub),
+            ValType::I64,
+            1,
+            location,
+        )?,
+        W::I64AtomicRmw8AndU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::And),
+            ValType::I64,
+            1,
+            location,
+        )?,
+        W::I64AtomicRmw8OrU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Or),
+            ValType::I64,
+            1,
+            location,
+        )?,
+        W::I64AtomicRmw8XorU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Xor),
+            ValType::I64,
+            1,
+            location,
+        )?,
+        W::I64AtomicRmw8XchgU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Xchg),
+            ValType::I64,
+            1,
+            location,
+        )?,
+        W::I64AtomicRmw8CmpxchgU { memarg } => {
+            atomic(*memarg, AtomicKind::Cmpxchg, ValType::I64, 1, location)?
+        }
+        W::I64AtomicRmw16AddU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Add),
+            ValType::I64,
+            2,
+            location,
+        )?,
+        W::I64AtomicRmw16SubU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Sub),
+            ValType::I64,
+            2,
+            location,
+        )?,
+        W::I64AtomicRmw16AndU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::And),
+            ValType::I64,
+            2,
+            location,
+        )?,
+        W::I64AtomicRmw16OrU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Or),
+            ValType::I64,
+            2,
+            location,
+        )?,
+        W::I64AtomicRmw16XorU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Xor),
+            ValType::I64,
+            2,
+            location,
+        )?,
+        W::I64AtomicRmw16XchgU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Xchg),
+            ValType::I64,
+            2,
+            location,
+        )?,
+        W::I64AtomicRmw16CmpxchgU { memarg } => {
+            atomic(*memarg, AtomicKind::Cmpxchg, ValType::I64, 2, location)?
+        }
+        W::I64AtomicRmw32AddU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Add),
+            ValType::I64,
+            4,
+            location,
+        )?,
+        W::I64AtomicRmw32SubU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Sub),
+            ValType::I64,
+            4,
+            location,
+        )?,
+        W::I64AtomicRmw32AndU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::And),
+            ValType::I64,
+            4,
+            location,
+        )?,
+        W::I64AtomicRmw32OrU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Or),
+            ValType::I64,
+            4,
+            location,
+        )?,
+        W::I64AtomicRmw32XorU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Xor),
+            ValType::I64,
+            4,
+            location,
+        )?,
+        W::I64AtomicRmw32XchgU { memarg } => atomic(
+            *memarg,
+            AtomicKind::Rmw(RmwKind::Xchg),
+            ValType::I64,
+            4,
+            location,
+        )?,
+        W::I64AtomicRmw32CmpxchgU { memarg } => {
+            atomic(*memarg, AtomicKind::Cmpxchg, ValType::I64, 4, location)?
+        }
+        W::MemoryAtomicNotify { memarg } => {
+            atomic(*memarg, AtomicKind::Notify, ValType::I32, 4, location)?
+        }
+        W::MemoryAtomicWait32 { memarg } => {
+            atomic(*memarg, AtomicKind::Wait, ValType::I32, 4, location)?
+        }
+        W::MemoryAtomicWait64 { memarg } => {
+            atomic(*memarg, AtomicKind::Wait, ValType::I64, 8, location)?
+        }
+        // Nothing a single thread can observe is ordered by a fence, and a
+        // decompilation that dropped it silently would still be wrong: it is
+        // kept in the IR and emitted as a comment.
+        W::AtomicFence => Op::AtomicFence,
+        _ => return Ok(None),
+    };
+    Ok(Some(op))
+}
+
+fn atomic(
+    memarg: wasmparser::MemArg,
+    kind: AtomicKind,
+    ty: ValType,
+    width: u32,
+    location: &str,
+) -> Result<Op> {
+    check_memory_index(&memarg, location)?;
+    Ok(Op::Atomic {
+        op: Atomic { kind, ty, width },
+        mem: MemArg {
+            offset: memarg.offset,
+        },
+    })
 }
 
 fn load(kind: LoadKind, memarg: &wasmparser::MemArg, location: &str) -> Result<Op> {

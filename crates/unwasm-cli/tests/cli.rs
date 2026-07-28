@@ -144,12 +144,12 @@ fn a_missing_argument_is_reported_rather_than_ignored() {
 #[test]
 fn an_unsupported_module_fails_with_the_construct_named() {
     let path = fixture(
-        "imported-memory",
-        "(module (import \"env\" \"memory\" (memory 1)))",
+        "simd-module",
+        "(module (func (export \"f\") (result v128) v128.const i32x4 0 0 0 0))",
     );
     let (ok, _, stderr) = run(&["decompile", path.to_str().expect("utf-8 path")]);
     assert!(!ok);
-    assert!(stderr.contains("imported memory"), "{stderr}");
+    assert!(stderr.contains("v128"), "{stderr}");
     assert!(stderr.contains("rather than emitting a guess"), "{stderr}");
 }
 

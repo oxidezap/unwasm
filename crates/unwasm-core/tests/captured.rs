@@ -27,7 +27,10 @@ const CAPTURES: &[(&str, &str)] = &[
     ("9Nbh3eMuVjD", "2.9 MiB"),
     ("ayqr5HQtlkb", "2.0 MiB"),
     ("rogm88TRRiw", "2.1 MiB"),
-    ("D5pLH9sfOOl", "VoIP / PJSIP, 9.4 MiB — imports its memory"),
+    (
+        "D5pLH9sfOOl",
+        "VoIP / PJSIP, 9.4 MiB — a shared imported memory and 1070 atomics",
+    ),
 ];
 
 #[test]
