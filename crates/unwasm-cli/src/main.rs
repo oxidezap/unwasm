@@ -14,6 +14,7 @@ unwasm — a WebAssembly decompiler whose output compiles
 
 usage:
   unwasm decompile <module.wasm> [-o <out>] [--split <n>]
+  unwasm host      <module.wasm> [-o <host.rs>]
   unwasm inspect   <module.wasm>
 
   -o <out>       a path ending in .rs writes one file; any other path is a
@@ -22,6 +23,10 @@ usage:
   --split <n>    roughly how many lines to put in each part file. Implies a
                  directory. Without it, a directory gets the layout the
                  module's size calls for.
+
+`host` writes a skeleton `impl Imports`: every import the module still needs,
+grouped by where it comes from, each one a `todo!()`. Emscripten's `invoke_*`
+trampolines are not among them — those are generated.
 
 A large module wants the split: rustc partitions codegen units along module
 boundaries, so half a million lines in one file becomes one enormous unit.
@@ -48,6 +53,7 @@ fn main() -> ExitCode {
 fn run(arguments: &[String]) -> Result<String, String> {
     match arguments.first().map(String::as_str) {
         Some("decompile") => decompile(&arguments[1..]),
+        Some("host") => host(&arguments[1..]),
         Some("inspect") => inspect(&arguments[1..]),
         Some("-h" | "--help" | "help") | None => Ok(USAGE.to_string()),
         Some(other) => Err(format!("unknown command `{other}`\n\n{USAGE}")),
@@ -122,6 +128,34 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
         files.len(),
         module.funcs.len()
     ))
+}
+
+fn host(arguments: &[String]) -> Result<String, String> {
+    let path = arguments.first().ok_or("host needs a module path")?;
+    let mut destination = None;
+    let mut rest = arguments[1..].iter();
+    while let Some(argument) = rest.next() {
+        match argument.as_str() {
+            "-o" | "--output" => {
+                destination = Some(rest.next().ok_or("-o needs a path")?.clone());
+            }
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+    }
+
+    let module = read(path)?;
+    let skeleton = codegen::generate_host(&module).map_err(|error| error.to_string())?;
+    match destination {
+        Some(destination) => {
+            std::fs::write(&destination, &skeleton)
+                .map_err(|error| format!("writing {destination}: {error}"))?;
+            Ok(format!(
+                "wrote {destination} ({} methods to implement)\n",
+                skeleton.matches("    fn ").count()
+            ))
+        }
+        None => Ok(skeleton),
+    }
 }
 
 fn inspect(arguments: &[String]) -> Result<String, String> {

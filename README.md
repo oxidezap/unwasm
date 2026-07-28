@@ -239,10 +239,43 @@ captures, the frames that stay put are 0.7% to 28% of the total — so the prize
 is smaller than it sounds, and would need a real dataflow analysis rather than
 this linear walk to grow.
 
+### What is left for a host
+
+After decompiling, what remains is the part only a host can answer. `unwasm
+host` writes the skeleton:
+
+```console
+$ unwasm host D5pLH9sfOOl.wasm -o host.rs
+wrote host.rs (102 methods to implement)
+```
+
+```rust
+impl Imports for Host {
+    // 102 methods. 125 of the module's 227 imports are Emscripten
+    // exception trampolines and are generated, so they are not here.
+
+    // ---- WASI. A subset over an in-memory filesystem answers these.
+    fn wasi_snapshot_preview1_fd_write(&mut self, p0: i32, ..) -> i32 {
+        todo!("wasi_snapshot_preview1::fd_write")
+    }
+    // ---- The application's own callbacks. Nothing but the application can
+    // say what these should do.
+    fn env_on_call_event_js_sync(&mut self, p0: i32, p1: i32) {
+        todo!("env::on_call_event_js_sync")
+    }
+```
+
+Grouped by where each import comes from, because 102 methods in one list is a
+wall and the same 102 split into "these are WASI", "these are the C++ runtime"
+and "these 35 are yours" is a plan. Every body is `todo!()` — a skeleton
+returning zero would compile, run, and be wrong, and the module could not tell
+"not written yet" from "answered 0".
+
 ## Usage
 
 ```console
 $ unwasm inspect module.wasm      # what the module contains
+$ unwasm host module.wasm         # the skeleton of what a host must answer
 $ unwasm decompile module.wasm    # to stdout
 $ unwasm decompile module.wasm -o out.rs      # one file
 $ unwasm decompile module.wasm -o out/        # mod.rs plus parts

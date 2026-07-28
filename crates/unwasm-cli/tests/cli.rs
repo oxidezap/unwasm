@@ -329,3 +329,57 @@ fn inspect_reports_a_plain_declared_memory_plainly() {
     assert!(ok);
     assert!(stdout.contains("memory: 2 pages initial\n"), "{stdout}");
 }
+
+#[test]
+fn host_writes_a_skeleton_for_the_imports_that_remain() {
+    let path = fixture("sample-host", SAMPLE);
+    let (ok, stdout, stderr) = run(&["host", path.to_str().expect("utf-8 path")]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("impl Imports for Host"), "{stdout}");
+    assert!(stdout.contains(r#"todo!("env::host_fn")"#), "{stdout}");
+    assert!(stdout.contains("1 methods"), "{stdout}");
+}
+
+#[test]
+fn host_writes_to_a_file_and_says_how_much_is_left_to_do() {
+    let path = fixture("sample-hostfile", SAMPLE);
+    let destination = scratch().join("host.rs");
+    let (ok, stdout, stderr) = run(&[
+        "host",
+        path.to_str().expect("utf-8 path"),
+        "-o",
+        destination.to_str().expect("utf-8 path"),
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("1 methods to implement"), "{stdout}");
+    let written = std::fs::read_to_string(&destination).expect("the file exists");
+    assert!(written.contains("pub struct Host"));
+}
+
+#[test]
+fn host_needs_a_module_and_rejects_what_it_does_not_understand() {
+    let (ok, _, stderr) = run(&["host"]);
+    assert!(!ok);
+    assert!(stderr.contains("host needs a module path"), "{stderr}");
+
+    let path = fixture("sample-hostargs", SAMPLE);
+    let (ok, _, stderr) = run(&["host", path.to_str().expect("utf-8 path"), "--split", "4"]);
+    assert!(!ok);
+    assert!(stderr.contains("unexpected argument `--split`"), "{stderr}");
+
+    let (ok, _, stderr) = run(&["host", path.to_str().expect("utf-8 path"), "-o"]);
+    assert!(!ok);
+    assert!(stderr.contains("-o needs a path"), "{stderr}");
+
+    let (ok, _, stderr) = run(&[
+        "host",
+        path.to_str().expect("utf-8 path"),
+        "-o",
+        "/nonexistent-directory/host.rs",
+    ]);
+    assert!(!ok);
+    assert!(
+        stderr.contains("/nonexistent-directory/host.rs"),
+        "{stderr}"
+    );
+}

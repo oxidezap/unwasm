@@ -213,11 +213,18 @@ happened twice before this was fixed properly.
 
 ## Open work
 
-1. **Host the VoIP module.** 102 imports remain: 7 WASI, 20 Emscripten runtime,
-   20 C++ runtime and syscalls, 16 embind/emval, and 40 WhatsApp callbacks.
-   `wa-wasm-oracle` implements most of the first four groups already.
-2. **Promote frame slots to variables**, with the caveat recorded above about
+1. **Host the VoIP module.** `unwasm host` writes the skeleton; what is left is
+   filling it. 67 of the 102 are mechanical (WASI, the C++ runtime, Emscripten's
+   runtime, embind/emval) and `wa-wasm-oracle` implements most of them already.
+   35 are WhatsApp's own callbacks and only the application can answer those.
+2. **Read what embind registers.** The `_embind_register_*` calls are the one
+   place a stripped module describes its own high-level API — classes, methods,
+   signatures. `wa-wasm-oracle` recovers this at run time; doing it statically
+   would name types, not just functions.
+3. **Promote frame slots to variables**, with the caveat recorded above about
    byte-exactness.
+4. **Identify library code** so libc, libc++ and PJSIP are recognised and left
+   undecompiled. On a 9 MiB module that is most of the output.
 2. **Level 1 proper**: turn shadow-stack slots into named locals, now that the
    stack pointer is identified. The frame size is in the prologue; what is
    missing is tracking which offsets from it are distinct variables.
