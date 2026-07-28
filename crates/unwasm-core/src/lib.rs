@@ -1,5 +1,6 @@
 //! unwasm: a WebAssembly decompiler whose output compiles.
 
+pub mod analysis;
 pub mod codegen;
 pub mod error;
 pub mod module;

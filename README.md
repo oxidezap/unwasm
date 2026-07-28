@@ -95,12 +95,43 @@ runs the module's own `__wasm_call_ctors` and every static initialiser with it.
 it is rustc's single compilation unit rather than anything in the decompiler:
 the emitter takes about a second.
 
+### What the module says about itself
+
+Level 0 translates. Alongside it, a small analysis pass *reads*, and annotates
+the output with what the module states about itself — never with a guess:
+
+```rust
+/// Global #0 (mutable).
+///
+/// The C stack pointer, by its use: 214 functions open by subtracting a
+/// frame from it and storing it back. The module keeps no names, so this is
+/// evidence rather than a declaration.
+pub g0_stack_pointer: i32,
+```
+
+```rust
+let t0: i32 = 211967i32 /* "called `Option::unwrap()` on a `None` value" */;
+```
+
+Both claims carry their evidence. The stack pointer is found by an exported
+name where one survives, and otherwise by counting prologues — one match is a
+coincidence, two hundred is a calling convention. Static strings are quoted from
+the data segments, and where the code passes a pointer with a length beside it
+(how Rust passes `&str`) the length is used, so an unterminated string stops
+where it actually stops instead of running into the next one.
+
+On the mozjpeg capture that recovers 247 strings, including the Rust panic
+messages that name the failing function — which is how `wa-wasm-oracle` worked
+out that module's calling convention in the first place.
+
 ## Usage
 
 ```console
 $ unwasm inspect module.wasm      # what the module contains
 $ unwasm decompile module.wasm    # to stdout
-$ unwasm decompile module.wasm -o out.rs
+$ unwasm decompile module.wasm -o out.rs      # one file
+$ unwasm decompile module.wasm -o out/        # mod.rs plus parts
+$ unwasm decompile module.wasm -o out/ --split 64
 ```
 
 The output is a self-contained Rust module — no dependencies, runtime embedded:

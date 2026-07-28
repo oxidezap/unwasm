@@ -783,3 +783,120 @@ fn a_module_with_no_functions_splits_into_just_a_mod_file() {
     assert_eq!(files.len(), 1);
     assert!(!files[0].contents.contains("mod part"));
 }
+
+/// Annotations must be readable and must change nothing.
+///
+/// Naming a global and quoting a string are claims about meaning, not about
+/// behaviour — so the same fixture still has to agree with the engine, and that
+/// is what makes them safe to add.
+#[test]
+fn the_stack_pointer_is_named_and_the_module_still_agrees() {
+    const SOURCE: &str = r#"
+        struct Point { int x; int y; int z; };
+        int through_the_stack(int a, int b) {
+            struct Point point = { a, b, a ^ b };
+            struct Point *alias = &point;
+            alias->z += alias->x;
+            return alias->x + alias->y + alias->z;
+        }
+    "#;
+    // -O0 keeps the struct in the shadow stack, which is what makes the
+    // prologue appear.
+    let wasm = common::compile_c("sp", SOURCE, "-O0");
+    let code = common::decompile(&wasm);
+    assert!(
+        code.contains("g0_stack_pointer"),
+        "the stack pointer was not recognised:\n{}",
+        &code[..code.len().min(4000)]
+    );
+    assert!(
+        code.contains("The C stack pointer"),
+        "the name arrived without its evidence"
+    );
+
+    let calls: Vec<_> = [(0, 0), (1, 2), (-3, 7)]
+        .into_iter()
+        .map(|(a, b)| {
+            common::call(
+                "through_the_stack",
+                &[common::Arg::I32(a), common::Arg::I32(b)],
+            )
+        })
+        .collect();
+    common::assert_agrees("sp", &wasm, &calls);
+}
+
+#[test]
+fn a_constant_that_addresses_a_string_carries_it_into_the_output() {
+    let wasm = common::assemble(
+        "quoted",
+        r#"(module
+            (memory (export "memory") 1)
+            (data (i32.const 100) "hello, world\00")
+            (data (i32.const 200) "\01\02\03\04\00")
+            (func (export "text_at") (param i32) (result i32)
+                i32.const 100
+                local.get 0
+                i32.add
+                i32.load8_u)
+            (func (export "binary_at") (result i32)
+                i32.const 200
+                i32.load8_u))"#,
+    );
+    let code = common::decompile(&wasm);
+    assert!(code.contains(r#"100i32 /* "hello, world" */"#), "{code}");
+    // Bytes that are not text are not quoted as if they were.
+    assert!(!code.contains("200i32 /*"), "{code}");
+    common::assert_agrees(
+        "quoted",
+        &wasm,
+        &[
+            common::call("text_at", &[common::Arg::I32(0)]),
+            common::call("text_at", &[common::Arg::I32(7)]),
+            common::call("binary_at", &[]),
+        ],
+    );
+}
+
+#[test]
+fn a_string_with_a_length_beside_it_stops_where_the_length_says() {
+    // How Rust passes `&str`: a pointer and a length, with no terminator. Read
+    // to the next NUL instead and the text runs into the string after it.
+    let wasm = common::assemble(
+        "sliced",
+        r#"(module
+            (import "env" "take" (func $take (param i32 i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 64) "first messagesecond message\00")
+            (func (export "send")
+                i32.const 64
+                i32.const 13
+                call $take))"#,
+    );
+    let code = common::decompile(&wasm);
+    assert!(code.contains(r#"64i32 /* "first message" */"#), "{code}");
+    assert!(
+        !code.contains("first messagesecond"),
+        "the length was ignored:\n{code}"
+    );
+}
+
+#[test]
+fn a_string_containing_a_comment_terminator_cannot_break_the_output() {
+    // The one way an annotation could stop the output compiling: text
+    // containing `*/` would close its own comment.
+    let wasm = common::assemble(
+        "hostile",
+        r#"(module
+            (memory (export "memory") 1)
+            (data (i32.const 32) "end */ then int x = 1; /* more\00")
+            (func (export "at") (result i32) i32.const 32 i32.load8_u))"#,
+    );
+    let code = common::decompile(&wasm);
+    assert!(
+        !code.contains("*/ then"),
+        "the comment was closed early:\n{code}"
+    );
+    // And it still builds and runs, which is the property that matters.
+    common::assert_agrees("hostile", &wasm, &[common::call("at", &[])]);
+}

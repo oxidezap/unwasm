@@ -28,6 +28,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
+use crate::analysis::{self, Analysis, Evidence};
 use crate::error::{Error, Result};
 use crate::module::{
     BlockType, ConstExpr, ExportKind, Func, LoadKind, Module, Op, StoreKind, ValType,
@@ -149,6 +150,7 @@ pub fn generate_files(module: &Module, layout: Layout) -> Result<Vec<GeneratedFi
 struct Generator<'a> {
     module: &'a Module,
     layout: Layout,
+    analysis: Analysis,
     out: String,
     parts: Vec<GeneratedFile>,
 }
@@ -158,6 +160,7 @@ impl<'a> Generator<'a> {
         Self {
             module,
             layout,
+            analysis: analysis::analyse(module),
             out: String::new(),
             parts: Vec::new(),
         }
@@ -297,7 +300,9 @@ impl<'a> Generator<'a> {
             };
             let _ = writeln!(
                 self.out,
-                "    /// Global #{index} ({mutability}).\n    pub g{index}: {},",
+                "    /// Global #{index} ({mutability}).{}\n    pub {}: {},",
+                self.global_note(index as u32),
+                global_ident(index as u32, &self.analysis),
                 global.ty.rust_name()
             );
         }
@@ -324,7 +329,8 @@ impl<'a> Generator<'a> {
         for (index, global) in self.module.globals.iter().enumerate() {
             let _ = writeln!(
                 self.out,
-                "            g{index}: {},",
+                "            {}: {},",
+                global_ident(index as u32, &self.analysis),
                 const_expr_literal(global.init)
             );
         }
@@ -434,6 +440,26 @@ impl<'a> Generator<'a> {
         Ok(())
     }
 
+    /// The doc comment a global carries when the analysis recognised it.
+    ///
+    /// The evidence goes in the comment rather than only in the name: "this is
+    /// the stack pointer" is a claim, and the reader deserves to see what it
+    /// rests on.
+    fn global_note(&self, index: u32) -> String {
+        match self.analysis.stack_pointer {
+            Some(found) if found.global == index => match found.evidence {
+                Evidence::Exported => {
+                    "\n    ///\n    /// The C stack pointer: the module exports it under that name."
+                        .to_string()
+                }
+                Evidence::Prologue { functions } => format!(
+                    "\n    ///\n    /// The C stack pointer, by its use: {functions} functions open by\n    /// subtracting a frame from it and storing it back. The module keeps\n    /// no names, so this is evidence rather than a declaration."
+                ),
+            },
+            _ => String::new(),
+        }
+    }
+
     fn table_size(&self) -> usize {
         self.module
             .elems
@@ -471,7 +497,7 @@ impl<'a> Generator<'a> {
                 ExportKind::Global => {
                     let _ = writeln!(
                         self.out,
-                        "    /// The module exports global #{} as `{}`.\n    pub fn exported_global_{}(&self) -> {} {{\n        self.g{}\n    }}\n",
+                        "    /// The module exports global #{} as `{}`.\n    pub fn exported_global_{}(&self) -> {} {{\n        self.{}\n    }}\n",
                         export.index,
                         escape_doc(&export.name),
                         sanitize(&export.name),
@@ -479,7 +505,7 @@ impl<'a> Generator<'a> {
                             .globals
                             .get(export.index as usize)
                             .map_or("i32", |global| global.ty.rust_name()),
-                        export.index
+                        global_ident(export.index, &self.analysis)
                     );
                 }
                 ExportKind::Memory | ExportKind::Table | ExportKind::Func => {}
@@ -601,7 +627,7 @@ impl<'a> Generator<'a> {
             return_type(ty)
         );
 
-        out.push_str(&Body::new(self.module, func, ty, index).emit()?);
+        out.push_str(&Body::new(self.module, &self.analysis, func, ty, index).emit()?);
         out.push_str("    }\n\n");
         Ok(out)
     }
@@ -642,6 +668,7 @@ struct Frame {
 
 struct Body<'a> {
     module: &'a Module,
+    analysis: &'a Analysis,
     func: &'a Func,
     ty: &'a crate::module::FuncType,
     index: u32,
@@ -654,17 +681,22 @@ struct Body<'a> {
     unreachable: bool,
     /// Nesting still to be skipped while unreachable.
     skipping: usize,
+    /// The instruction after the one being emitted, for the one lookahead this
+    /// backend does.
+    next_op: Option<Op>,
 }
 
 impl<'a> Body<'a> {
     fn new(
         module: &'a Module,
+        analysis: &'a Analysis,
         func: &'a Func,
         ty: &'a crate::module::FuncType,
         index: u32,
     ) -> Self {
         Self {
             module,
+            analysis,
             func,
             ty,
             index,
@@ -676,6 +708,7 @@ impl<'a> Body<'a> {
             depth: 2,
             unreachable: false,
             skipping: 0,
+            next_op: None,
         }
     }
 
@@ -700,7 +733,11 @@ impl<'a> Body<'a> {
         }
 
         let body = self.func.body.clone();
-        for op in &body {
+        for (at, op) in body.iter().enumerate() {
+            // The next instruction is worth having for one reason: a Rust
+            // string is `i32.const ptr; i32.const len`, and the length is what
+            // stops the text from running into the next string.
+            self.next_op = body.get(at + 1).cloned();
             self.op(op)?;
         }
 
@@ -1028,14 +1065,42 @@ impl<'a> Body<'a> {
             }
             Op::GlobalGet(index) => {
                 let ty = self.global_type(*index)?;
-                self.push(format!("self.g{index}"), ty, true);
+                self.push(
+                    format!("self.{}", global_ident(*index, self.analysis)),
+                    ty,
+                    true,
+                );
             }
             Op::GlobalSet(index) => {
                 let value = self.pop()?;
                 self.spill_stack();
-                self.line(&format!("self.g{index} = {};", value.code));
+                self.line(&format!(
+                    "self.{} = {};",
+                    global_ident(*index, self.analysis),
+                    value.code
+                ));
             }
-            Op::I32Const(value) => self.push(format_i32(*value), ValType::I32, true),
+            Op::I32Const(value) => {
+                // A constant that addresses a static string is quoted inline.
+                // On a minified module these are often the only readable thing
+                // left, and they cost nothing to carry: the comment travels
+                // with the expression into whatever consumes it.
+                let text = match self.next_op {
+                    // `ptr, len`: the pair a `&str` is passed as. Trying the
+                    // length first is what keeps Rust's unterminated strings
+                    // from running into each other.
+                    Some(Op::I32Const(length)) if length > 0 => {
+                        analysis::static_text_of_length(self.module, *value, length as u32)
+                            .or_else(|| analysis::static_text(self.module, *value))
+                    }
+                    _ => analysis::static_text(self.module, *value),
+                };
+                let code = match text {
+                    Some(text) => format!("{} /* {} */", format_i32(*value), escape_comment(&text)),
+                    None => format_i32(*value),
+                };
+                self.push(code, ValType::I32, true);
+            }
             Op::I64Const(value) => self.push(format_i64(*value), ValType::I64, true),
             Op::F32Const(value) => self.push(format_f32(*value), ValType::F32, true),
             Op::F64Const(value) => self.push(format_f64(*value), ValType::F64, true),
@@ -1335,6 +1400,41 @@ pub fn exported_functions(module: &Module) -> Vec<(&crate::module::Export, Strin
         }
         out.push((export, name));
     }
+    out
+}
+
+/// The field name a global gets.
+///
+/// Indices stay in the name — `g0_stack_pointer`, not `stack_pointer` — because
+/// the index is what every other view of the module uses, and a reader tracing
+/// a `global.get 0` should not have to work out which field that became.
+fn global_ident(index: u32, analysis: &Analysis) -> String {
+    match analysis.stack_pointer {
+        Some(found) if found.global == index => format!("g{index}_stack_pointer"),
+        _ => format!("g{index}"),
+    }
+}
+
+/// Makes text safe to sit inside a `/* */` comment.
+///
+/// A string containing `*/` would otherwise close the comment early and the
+/// output would not compile — which, for this project, is the one unacceptable
+/// outcome. Newlines and tabs are escaped for the same reason a one-line
+/// comment wants to stay on one line.
+fn escape_comment(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '*' => out.push('∗'),
+            '/' => out.push('∕'),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '"' => out.push('\''),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
     out
 }
 
