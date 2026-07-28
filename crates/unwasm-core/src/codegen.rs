@@ -1828,6 +1828,8 @@ struct Body<'a> {
     map_offsets: bool,
     /// The offset of the first operator not yet attributed to a line.
     pending: Option<u32>,
+    /// Lines emitted so far, kept rather than counted.
+    lines: usize,
     /// This function's C stack frame, when it has one.
     frame: Option<&'a StackFrame>,
     func: &'a Func,
@@ -1869,6 +1871,7 @@ impl<'a> Body<'a> {
             spans: Vec::new(),
             map_offsets,
             pending: None,
+            lines: 0,
             frame: analysis.frames.get(&index),
             func,
             ty,
@@ -1962,11 +1965,17 @@ impl<'a> Body<'a> {
     }
 
     /// How many lines have been emitted so far.
+    ///
+    /// Counted as they go rather than by scanning the output: this is asked
+    /// once per operator, and a 100k-line function whose every operator
+    /// re-counted the whole buffer turned a three-second decompile into one
+    /// that had not finished after ten minutes.
     fn emitted_lines(&self) -> usize {
-        self.out.matches('\n').count()
+        self.lines
     }
 
     fn line(&mut self, text: &str) {
+        self.lines += 1;
         for _ in 0..self.depth {
             self.out.push_str("    ");
         }
