@@ -169,12 +169,28 @@ Measure before believing a feature list: the VoIP module's `target_features`
 asks for `reference-types` and `multivalue`, and the module uses neither — one
 `funcref` declaration and zero multi-result blocks across 13347 functions.
 
+## A trampoline must not catch a trap
+
+The generated `invoke_*` trampolines reproduce Emscripten's glue, including the
+part that is easy to drop: `if (e !== e+0) throw e`. A host throws a C++
+exception with `rt::throw`, which panics with a `GuestException`; the trampoline
+catches that type and nothing else, and re-raises everything else with
+`resume_unwind`. Catching all panics would turn every trap inside a `try` into a
+silently handled error — the exact failure this project is built to prevent.
+
+A trampoline is generated only when the module has all three parts: a stack
+pointer, an exported `setThrew`, and a declared type for what the table holds.
+Missing any of them, the import stays the host's — `analysis.rs` decides, and
+the tests cover each refusal.
+
 ## Open work
 
-1. **Generate the `invoke_*` trampolines.** 125 of the VoIP module's 228 imports
-   are Emscripten's exception trampolines, and they are mechanical: clear
-   `__THREW__`, call through the table, read it back. Generating them turns 228
-   imports to implement into about 100.
+1. **Name functions from the strings they reference.** The VoIP module is
+   stripped — no name section, no mangled symbols — but its data segments are
+   full of specific log messages (`parse_xmpp_offer: invalid call-creator jid`).
+   A function that references one almost certainly is that function. For a
+   binary with no names at all this is the largest legibility win available, and
+   it is cheap.
 2. **Level 1 proper**: turn shadow-stack slots into named locals, now that the
    stack pointer is identified. The frame size is in the prologue; what is
    missing is tracking which offsets from it are distinct variables.

@@ -262,10 +262,28 @@ impl<'a> Generator<'a> {
     /// traps, which keeps "nobody supplied a host" distinguishable from "the
     /// host returned 0" — the distinction the oracle work in wa-wasm-oracle
     /// found the hard way.
+    /// Whether an import is one this backend generates rather than asks for.
+    fn is_generated(&self, index: usize) -> bool {
+        self.analysis
+            .invokes
+            .iter()
+            .any(|invoke| invoke.import == index as u32)
+    }
+
     fn imports_trait(&mut self) {
         self.out
             .push_str("/// What the module needs from its host.\npub trait Imports {\n");
-        for import in &self.module.func_imports {
+        if !self.analysis.invokes.is_empty() {
+            let _ = writeln!(
+                self.out,
+                "    // {} `invoke_*` imports are not here: they are Emscripten's\n    // exception trampolines, and every part of one is already in this\n    // module — the table, the stack pointer, and its own `setThrew`. They\n    // are generated below rather than asked of you.",
+                self.analysis.invokes.len()
+            );
+        }
+        for (index, import) in self.module.func_imports.iter().enumerate() {
+            if self.is_generated(index) {
+                continue;
+            }
             let ty = self.module.types.get(import.type_index as usize);
             let signature = ty.map_or_else(String::new, signature_of);
             let result = ty.map_or_else(String::new, return_type);
@@ -289,7 +307,10 @@ impl<'a> Generator<'a> {
             "pub struct NoImports;\n\n",
             "impl Imports for NoImports {\n",
         ));
-        for import in &self.module.func_imports {
+        for (index, import) in self.module.func_imports.iter().enumerate() {
+            if self.is_generated(index) {
+                continue;
+            }
             let ty = self.module.types.get(import.type_index as usize);
             let signature = ty.map_or_else(String::new, signature_of);
             let result = ty.map_or_else(String::new, return_type);
@@ -545,11 +566,25 @@ impl<'a> Generator<'a> {
 
     /// Calls to imported functions go through a thunk, so a call site reads the
     /// same whether the callee is defined here or supplied by the host.
+    ///
+    /// An `invoke_*` import gets a generated trampoline instead — see
+    /// [`Self::invoke_trampoline`].
     fn import_thunks(&mut self) {
         for (index, import) in self.module.func_imports.iter().enumerate() {
             let Some(ty) = self.module.types.get(import.type_index as usize) else {
                 continue;
             };
+            if let Some(invoke) = self
+                .analysis
+                .invokes
+                .iter()
+                .find(|invoke| invoke.import == index as u32)
+                .copied()
+            {
+                let ty = ty.clone();
+                self.invoke_trampoline(invoke, &ty, import.field.clone());
+                continue;
+            }
             let args: Vec<String> = (0..ty.params.len()).map(|at| format!("p{at}")).collect();
             let _ = writeln!(
                 self.out,
@@ -564,6 +599,52 @@ impl<'a> Generator<'a> {
         }
     }
 
+    /// Emits one `invoke_*` trampoline.
+    ///
+    /// This is Emscripten's glue, in Rust:
+    ///
+    /// ```js
+    /// var sp = stackSave();
+    /// try { getWasmTableEntry(index)(a, b); }
+    /// catch (e) { stackRestore(sp); if (e !== e+0) throw e; _setThrew(1, 0); }
+    /// ```
+    ///
+    /// The `if (e !== e+0) throw e` is the part worth copying carefully: the
+    /// glue re-throws anything that is not one of its own exceptions, so a trap
+    /// stays a trap. Catching everything would turn a crash into a quietly
+    /// handled error, which is the failure mode a decompiler must not have.
+    fn invoke_trampoline(
+        &mut self,
+        invoke: crate::analysis::Invoke,
+        ty: &crate::module::FuncType,
+        field: String,
+    ) {
+        let index = invoke.import;
+        let args: Vec<String> = (1..ty.params.len()).map(|at| format!("p{at}")).collect();
+        let stack_pointer = global_ident(
+            self.analysis
+                .stack_pointer
+                .expect("a trampoline is only generated with one")
+                .global,
+            &self.analysis,
+        );
+        let set_threw = self
+            .analysis
+            .set_threw
+            .expect("a trampoline is only generated with one");
+        let zero = ty.results.first().map_or("", |result| result.zero());
+
+        let _ = writeln!(
+            self.out,
+            "    /// `env::{field}` — generated, not delegated.\n    ///\n    /// Emscripten's exception trampoline: call through the table, and if the\n    /// callee throws, restore the stack pointer and tell the module through\n    /// its own `setThrew`. A trap is not an exception and is re-raised.\n    fn f{index}(&mut self{}) {} {{\n        let saved = self.{stack_pointer};\n        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{\n            self.call_indirect_{}(p0{}{})\n        }}));\n        match outcome {{\n            Ok(value) => value,\n            Err(payload) => {{\n                if payload.is::<rt::GuestException>() {{\n                    self.{stack_pointer} = saved;\n                    self.f{set_threw}(1, 0);\n                    {zero}\n                }} else {{\n                    std::panic::resume_unwind(payload)\n                }}\n            }}\n        }}\n    }}\n",
+            signature_of(ty),
+            return_type(ty),
+            invoke.callee_type,
+            if args.is_empty() { "" } else { ", " },
+            args.join(", ")
+        );
+    }
+
     /// `call_indirect` becomes a match over the table, one dispatcher per
     /// signature. The type check wasm does at run time is the match arm's
     /// guard: a slot holding a function of another signature falls through to
@@ -576,6 +657,11 @@ impl<'a> Generator<'a> {
                     signatures.insert(*type_index);
                 }
             }
+        }
+        // A trampoline dispatches through the table too, and its signature may
+        // appear in no `call_indirect` at all.
+        for invoke in &self.analysis.invokes {
+            signatures.insert(invoke.callee_type);
         }
         for type_index in signatures {
             let ty = self.module.types.get(type_index as usize).ok_or_else(|| {
@@ -1823,6 +1909,57 @@ mod tests {
             const_expr_literal(ConstExpr::GlobalGet(3)),
             "/* global.get 3 */ 0"
         );
+    }
+
+    #[test]
+    fn quoted_text_stays_on_one_line_and_inside_its_comment() {
+        // A string containing the comment terminator would close it early and
+        // the output would not compile — the one thing that must never happen.
+        assert!(!escape_comment("end */ here").contains("*/"));
+        // Newlines and tabs would break the line the comment sits on.
+        assert_eq!(escape_comment("a\nb"), "\"a\\nb\"");
+        assert_eq!(escape_comment("a\tb"), "\"a\\tb\"");
+        assert_eq!(escape_comment("say \"this\""), "\"say 'this'\"");
+        assert_eq!(escape_comment("plain"), "\"plain\"");
+    }
+
+    #[test]
+    fn a_frame_with_no_resolved_slots_says_so() {
+        // A frame whose address escapes immediately: it has a size, and nothing
+        // else could be worked out. Printing an empty table would read as "no
+        // slots", which is a different claim.
+        let summary = frame_summary(&StackFrame {
+            size: 16,
+            base_local: 0,
+            slots: std::collections::BTreeMap::new(),
+            escapes: true,
+            publishes: true,
+        });
+        assert!(
+            summary.contains("No slot accesses were resolved"),
+            "{summary}"
+        );
+        assert!(!summary.contains("| offset |"));
+    }
+
+    #[test]
+    fn a_stack_pointer_found_by_its_use_says_how_many_prologues() {
+        let module = Module {
+            globals: vec![crate::module::GlobalDef {
+                ty: ValType::I32,
+                mutable: true,
+                init: ConstExpr::I32(0),
+            }],
+            ..Module::default()
+        };
+        let mut generator = Generator::new(&module, Layout::Single);
+        generator.analysis.stack_pointer = Some(crate::analysis::StackPointer {
+            global: 0,
+            evidence: Evidence::Prologue { functions: 214 },
+        });
+        let note = generator.global_note(0);
+        assert!(note.contains("214 functions"), "{note}");
+        assert!(note.contains("evidence rather than a declaration"));
     }
 
     #[test]

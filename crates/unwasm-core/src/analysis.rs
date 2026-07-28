@@ -11,7 +11,7 @@
 //! many times the pattern appeared, and anything with no evidence comes back as
 //! `None` rather than as the most likely index.
 
-use crate::module::{ConstExpr, ExportKind, Module, Op};
+use crate::module::{ConstExpr, ExportKind, Module, Op, ValType};
 
 /// How the C stack pointer was identified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +84,34 @@ pub struct Frame {
     pub publishes: bool,
 }
 
+/// An `invoke_*` import that can be generated instead of asked of the host.
+///
+/// Emscripten routes any call that might throw through one of these: the first
+/// argument is a table index, the rest are the callee's own arguments. The
+/// JavaScript glue implements it as
+///
+/// ```js
+/// function invoke_vii(index, a, b) {
+///   var sp = stackSave();
+///   try { getWasmTableEntry(index)(a, b); }
+///   catch (e) { stackRestore(sp); if (e !== e+0) throw e; _setThrew(1, 0); }
+/// }
+/// ```
+///
+/// Every part of that is available here: the table, the stack pointer, and the
+/// module's own exported `setThrew`. So it is generated rather than left as one
+/// more thing for a host to write — 125 of the VoIP module's 228 imports are
+/// these, and none of them says anything about the module that the module does
+/// not already say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Invoke {
+    /// The imported function's index.
+    pub import: u32,
+    /// The type of what it dispatches to: the import's signature without its
+    /// leading table index.
+    pub callee_type: u32,
+}
+
 /// What could be read out of a module.
 #[derive(Debug, Clone, Default)]
 pub struct Analysis {
@@ -91,18 +119,81 @@ pub struct Analysis {
     pub stack_pointer: Option<StackPointer>,
     /// Frames, by function index. Absent for a function with no prologue.
     pub frames: std::collections::BTreeMap<u32, Frame>,
+    /// The `invoke_*` trampolines that can be generated.
+    pub invokes: Vec<Invoke>,
+    /// The module's exported `setThrew`, which a trampoline needs to report a
+    /// caught exception back to the guest.
+    pub set_threw: Option<u32>,
 }
 
 /// Reads a module for the things worth naming.
 #[must_use]
 pub fn analyse(module: &Module) -> Analysis {
     let stack_pointer = find_stack_pointer(module);
+    let set_threw = find_export(module, &["setThrew", "_setThrew"]);
+    // A trampoline needs somewhere to report the exception it caught and a
+    // stack pointer to restore. Without either, generating one would be
+    // inventing behaviour rather than reproducing the glue's.
+    let invokes = if set_threw.is_some() && stack_pointer.is_some() {
+        find_invokes(module)
+    } else {
+        Vec::new()
+    };
     Analysis {
         frames: stack_pointer
             .map(|sp| find_frames(module, sp))
             .unwrap_or_default(),
         stack_pointer,
+        invokes,
+        set_threw,
     }
+}
+
+fn find_export(module: &Module, names: &[&str]) -> Option<u32> {
+    module
+        .exports
+        .iter()
+        .find(|export| export.kind == ExportKind::Func && names.contains(&export.name.as_str()))
+        .map(|export| export.index)
+}
+
+/// Finds the `invoke_*` imports whose dispatch target the module already has a
+/// type for.
+///
+/// The name is the signal, and it is a reliable one: import names are the
+/// module's interface to its host, so a minifier cannot touch them — the VoIP
+/// module keeps `invoke_vii` while every function name is gone. The signature
+/// is then checked rather than trusted: the first parameter must be the table
+/// index, and the rest must match a type the module declares, or there is no
+/// dispatcher to call.
+fn find_invokes(module: &Module) -> Vec<Invoke> {
+    let mut invokes = Vec::new();
+    for (index, import) in module.func_imports.iter().enumerate() {
+        if !import.field.starts_with("invoke_") {
+            continue;
+        }
+        let Some(ty) = module.types.get(import.type_index as usize) else {
+            continue;
+        };
+        let Some((first, rest)) = ty.params.split_first() else {
+            continue;
+        };
+        if *first != ValType::I32 {
+            continue;
+        }
+        // The callee's signature is the import's without the table index.
+        let callee_type = module
+            .types
+            .iter()
+            .position(|candidate| candidate.params == rest && candidate.results == ty.results);
+        if let Some(callee_type) = callee_type {
+            invokes.push(Invoke {
+                import: index as u32,
+                callee_type: callee_type as u32,
+            });
+        }
+    }
+    invokes
 }
 
 fn find_frames(
@@ -1249,6 +1340,118 @@ mod tests {
         let mut body = frame_prologue(16, 0);
         body.extend(frame_epilogue(16, 0));
         assert!(frame_of(body).publishes);
+    }
+
+    // ---- trampolines ----
+
+    /// A module with the three things a trampoline needs: a stack pointer, an
+    /// exported `setThrew`, and a type for what the table holds.
+    fn trampoline_module(import_params: Vec<ValType>, import_results: Vec<ValType>) -> Module {
+        let mut module = module_with_globals(1, true);
+        module.exports.push(crate::module::Export {
+            name: "__stack_pointer".into(),
+            kind: ExportKind::Global,
+            index: 0,
+        });
+        module.exports.push(crate::module::Export {
+            name: "setThrew".into(),
+            kind: ExportKind::Func,
+            index: 1,
+        });
+        module.types = vec![
+            FuncType {
+                params: import_params,
+                results: import_results,
+            },
+            // The callee's type: one i32, no result.
+            FuncType {
+                params: vec![ValType::I32],
+                results: Vec::new(),
+            },
+        ];
+        module.func_imports.push(crate::module::ImportedFunc {
+            module: "env".into(),
+            field: "invoke_vi".into(),
+            type_index: 0,
+        });
+        // Two prologues, so the stack pointer is identified by use as well.
+        with_bodies(module, vec![prologue(0), prologue(0)])
+    }
+
+    #[test]
+    fn a_trampoline_is_found_by_its_name_and_checked_by_its_signature() {
+        let module = trampoline_module(vec![ValType::I32, ValType::I32], Vec::new());
+        let analysis = analyse(&module);
+        assert_eq!(analysis.invokes.len(), 1);
+        assert_eq!(analysis.invokes[0].import, 0);
+        assert_eq!(
+            analysis.invokes[0].callee_type, 1,
+            "the type without the index"
+        );
+        assert_eq!(analysis.set_threw, Some(1));
+    }
+
+    #[test]
+    fn an_invoke_with_no_leading_table_index_is_not_one() {
+        // The name matches and the signature does not: nothing to dispatch.
+        let module = trampoline_module(Vec::new(), Vec::new());
+        assert!(analyse(&module).invokes.is_empty());
+        // A first parameter that is not an index either.
+        let module = trampoline_module(vec![ValType::F64, ValType::I32], Vec::new());
+        assert!(analyse(&module).invokes.is_empty());
+    }
+
+    #[test]
+    fn an_invoke_whose_callee_type_the_module_lacks_is_left_alone() {
+        // `(i32, i64) -> ()` would dispatch to `(i64) -> ()`, and the module
+        // declares no such type — so there is no dispatcher to call.
+        let module = trampoline_module(vec![ValType::I32, ValType::I64], Vec::new());
+        assert!(analyse(&module).invokes.is_empty());
+    }
+
+    #[test]
+    fn an_invoke_whose_type_index_is_missing_is_left_alone() {
+        let mut module = trampoline_module(vec![ValType::I32, ValType::I32], Vec::new());
+        module.func_imports[0].type_index = 99;
+        assert!(analyse(&module).invokes.is_empty());
+    }
+
+    #[test]
+    fn an_import_that_is_not_an_invoke_is_never_taken_for_one() {
+        let mut module = trampoline_module(vec![ValType::I32, ValType::I32], Vec::new());
+        module.func_imports[0].field = "call_something".into();
+        assert!(analyse(&module).invokes.is_empty());
+    }
+
+    #[test]
+    fn without_set_threw_no_trampoline_is_generated() {
+        let mut module = trampoline_module(vec![ValType::I32, ValType::I32], Vec::new());
+        module.exports.retain(|export| export.name != "setThrew");
+        let analysis = analyse(&module);
+        assert!(analysis.set_threw.is_none());
+        assert!(analysis.invokes.is_empty());
+    }
+
+    #[test]
+    fn the_underscored_spelling_of_set_threw_counts_too() {
+        let mut module = trampoline_module(vec![ValType::I32, ValType::I32], Vec::new());
+        for export in &mut module.exports {
+            if export.name == "setThrew" {
+                export.name = "_setThrew".into();
+            }
+        }
+        assert_eq!(analyse(&module).set_threw, Some(1));
+    }
+
+    #[test]
+    fn a_global_exported_as_set_threw_is_not_a_function() {
+        let mut module = trampoline_module(vec![ValType::I32, ValType::I32], Vec::new());
+        for export in &mut module.exports {
+            if export.name == "setThrew" {
+                export.kind = ExportKind::Global;
+            }
+        }
+        assert!(analyse(&module).set_threw.is_none());
     }
 
     #[test]

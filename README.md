@@ -70,6 +70,8 @@ Concretely:
 - **Imports become a trait.** A host implements `Imports`; the default
   `NoImports` traps on every call, so "nobody supplied a host" never looks like
   "the host returned 0".
+- **Emscripten's `invoke_*` trampolines are generated**, not asked for. On the
+  VoIP module that is 125 of 228 imports; see below.
 - **Nothing is skipped.** An opcode with no faithful Rust form is an error
   naming the construct — never a comment in the output, never a stub.
 - **No `unsafe`.** `unsafe_code = "forbid"` for this crate and for what it
@@ -309,16 +311,65 @@ Three things are not "almost":
 All 67 are compared instruction by instruction against V8 running a real shared
 memory, so the two sides differ only where the thread count makes them.
 
+### The `invoke_*` trampolines
+
+Emscripten routes any call that might throw through an `invoke_*` import: the
+first argument is a table index, the rest are the callee's own. The JavaScript
+glue implements it as
+
+```js
+function invoke_vii(index, a, b) {
+  var sp = stackSave();
+  try { getWasmTableEntry(index)(a, b); }
+  catch (e) { stackRestore(sp); if (e !== e+0) throw e; _setThrew(1, 0); }
+}
+```
+
+Every part of that is already in the module — the table, the stack pointer, and
+its own exported `setThrew` — so it is generated rather than left as one more
+thing for a host to write. **The VoIP module's 228 imports become 102.**
+
+```rust
+/// `env::invoke_vii` — generated, not delegated.
+fn f96(&mut self, p0: i32, p1: i32, p2: i32) {
+    let saved = self.g0_stack_pointer;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        self.call_indirect_6(p0, p1, p2)
+    }));
+    match outcome {
+        Ok(value) => value,
+        Err(payload) => {
+            if payload.is::<rt::GuestException>() {
+                self.g0_stack_pointer = saved;
+                self.f596(1, 0);
+            } else {
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+}
+```
+
+The clause worth copying carefully is `if (e !== e+0) throw e`: the glue
+re-throws anything that is not one of its own exceptions. A host throws by
+calling `rt::throw`, which the trampoline catches; **a trap is not an exception
+and is re-raised**. A trampoline that caught everything would turn a crash into
+a quietly handled error, which is the failure mode this project exists to avoid,
+and it has a test of its own.
+
+A trampoline is only generated when the module supplies all three parts. No
+`setThrew`, no stack pointer, or no type for what the table holds, and the
+import stays the host's to implement.
+
 ## Known limits
 
 - **Compile time still scales with the module**, just not catastrophically:
   23 seconds for 2.0 MiB of wasm. The 9.4 MiB VoIP module would be several
   minutes, if the rest of it were supported.
-- **The VoIP module decompiles but cannot yet run**: it needs 228 host imports,
-  of which 125 are `invoke_*` exception trampolines that could be generated
-  mechanically. Its `target_features` also asks for `reference-types` and
-  `multivalue`, but the module uses neither — one `funcref` declaration and zero
-  multi-result blocks in 13347 functions.
+- **The VoIP module decompiles but cannot yet run**: 102 host imports remain,
+  and they are the ones only a host can answer — 7 WASI, 20 Emscripten runtime,
+  20 C++ runtime and syscalls, 16 embind/emval, and 40 callbacks belonging to
+  WhatsApp itself.
 - **No SIMD, no reference types, no exceptions, no multi-value.** Each is
   refused by name.
 - **Level 0 only.** Linear memory is bytes; a C local that lived in the shadow

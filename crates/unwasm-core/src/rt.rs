@@ -325,6 +325,36 @@ impl Memory {
     }
 }
 
+/// An exception thrown by the guest, on its way out through Rust's unwinder.
+///
+/// Emscripten compiles a C++ `throw` into a call to the imported
+/// `__cxa_throw`, and the JavaScript glue turns that into a JS exception which
+/// the `invoke_*` trampolines catch. A host here does the same thing by calling
+/// [`throw`], and the generated trampolines catch exactly this type.
+///
+/// The distinction matters as much as the mechanism. The glue checks
+/// `if (e !== e+0) throw e` — anything that is not one of its own exceptions is
+/// re-thrown rather than swallowed. A trap is not a C++ exception, and a
+/// trampoline that caught traps too would turn a crash into a silently handled
+/// error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestException {
+    /// The exception object, as the guest's `__cxa_throw` was given it.
+    pub exception: i32,
+    /// Its `std::type_info`, for a host that wants to match on the type.
+    pub info: i32,
+}
+
+/// Throws a guest exception. What a host's `__cxa_throw` calls.
+///
+/// # Panics
+///
+/// Always: that is what a throw is here. A generated `invoke_*` trampoline
+/// catches it; anywhere else it propagates like any other panic.
+pub fn throw(exception: i32, info: i32) -> ! {
+    std::panic::panic_any(GuestException { exception, info });
+}
+
 /// Which read-modify-write an atomic performs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rmw {
@@ -1036,6 +1066,30 @@ mod tests {
     #[should_panic(expected = "unaligned atomic operation")]
     fn notify_checks_alignment_too() {
         Memory::new(1, None).atomic_notify(2, 0);
+    }
+
+    #[test]
+    fn a_guest_exception_carries_what_the_guest_threw() {
+        let outcome = std::panic::catch_unwind(|| throw(0x1234, 0x5678));
+        let payload = outcome.expect_err("a throw is a panic");
+        let exception = payload
+            .downcast_ref::<GuestException>()
+            .expect("and it carries the exception");
+        assert_eq!(exception.exception, 0x1234);
+        assert_eq!(exception.info, 0x5678);
+    }
+
+    #[test]
+    fn a_trap_is_not_a_guest_exception() {
+        // What the generated trampolines rely on to tell one from the other:
+        // a trap panics with a string, not with this type.
+        let outcome = std::panic::catch_unwind(|| trap("out of bounds memory access"));
+        let payload = outcome.expect_err("a trap is a panic too");
+        assert!(
+            payload.downcast_ref::<GuestException>().is_none(),
+            "a trampoline would swallow this if it were"
+        );
+        assert!(payload.downcast_ref::<String>().is_some());
     }
 
     #[test]
