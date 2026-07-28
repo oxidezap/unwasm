@@ -224,6 +224,35 @@ at a computed `base + offset`, and a segment placed at two different constant
 addresses is dropped rather than picked between — both are true, so neither can
 resolve an address back to text.
 
+### The API the module publishes
+
+embind is how a C++ module tells JavaScript what it exposes. The registration
+runs at startup — but its arguments are constants, including the pointer to
+each name *and the pointer to the array of type ids*, so the whole thing reads
+statically:
+
+```
+function int initVoipStack(std::string, std::string, std::string)
+function void handleIncomingSignalingOffer(std::string, std::string, std::string,
+         std::string, std::string, bool, bool, std::string, Uint8List)
+class Uint8List
+class_constructor Uint8List::Uint8List()
+```
+
+Each type id is the address of a `std::type_info` that some other registration
+names, so `std::string` and `bool` come back as themselves rather than as `i32`.
+**This is the only place in a stripped module where a type has a name at all** —
+everything else this crate recovers is what the compiler left behind, and this
+is what the author published. 111 registrations in the VoIP module, 75 named,
+37 with full signatures.
+
+Three details that each cost a wrong answer before they were right: a class
+registers three ids for itself (the class, a pointer, a const pointer), so a
+method returning the second is returning the class; the types can be registered
+*after* the function that uses them, so it takes two passes; and `int` is three
+characters, which the general text reader refuses as too short to be a string —
+losing the most common type in any module.
+
 ### The shadow stack
 
 A C function's locals do not all fit in wasm locals: anything whose address is

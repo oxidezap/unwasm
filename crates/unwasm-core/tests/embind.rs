@@ -191,3 +191,296 @@ fn the_voip_modules_own_api_comes_back() {
         names.len()
     );
 }
+
+/// The types, not just the names.
+///
+/// embind passes them as a pointer to an array of type ids, and each id is the
+/// address of a `std::type_info` that some other registration names. Both
+/// halves are static.
+#[test]
+fn a_registered_function_comes_back_with_its_c_plus_plus_signature() {
+    let wasm = common::assemble(
+        "embind-types",
+        r#"(module
+            (import "env" "_embind_register_void" (func $reg_void (param i32 i32)))
+            (import "env" "_embind_register_bool"
+                (func $reg_bool (param i32 i32 i32 i32 i32)))
+            (import "env" "_embind_register_std_string" (func $reg_string (param i32 i32)))
+            (import "env" "_embind_register_function"
+                (func $reg_fn (param i32 i32 i32 i32 i32 i32 i32)))
+            (memory (export "memory") 1)
+            ;; type ids, and the names they are registered under
+            (data (i32.const 100) "void\00")
+            (data (i32.const 110) "bool\00")
+            (data (i32.const 120) "std::string\00")
+            (data (i32.const 140) "startVoipCall\00")
+            ;; the argument type array: [void, std::string, bool]
+            (data (i32.const 200) "\01\00\00\00\03\00\00\00\02\00\00\00")
+            (func (export "__wasm_call_ctors")
+                ;; register the types: id 1 is void, 2 is bool, 3 is std::string
+                i32.const 1 i32.const 100 call $reg_void
+                i32.const 2 i32.const 110 i32.const 1 i32.const 1 i32.const 0 call $reg_bool
+                i32.const 3 i32.const 120 call $reg_string
+                ;; register the function taking (std::string, bool) and returning void
+                i32.const 140 i32.const 3 i32.const 200
+                i32.const 0 i32.const 0 i32.const 0 i32.const 0
+                call $reg_fn))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let registrations = analysis::analyse(&module).registrations;
+    let function = registrations
+        .iter()
+        .find(|registration| registration.name.as_deref() == Some("startVoipCall"))
+        .expect("registered");
+    assert_eq!(
+        function.signature.as_deref(),
+        Some("void startVoipCall(std::string, bool)")
+    );
+}
+
+#[test]
+fn a_type_registered_after_it_is_used_is_still_resolved() {
+    // The order is whatever the module's initialisers happen to run in, and
+    // nothing says the types come first.
+    let wasm = common::assemble(
+        "embind-order",
+        r#"(module
+            (import "env" "_embind_register_integer"
+                (func $reg_int (param i32 i32 i32 i32 i32)))
+            (import "env" "_embind_register_function"
+                (func $reg_fn (param i32 i32 i32 i32 i32 i32 i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 100) "int\00")
+            (data (i32.const 140) "twice\00")
+            (data (i32.const 200) "\01\00\00\00\01\00\00\00")
+            (func (export "__wasm_call_ctors")
+                i32.const 140 i32.const 2 i32.const 200
+                i32.const 0 i32.const 0 i32.const 0 i32.const 0
+                call $reg_fn
+                ;; the type is registered afterwards — and `int` is three
+                ;; characters, which a general text read would refuse
+                i32.const 1 i32.const 100 i32.const 4 i32.const 0 i32.const 0
+                call $reg_int))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let registrations = analysis::analyse(&module).registrations;
+    let function = registrations
+        .iter()
+        .find(|registration| registration.name.as_deref() == Some("twice"))
+        .expect("registered");
+    assert_eq!(function.signature.as_deref(), Some("int twice(int)"));
+}
+
+/// A class, its constructor and a method — the shape embind's generated code
+/// has, in the order it has it.
+const CLASS_WITH_METHOD: &str = r#"(module
+            (import "env" "_embind_register_integer"
+                (func $reg_int (param i32 i32 i32 i32 i32)))
+            (import "env" "_embind_register_class"
+                (func $reg_class
+                    (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)))
+            (import "env" "_embind_register_class_function"
+                (func $reg_method (param i32 i32 i32 i32 i32 i32 i32 i32 i32)))
+            (import "env" "_embind_register_class_constructor"
+                (func $reg_ctor (param i32 i32 i32 i32 i32 i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 100) "int\00")
+            (data (i32.const 110) "Uint8List\00")
+            (data (i32.const 130) "push_back\00")
+            (data (i32.const 200) "\01\00\00\00\01\00\00\00")
+            (data (i32.const 220) "\0a\00\00\00")
+            (func (export "__wasm_call_ctors")
+                i32.const 1 i32.const 100 i32.const 4 i32.const 0 i32.const 0
+                call $reg_int
+                ;; class id 9, pointer id 10, const pointer id 11
+                i32.const 9 i32.const 10 i32.const 11 i32.const 0 i32.const 0
+                i32.const 0 i32.const 0 i32.const 0 i32.const 0 i32.const 0
+                i32.const 110
+                i32.const 0 i32.const 0
+                call $reg_class
+                ;; its constructor, which returns a pointer to the class
+                i32.const 9 i32.const 1 i32.const 220 i32.const 0 i32.const 0 i32.const 0
+                call $reg_ctor
+                ;; and a method
+                i32.const 9 i32.const 130 i32.const 2 i32.const 200
+                i32.const 0 i32.const 0 i32.const 0 i32.const 0 i32.const 0
+                call $reg_method))"#;
+
+#[test]
+fn a_method_belongs_to_the_class_registered_before_it() {
+    let wasm = common::assemble("embind-method", CLASS_WITH_METHOD);
+    let module = Module::parse(&wasm).expect("valid");
+    let registrations = analysis::analyse(&module).registrations;
+
+    let method = registrations
+        .iter()
+        .find(|registration| registration.name.as_deref() == Some("push_back"))
+        .expect("registered");
+    assert_eq!(method.class.as_deref(), Some("Uint8List"));
+    assert_eq!(method.signature.as_deref(), Some("int push_back(int)"));
+
+    // A constructor is named after its class rather than returning an address.
+    let constructor = registrations
+        .iter()
+        .find(|registration| registration.kind.ends_with("class_constructor"))
+        .expect("registered");
+    assert_eq!(constructor.signature.as_deref(), Some("Uint8List()"));
+    assert_eq!(constructor.class.as_deref(), Some("Uint8List"));
+}
+
+#[test]
+fn a_type_nothing_names_is_shown_as_its_address_rather_than_guessed_at() {
+    let wasm = common::assemble(
+        "embind-unknown-type",
+        r#"(module
+            (import "env" "_embind_register_function"
+                (func $reg_fn (param i32 i32 i32 i32 i32 i32 i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 140) "mystery\00")
+            (data (i32.const 200) "\07\00\00\00")
+            (func (export "__wasm_call_ctors")
+                i32.const 140 i32.const 1 i32.const 200
+                i32.const 0 i32.const 0 i32.const 0 i32.const 0
+                call $reg_fn))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let registrations = analysis::analyse(&module).registrations;
+    assert_eq!(
+        registrations[0].signature.as_deref(),
+        Some("type@7 mystery()"),
+        "an id nothing registered is an address, and says so"
+    );
+}
+
+#[test]
+fn the_signatures_reach_the_top_of_the_generated_module() {
+    // The same module as the signature test above: a registration with types
+    // to resolve, rather than one with the type arguments zeroed.
+    let wasm = common::assemble(
+        "embind-signature-output",
+        r#"(module
+            (import "env" "_embind_register_std_string" (func $reg_string (param i32 i32)))
+            (import "env" "_embind_register_function"
+                (func $reg_fn (param i32 i32 i32 i32 i32 i32 i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 120) "std::string\00")
+            (data (i32.const 140) "startVoipCall\00")
+            (data (i32.const 200) "\03\00\00\00\03\00\00\00")
+            (func (export "__wasm_call_ctors")
+                i32.const 3 i32.const 120 call $reg_string
+                i32.const 140 i32.const 2 i32.const 200
+                i32.const 0 i32.const 0 i32.const 0 i32.const 0
+                call $reg_fn))"#,
+    );
+    let code = common::decompile(&wasm);
+    assert!(
+        code.contains("The API this module registers with embind"),
+        "{code}"
+    );
+    assert!(
+        code.contains("//   function: std::string startVoipCall(std::string)"),
+        "the types reach the reader, not just the name:\n{code}"
+    );
+}
+
+#[test]
+fn a_method_reaches_the_output_with_its_class() {
+    let wasm = common::assemble("embind-method-output", CLASS_WITH_METHOD);
+    let code = common::decompile(&wasm);
+    assert!(
+        code.contains("//   class function: Uint8List::int push_back(int)"),
+        "a method is printed under the class it belongs to:\n{code}"
+    );
+    assert!(
+        code.contains("//   class constructor: Uint8List::Uint8List()"),
+        "{code}"
+    );
+}
+
+#[test]
+fn a_type_array_outside_static_memory_reads_as_unknown() {
+    // The pointer is a number the module never wrote anything at.
+    let wasm = common::assemble(
+        "embind-far-types",
+        r#"(module
+            (import "env" "_embind_register_function"
+                (func $reg_fn (param i32 i32 i32 i32 i32 i32 i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 140) "far\00")
+            (func (export "__wasm_call_ctors")
+                i32.const 140 i32.const 1 i32.const 999999
+                i32.const 0 i32.const 0 i32.const 0 i32.const 0
+                call $reg_fn))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let registrations = analysis::analyse(&module).registrations;
+    assert_eq!(
+        registrations[0].signature.as_deref(),
+        Some("? far()"),
+        "a type that could not be read is unknown, not invented"
+    );
+}
+
+#[test]
+fn a_type_definition_with_nothing_readable_defines_nothing() {
+    // The name argument points nowhere, so there is no name to register the
+    // type under — and the registration is still reported.
+    let wasm = common::assemble(
+        "embind-nameless-type",
+        r#"(module
+            (import "env" "_embind_register_integer"
+                (func $reg_int (param i32 i32 i32 i32 i32)))
+            (import "env" "_embind_register_function"
+                (func $reg_fn (param i32 i32 i32 i32 i32 i32 i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 140) "uses_it\00")
+            (data (i32.const 200) "\01\00\00\00")
+            (func (export "__wasm_call_ctors")
+                i32.const 1 i32.const 888888 i32.const 4 i32.const 0 i32.const 0
+                call $reg_int
+                i32.const 140 i32.const 1 i32.const 200
+                i32.const 0 i32.const 0 i32.const 0 i32.const 0
+                call $reg_fn))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let registrations = analysis::analyse(&module).registrations;
+    assert_eq!(registrations[0].name, None, "the type registered no name");
+    assert_eq!(
+        registrations[1].signature.as_deref(),
+        Some("type@1 uses_it()"),
+        "so the id stays an id"
+    );
+}
+
+#[test]
+fn static_memory_is_read_out_of_a_placed_segment_too() {
+    // A threaded module's segments are passive; the type arrays live in them
+    // like everything else.
+    let wasm = common::assemble(
+        "embind-placed-types",
+        r#"(module
+            (import "env" "_embind_register_std_string" (func $reg_string (param i32 i32)))
+            (import "env" "_embind_register_function"
+                (func $reg_fn (param i32 i32 i32 i32 i32 i32 i32)))
+            (memory (export "memory") 1)
+            (data $names "std::string\00placed_call\00")
+            (data $types "\03\00\00\00\03\00\00\00")
+            (func (export "__wasm_call_ctors")
+                i32.const 4096 i32.const 0 i32.const 24 memory.init $names
+                i32.const 8192 i32.const 0 i32.const 8 memory.init $types
+                i32.const 3 i32.const 4096 call $reg_string
+                i32.const 4108 i32.const 2 i32.const 8192
+                i32.const 0 i32.const 0 i32.const 0 i32.const 0
+                call $reg_fn))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let registrations = analysis::analyse(&module).registrations;
+    let call = registrations
+        .iter()
+        .find(|registration| registration.name.as_deref() == Some("placed_call"))
+        .expect("registered");
+    assert_eq!(
+        call.signature.as_deref(),
+        Some("std::string placed_call(std::string)")
+    );
+}

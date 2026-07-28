@@ -430,18 +430,25 @@ fn inspect(arguments: &[String]) -> Result<String, String> {
         let named = analysis
             .registrations
             .iter()
-            .filter(|registration| registration.name.is_some())
+            .filter(|registration| registration.name.is_some() || registration.signature.is_some())
             .count();
         out.push_str(&format!(
             "embind: {} registrations, {named} of them named\n",
             analysis.registrations.len()
         ));
         for registration in &analysis.registrations {
-            if let Some(name) = &registration.name {
-                out.push_str(&format!(
-                    "  {} {name}\n",
-                    registration.kind.trim_start_matches("_embind_register_")
-                ));
+            let kind = registration.kind.trim_start_matches("_embind_register_");
+            match (
+                &registration.signature,
+                &registration.class,
+                &registration.name,
+            ) {
+                (Some(signature), Some(class), _) => {
+                    out.push_str(&format!("  {kind} {class}::{signature}\n"));
+                }
+                (Some(signature), None, _) => out.push_str(&format!("  {kind} {signature}\n")),
+                (None, _, Some(name)) => out.push_str(&format!("  {kind} {name}\n")),
+                (None, _, None) => {}
             }
         }
     }

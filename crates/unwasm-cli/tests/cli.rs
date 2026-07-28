@@ -389,22 +389,42 @@ fn inspect_lists_what_the_module_registers_with_embind() {
     let path = fixture(
         "sample-embind",
         r#"(module
+            (import "env" "_embind_register_integer"
+                (func $reg_int (param i32 i32 i32 i32 i32)))
             (import "env" "_embind_register_function"
                 (func $register (param i32 i32 i32 i32 i32 i32 i32)))
             (memory 1)
             (data (i32.const 64) "initVoipStack\00")
-            (func (export "register_it")
+            (data (i32.const 100) "int\00")
+            (data (i32.const 110) "typed_call\00")
+            (data (i32.const 200) "\01\00\00\00\01\00\00\00")
+            (func (export "register_it") (param i32)
                 i32.const 64
+                i32.const 0 i32.const 0 i32.const 0 i32.const 0 i32.const 0 i32.const 0
+                call $register
+                i32.const 1 i32.const 100 i32.const 4 i32.const 0 i32.const 0
+                call $reg_int
+                i32.const 110 i32.const 2 i32.const 200
+                i32.const 0 i32.const 0 i32.const 0 i32.const 0
+                call $register
+                ;; a registration whose name is computed: neither name nor types
+                local.get 0
                 i32.const 0 i32.const 0 i32.const 0 i32.const 0 i32.const 0 i32.const 0
                 call $register))"#,
     );
     let (ok, stdout, stderr) = run(&["inspect", path.to_str().expect("utf-8 path")]);
     assert!(ok, "{stderr}");
     assert!(
-        stdout.contains("embind: 1 registrations, 1 of them named"),
+        stdout.contains("embind: 4 registrations, 3 of them named"),
         "{stdout}"
     );
-    assert!(stdout.contains("  function initVoipStack"), "{stdout}");
+    // A name with no types to resolve, a free function with its signature, and
+    // a registration that yielded neither.
+    assert!(stdout.contains("  function initVoipStack\n"), "{stdout}");
+    assert!(
+        stdout.contains("  function int typed_call(int)"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -685,4 +705,41 @@ fn calls_names_an_indirect_type_it_cannot_resolve() {
     let (ok, stdout, stderr) = run(&["calls", path.to_str().expect("utf-8 path"), "0"]);
     assert!(ok, "{stderr}");
     assert!(stdout.contains("type 9"), "{stdout}");
+}
+
+#[test]
+fn inspect_prints_a_method_under_its_class_with_its_types() {
+    let path = fixture(
+        "sample-embind-method",
+        r#"(module
+            (import "env" "_embind_register_integer"
+                (func $reg_int (param i32 i32 i32 i32 i32)))
+            (import "env" "_embind_register_class"
+                (func $reg_class
+                    (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)))
+            (import "env" "_embind_register_class_function"
+                (func $reg_method (param i32 i32 i32 i32 i32 i32 i32 i32 i32)))
+            (memory 1)
+            (data (i32.const 100) "int\00")
+            (data (i32.const 110) "Uint8List\00")
+            (data (i32.const 130) "push_back\00")
+            (data (i32.const 200) "\01\00\00\00\01\00\00\00")
+            (func (export "__wasm_call_ctors")
+                i32.const 1 i32.const 100 i32.const 4 i32.const 0 i32.const 0
+                call $reg_int
+                i32.const 9 i32.const 10 i32.const 11 i32.const 0 i32.const 0
+                i32.const 0 i32.const 0 i32.const 0 i32.const 0 i32.const 0
+                i32.const 110 i32.const 0 i32.const 0
+                call $reg_class
+                i32.const 9 i32.const 130 i32.const 2 i32.const 200
+                i32.const 0 i32.const 0 i32.const 0 i32.const 0 i32.const 0
+                call $reg_method))"#,
+    );
+    let (ok, stdout, stderr) = run(&["inspect", path.to_str().expect("utf-8 path")]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("class_function Uint8List::int push_back(int)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("class Uint8List"), "{stdout}");
 }

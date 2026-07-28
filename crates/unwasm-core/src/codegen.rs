@@ -463,11 +463,13 @@ impl<'a> Generator<'a> {
     /// what the compiler left behind; this is what the author published, and on
     /// a stripped module it is the only such thing there is.
     fn registered_api(&mut self) {
+        // A constructor has no name argument — it has a signature, and its
+        // class. Filtering on the name alone drops exactly those.
         let named: Vec<&crate::analysis::Registration> = self
             .analysis
             .registrations
             .iter()
-            .filter(|registration| registration.name.is_some())
+            .filter(|registration| registration.name.is_some() || registration.signature.is_some())
             .collect();
         if named.is_empty() {
             return;
@@ -483,11 +485,29 @@ impl<'a> Generator<'a> {
                 .kind
                 .trim_start_matches("_embind_register_")
                 .replace('_', " ");
-            let _ = writeln!(
-                self.out,
-                "//   {kind}: {}",
-                escape_doc(registration.name.as_deref().unwrap_or_default())
-            );
+            // The signature where there is one: embind records the argument
+            // types as well as the name, and they are the only types in a
+            // stripped module that have names.
+            match (&registration.signature, &registration.class) {
+                (Some(signature), Some(class)) => {
+                    let _ = writeln!(
+                        self.out,
+                        "//   {kind}: {}::{}",
+                        escape_doc(class),
+                        escape_doc(signature)
+                    );
+                }
+                (Some(signature), None) => {
+                    let _ = writeln!(self.out, "//   {kind}: {}", escape_doc(signature));
+                }
+                (None, _) => {
+                    let _ = writeln!(
+                        self.out,
+                        "//   {kind}: {}",
+                        escape_doc(registration.name.as_deref().unwrap_or_default())
+                    );
+                }
+            }
         }
         self.out.push('\n');
     }

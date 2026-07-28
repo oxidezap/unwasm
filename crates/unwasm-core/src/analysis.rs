@@ -194,6 +194,16 @@ pub struct Registration {
     pub kind: String,
     /// The name it registered, when the name is a constant this can resolve.
     pub name: Option<String>,
+    /// The C++ signature, where the registration carries one.
+    ///
+    /// embind passes the types as a pointer to an array of type ids, and each
+    /// id is the address of a `std::type_info` that some other registration
+    /// names. Both halves are static, so `startVoipCall` comes back as taking
+    /// a `std::string` rather than an `i32` — which is the only place in a
+    /// stripped module where a type has a name at all.
+    pub signature: Option<String>,
+    /// For a method or a constructor, the class it belongs to.
+    pub class: Option<String>,
 }
 
 /// Who calls whom.
@@ -411,6 +421,37 @@ fn read_table(module: &Module) -> std::collections::BTreeMap<u32, u32> {
     table
 }
 
+/// Which argument of each `_embind_register_*` holds the count and the pointer
+/// to its array of type ids, for the registrations that carry a signature.
+///
+/// From embind's own declarations: `_embind_register_function(name, argCount,
+/// argTypes, ..)`, `_embind_register_class_function(classType, methodName,
+/// argCount, argTypes, ..)`.
+const EMBIND_TYPES_ARGUMENT: &[(&str, usize, usize)] = &[
+    ("_embind_register_function", 1, 2),
+    ("_embind_register_class_function", 2, 3),
+    ("_embind_register_class_class_function", 2, 3),
+    ("_embind_register_class_constructor", 1, 2),
+];
+
+/// Which argument holds the type id a registration is *defining*, for the ones
+/// that define a type. Always the first.
+const EMBIND_DEFINES_TYPE: &[&str] = &[
+    "_embind_register_void",
+    "_embind_register_bool",
+    "_embind_register_integer",
+    "_embind_register_bigint",
+    "_embind_register_float",
+    "_embind_register_std_string",
+    "_embind_register_std_wstring",
+    "_embind_register_emval",
+    "_embind_register_memory_view",
+    "_embind_register_value_array",
+    "_embind_register_value_object",
+    "_embind_register_class",
+    "_embind_register_enum",
+];
+
 /// Which argument of each `_embind_register_*` holds the name.
 ///
 /// From embind's own signatures. A registration not listed here is still
@@ -463,7 +504,7 @@ fn find_registrations(
         return Vec::new();
     }
 
-    let mut registrations = Vec::new();
+    let mut registrations: Vec<(Registration, Option<Vec<i32>>)> = Vec::new();
     for func in &module.funcs {
         for (position, op) in func.body.iter().enumerate() {
             let Op::Call(callee) = op else { continue };
@@ -489,16 +530,153 @@ fn find_registrations(
             let name = match (name_at, &arguments) {
                 (Some(at), Some(arguments)) => arguments
                     .get(*at)
-                    .and_then(|address| placed_text(module, placements, *address, None)),
+                    .and_then(|address| placed_name(module, placements, *address)),
                 _ => None,
             };
-            registrations.push(Registration {
-                kind: (*field).to_string(),
-                name,
-            });
+            registrations.push((
+                Registration {
+                    kind: (*field).to_string(),
+                    name,
+                    signature: None,
+                    class: None,
+                },
+                arguments,
+            ));
         }
     }
-    registrations
+
+    resolve_types(module, placements, registrations)
+}
+
+/// Fills in the signatures, once every type has been seen.
+///
+/// Two passes rather than one, because a type can be registered after the
+/// function that takes it — the order is the order the module's initialisers
+/// happen to run in, and nothing says the types come first.
+fn resolve_types(
+    module: &Module,
+    placements: &std::collections::BTreeMap<u32, Placement>,
+    registrations: Vec<(Registration, Option<Vec<i32>>)>,
+) -> Vec<Registration> {
+    // Type id to the name it was registered under. The id is the address of
+    // the type's `std::type_info`, and the first argument of whichever
+    // registration defines it.
+    let mut type_names: std::collections::BTreeMap<i32, String> = Default::default();
+    for (registration, arguments) in &registrations {
+        if !EMBIND_DEFINES_TYPE.contains(&registration.kind.as_str()) {
+            continue;
+        }
+        let (Some(arguments), Some(name)) = (arguments, &registration.name) else {
+            continue;
+        };
+        if let Some(id) = arguments.first() {
+            type_names.insert(*id, name.clone());
+        }
+        // A class registers three ids for itself: the class, a pointer to it,
+        // and a const pointer. A method returning the second is returning the
+        // class, and saying `type@972492` instead would be reporting an
+        // address where there is a name.
+        if registration.kind == "_embind_register_class" {
+            if let Some(id) = arguments.get(1) {
+                type_names.insert(*id, format!("{name}*"));
+            }
+            if let Some(id) = arguments.get(2) {
+                type_names.insert(*id, format!("const {name}*"));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut last_class: Option<String> = None;
+    for (mut registration, arguments) in registrations {
+        if registration.kind == "_embind_register_class" {
+            last_class.clone_from(&registration.name);
+        } else if registration.kind.starts_with("_embind_register_class") {
+            // A method belongs to the class registered before it, which is how
+            // embind's own generated code is ordered.
+            registration.class.clone_from(&last_class);
+        }
+
+        if let Some((_, count_at, types_at)) = EMBIND_TYPES_ARGUMENT
+            .iter()
+            .find(|(kind, _, _)| *kind == registration.kind)
+            && let Some(arguments) = &arguments
+            && let (Some(count), Some(types)) = (arguments.get(*count_at), arguments.get(*types_at))
+            && *count > 0
+            && *count < 64
+        {
+            let named = |id: Option<i32>| match id {
+                Some(id) => type_names
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("type@{id}")),
+                None => "?".to_string(),
+            };
+            // The first entry is the return type; the rest are the arguments.
+            let ids: Vec<Option<i32>> = (0..*count)
+                .map(|at| static_i32(module, placements, types + at * 4))
+                .collect();
+            let parameters: Vec<String> = ids[1..].iter().map(|id| named(*id)).collect();
+            registration.signature = Some(if registration.kind.ends_with("constructor") {
+                // A constructor is named after its class and returns it; both
+                // halves would otherwise print as a placeholder and an address.
+                format!(
+                    "{}({})",
+                    registration
+                        .class
+                        .clone()
+                        .unwrap_or_else(|| "…".to_string()),
+                    parameters.join(", ")
+                )
+            } else {
+                format!(
+                    "{} {}({})",
+                    named(ids[0]),
+                    registration.name.clone().unwrap_or_else(|| "…".to_string()),
+                    parameters.join(", ")
+                )
+            });
+        }
+        out.push(registration);
+    }
+    out
+}
+
+/// Reads four bytes of static memory.
+///
+/// The same lookup [`placed_text`] does, for a number rather than text: an
+/// embind type id array lives in a data segment, and reading it is how a
+/// registration's types are recovered.
+#[must_use]
+pub fn static_i32(
+    module: &Module,
+    placements: &std::collections::BTreeMap<u32, Placement>,
+    address: i32,
+) -> Option<i32> {
+    for (index, segment) in module.datas.iter().enumerate() {
+        let (base, within) = match segment.offset {
+            Some(ConstExpr::I32(base)) => (base, 0usize),
+            Some(_) => continue,
+            None => match placements.get(&(index as u32)) {
+                Some(placement) => (placement.address, placement.offset as usize),
+                None => continue,
+            },
+        };
+        if address < base {
+            continue;
+        }
+        let at = (address - base) as usize + within;
+        if at + 4 > segment.bytes.len() {
+            continue;
+        }
+        return Some(i32::from_le_bytes([
+            segment.bytes[at],
+            segment.bytes[at + 1],
+            segment.bytes[at + 2],
+            segment.bytes[at + 3],
+        ]));
+    }
+    None
 }
 
 /// Guesses names for unnamed functions from what they say about themselves.
@@ -1228,13 +1406,37 @@ pub fn placed_text(
     static_text_placed(module, placements, address, length.map(|len| len as usize))
 }
 
+/// Text at an address that is declared to be a name.
+///
+/// The same read as [`placed_text`] without its minimum length. That minimum
+/// is there to stop three stray printable bytes being reported as a string —
+/// but an embind registration's name argument *is* a name, and `int` is three
+/// characters. Requiring four loses the most common type in any module.
+#[must_use]
+pub fn placed_name(
+    module: &Module,
+    placements: &std::collections::BTreeMap<u32, Placement>,
+    address: i32,
+) -> Option<String> {
+    static_text_placed_with(module, placements, address, None, 1)
+}
+
 fn static_text_placed(
     module: &Module,
     placements: &std::collections::BTreeMap<u32, Placement>,
     address: i32,
     length: Option<usize>,
 ) -> Option<String> {
-    const SHORTEST: usize = 4;
+    static_text_placed_with(module, placements, address, length, 4)
+}
+
+fn static_text_placed_with(
+    module: &Module,
+    placements: &std::collections::BTreeMap<u32, Placement>,
+    address: i32,
+    length: Option<usize>,
+    shortest: usize,
+) -> Option<String> {
     const LONGEST: usize = 120;
 
     let address = address as u32;
@@ -1269,7 +1471,7 @@ fn static_text_placed(
         let mut text = String::new();
         for &byte in slice {
             if byte == 0 && length.is_none() {
-                return (text.len() >= SHORTEST).then_some(text);
+                return (text.len() >= shortest).then_some(text);
             }
             // Printable ASCII, plus the whitespace that appears in messages.
             // Anything else means these bytes are not a string.
@@ -1284,7 +1486,7 @@ fn static_text_placed(
         }
         return match length {
             // A length said where it ends, so it ended there.
-            Some(_) => (text.len() >= SHORTEST).then_some(text),
+            Some(_) => (text.len() >= shortest).then_some(text),
             // Ran off the end of the segment without a terminator.
             None => None,
         };
@@ -2106,6 +2308,35 @@ mod tests {
             derived[&0].name, "handle_incoming_signalling_offer",
             "{derived:?}"
         );
+    }
+
+    #[test]
+    fn static_reads_skip_segments_that_cannot_answer() {
+        // Three ways a segment is not the one holding an address: it is placed
+        // by a global, it is passive with no known placement, and it sits
+        // after the address being asked about.
+        let module = Module {
+            datas: vec![
+                DataSegment {
+                    offset: Some(ConstExpr::GlobalGet(0)),
+                    bytes: vec![1, 2, 3, 4],
+                },
+                DataSegment {
+                    offset: None,
+                    bytes: vec![5, 6, 7, 8],
+                },
+                DataSegment {
+                    offset: Some(ConstExpr::I32(4096)),
+                    bytes: vec![9, 0, 0, 0],
+                },
+            ],
+            ..Module::default()
+        };
+        let placements = Default::default();
+        // Before every segment that could answer.
+        assert_eq!(static_i32(&module, &placements, 0), None);
+        // And the one that can.
+        assert_eq!(static_i32(&module, &placements, 4096), Some(9));
     }
 
     #[test]
