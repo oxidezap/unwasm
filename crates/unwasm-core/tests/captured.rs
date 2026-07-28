@@ -91,3 +91,40 @@ fn main() {
     assert!(pages > 0, "the module instantiated with an empty memory");
     assert_eq!(pages % 65536, 0, "memory is a whole number of pages");
 }
+
+/// A real module in the split layout, compiled and instantiated.
+///
+/// The smallest capture is 478 functions, so the default layout already splits
+/// it — which makes this the test that the part files hold together on
+/// something that was not written to be easy.
+#[test]
+#[ignore = "compiles 70k lines of generated Rust"]
+fn a_capture_compiles_in_the_split_layout() {
+    let Some(bytes) = common::captured("COs9e0Kj0ic") else {
+        panic!("COs9e0Kj0ic is not available; set WA_WASM_DIR");
+    };
+    let module = Module::parse(&bytes).expect("it parses");
+    let layout = codegen::Layout::for_module(&module);
+    assert!(
+        matches!(layout, codegen::Layout::Split { .. }),
+        "478 functions should split by default, got {layout:?}"
+    );
+    let files = codegen::generate_files(&module, layout).expect("it generates");
+    assert!(files.len() > 1, "the layout produced no parts");
+
+    const DRIVER: &str = r#"
+mod generated;
+fn main() {
+    let instance = generated::Instance::new();
+    println!("{}", instance.memory.data.len());
+}
+"#;
+    let output = common::run_with_driver("capture-split", &bytes, DRIVER);
+    let bytes_of_memory: usize = output.trim().parse().expect("a memory size");
+    assert_eq!(bytes_of_memory % 65536, 0);
+    eprintln!(
+        "COs9e0Kj0ic: {} files, {} bytes of memory after instantiation",
+        files.len(),
+        bytes_of_memory
+    );
+}

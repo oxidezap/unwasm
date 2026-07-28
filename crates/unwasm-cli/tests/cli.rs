@@ -165,3 +165,87 @@ fn writing_to_an_unwritable_path_reports_the_path() {
     assert!(!ok);
     assert!(stderr.contains("/nonexistent-directory/out.rs"), "{stderr}");
 }
+
+#[test]
+fn a_destination_that_is_not_a_rust_file_becomes_a_directory() {
+    let path = fixture("sample-dir", SAMPLE);
+    let destination = scratch().join("out-dir");
+    let _ = std::fs::remove_dir_all(&destination);
+    let (ok, stdout, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "-o",
+        destination.to_str().expect("utf-8 path"),
+        "--split",
+        "1",
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("2 files"), "{stdout}");
+    let root = std::fs::read_to_string(destination.join("mod.rs")).expect("mod.rs exists");
+    assert!(root.contains("mod part0;"), "{root}");
+    let part = std::fs::read_to_string(destination.join("part0.rs")).expect("part0.rs exists");
+    assert!(part.contains("use super::*;"), "{part}");
+}
+
+#[test]
+fn a_small_module_written_to_a_directory_still_gets_one_file() {
+    // The layout follows the module's size unless `--split` overrides it, and
+    // one function does not need parts.
+    let path = fixture("sample-autolayout", SAMPLE);
+    let destination = scratch().join("out-auto");
+    let _ = std::fs::remove_dir_all(&destination);
+    let (ok, stdout, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "-o",
+        destination.to_str().expect("utf-8 path"),
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("1 files"), "{stdout}");
+    assert!(destination.join("mod.rs").exists());
+    assert!(!destination.join("part0.rs").exists());
+}
+
+#[test]
+fn split_needs_a_number_and_a_destination() {
+    let path = fixture("sample-splitargs", SAMPLE);
+    let (ok, _, stderr) = run(&["decompile", path.to_str().expect("utf-8 path"), "--split"]);
+    assert!(!ok);
+    assert!(stderr.contains("--split needs a number"), "{stderr}");
+
+    let (ok, _, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--split",
+        "many",
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("not `many`"), "{stderr}");
+
+    // Several files cannot go to stdout, and saying so beats writing the first
+    // one and dropping the rest.
+    let (ok, _, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--split",
+        "1",
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("needs -o <directory>"), "{stderr}");
+}
+
+#[test]
+fn an_unwritable_directory_reports_the_path() {
+    let path = fixture("sample-baddir", SAMPLE);
+    let (ok, _, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "-o",
+        "/proc/unwasm-cannot-write-here",
+    ]);
+    assert!(!ok);
+    assert!(
+        stderr.contains("/proc/unwasm-cannot-write-here"),
+        "{stderr}"
+    );
+}

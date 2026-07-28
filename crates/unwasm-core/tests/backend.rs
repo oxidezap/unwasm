@@ -620,3 +620,166 @@ fn an_if_whose_consequent_cannot_finish_still_yields_a_value() {
         ],
     );
 }
+
+/// Splitting the output across modules must not change what it does.
+///
+/// The same fixtures, decompiled into part files instead of one, still have to
+/// agree with the engine — including calls that cross a part boundary, which is
+/// what `pub(crate)` on the generated methods is for.
+#[test]
+fn a_split_layout_behaves_exactly_like_a_single_file() {
+    let wasm = common::assemble(
+        "split",
+        r#"(module
+            (memory (export "memory") 1)
+            (global $counter (mut i32) (i32.const 0))
+            (type $unary (func (param i32) (result i32)))
+            (func $double (type $unary) local.get 0 i32.const 2 i32.mul)
+            (func $triple (type $unary) local.get 0 i32.const 3 i32.mul)
+            (func $bump (param i32) global.get $counter local.get 0 i32.add global.set $counter)
+            (table 2 funcref)
+            (elem (i32.const 0) $double $triple)
+            (func (export "chain") (param i32) (param i32) (result i32)
+                local.get 0
+                call $double        ;; a call into another part
+                local.get 1
+                call_indirect (type $unary)
+                call $triple
+                local.tee 0
+                call $bump          ;; a void call into another part
+                local.get 0
+                global.get $counter
+                i32.add)
+            (func (export "counter") (result i32) global.get $counter))"#,
+    );
+    let mut calls = Vec::new();
+    for n in [0, 1, 5, -3] {
+        calls.push(common::call(
+            "chain",
+            &[common::Arg::I32(n), common::Arg::I32(0)],
+        ));
+        calls.push(common::call(
+            "chain",
+            &[common::Arg::I32(n), common::Arg::I32(1)],
+        ));
+        calls.push(common::call("counter", &[]));
+    }
+    // One function per file puts every call across a module boundary.
+    common::assert_agrees_with_layout(
+        "split",
+        &wasm,
+        &calls,
+        unwasm_core::codegen::Layout::Split {
+            functions_per_file: 1,
+        },
+    );
+}
+
+#[test]
+fn a_split_layout_produces_a_mod_file_and_one_part_per_group() {
+    let wasm = common::assemble(
+        "split-shape",
+        r#"(module
+            (func (export "a") (result i32) i32.const 1)
+            (func (export "b") (result i32) i32.const 2)
+            (func (export "c") (result i32) i32.const 3)
+            (func (export "d") (result i32) i32.const 4)
+            (func (export "e") (result i32) i32.const 5))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let files = codegen::generate_files(
+        &module,
+        codegen::Layout::Split {
+            functions_per_file: 2,
+        },
+    )
+    .expect("generating");
+
+    // Five functions in groups of two: three parts, the last one short.
+    let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
+    assert_eq!(names, ["mod.rs", "part0.rs", "part1.rs", "part2.rs"]);
+
+    let root = &files[0].contents;
+    assert!(
+        root.contains("mod part0;\nmod part1;\nmod part2;"),
+        "{root}"
+    );
+    assert!(root.contains("pub fn a("), "the exports stay in mod.rs");
+    assert!(!root.contains("pub(crate) fn f0("), "the functions do not");
+
+    for part in &files[1..] {
+        assert!(part.contents.contains("use super::*;"), "{}", part.name);
+        assert!(part.contents.contains("impl<H: Imports> Instance<H> {"));
+        // Each part carries its own lint allowances: they are per-file.
+        assert!(part.contents.contains("#![allow("));
+    }
+    assert_eq!(files[3].contents.matches("pub(crate) fn f").count(), 1);
+}
+
+#[test]
+fn the_layout_a_module_gets_by_default_follows_its_size() {
+    let small = common::assemble(
+        "layout-small",
+        "(module (func (export \"f\") (result i32) i32.const 1))",
+    );
+    let module = Module::parse(&small).expect("valid");
+    assert_eq!(
+        codegen::Layout::for_module(&module),
+        codegen::Layout::Single
+    );
+
+    // A module past the threshold, built rather than hand-written.
+    let mut wat = String::from("(module");
+    for index in 0..300 {
+        wat.push_str(&format!(
+            " (func (export \"f{index}\") (result i32) i32.const {index})"
+        ));
+    }
+    wat.push(')');
+    let large = common::assemble("layout-large", &wat);
+    let module = Module::parse(&large).expect("valid");
+    assert_eq!(
+        codegen::Layout::for_module(&module),
+        codegen::Layout::Split {
+            functions_per_file: 256
+        }
+    );
+    let files =
+        codegen::generate_files(&module, codegen::Layout::for_module(&module)).expect("generating");
+    assert_eq!(files.len(), 3, "mod.rs plus two parts");
+}
+
+#[test]
+fn a_zero_sized_split_still_produces_one_function_per_file() {
+    // A guard on the arithmetic rather than on the caller: zero per file would
+    // divide by zero and produce an unbounded number of empty modules.
+    let wasm = common::assemble(
+        "split-zero",
+        "(module (func (export \"a\") (result i32) i32.const 1)
+                 (func (export \"b\") (result i32) i32.const 2))",
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let files = codegen::generate_files(
+        &module,
+        codegen::Layout::Split {
+            functions_per_file: 0,
+        },
+    )
+    .expect("generating");
+    assert_eq!(files.len(), 3, "mod.rs plus one part per function");
+}
+
+#[test]
+fn a_module_with_no_functions_splits_into_just_a_mod_file() {
+    let wasm = common::assemble("split-empty", "(module (memory (export \"memory\") 1))");
+    let module = Module::parse(&wasm).expect("valid");
+    let files = codegen::generate_files(
+        &module,
+        codegen::Layout::Split {
+            functions_per_file: 4,
+        },
+    )
+    .expect("generating");
+    assert_eq!(files.len(), 1);
+    assert!(!files[0].contents.contains("mod part"));
+}

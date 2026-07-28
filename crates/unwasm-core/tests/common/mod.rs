@@ -255,11 +255,44 @@ fn result_kind(module: &Module, export: &str) -> String {
     }
 }
 
+/// Writes the decompilation to the scratch directory in the given layout.
+///
+/// Both layouts land at `mod generated;`: Rust resolves that to `generated.rs`
+/// or to `generated/mod.rs`, so the driver is identical either way and the two
+/// layouts are compared by exactly the same tests.
+fn write_generated(scratch: &Path, module: &Module, layout: codegen::Layout) {
+    let files = codegen::generate_files(module, layout).expect("generating Rust");
+    let single = scratch.join("generated.rs");
+    let directory = scratch.join("generated");
+    // Clear whichever form a previous run left, or `mod generated;` becomes
+    // ambiguous and the compile fails for a reason that has nothing to do with
+    // the test.
+    let _ = std::fs::remove_file(&single);
+    let _ = std::fs::remove_dir_all(&directory);
+
+    if files.len() == 1 {
+        std::fs::write(&single, &files[0].contents).expect("writing the generated module");
+        return;
+    }
+    std::fs::create_dir_all(&directory).expect("creating the module directory");
+    for file in &files {
+        std::fs::write(directory.join(&file.name), &file.contents).expect("writing a part");
+    }
+}
+
 /// Runs the same calls against the generated Rust.
 fn run_in_rust(name: &str, module: &Module, calls: &[Call]) -> Vec<String> {
+    run_in_rust_with_layout(name, module, calls, codegen::Layout::Single)
+}
+
+fn run_in_rust_with_layout(
+    name: &str,
+    module: &Module,
+    calls: &[Call],
+    layout: codegen::Layout,
+) -> Vec<String> {
     let scratch = workspace_scratch(name);
-    let generated = codegen::generate(module).expect("generating Rust");
-    std::fs::write(scratch.join("generated.rs"), &generated).expect("writing the generated module");
+    write_generated(&scratch, module, layout);
 
     let mut main = String::from(
         "mod generated;\n\
@@ -360,9 +393,18 @@ fn export_ident(module: &Module, name: &str) -> String {
 ///
 /// Panics with the first disagreement, naming the call that produced it.
 pub fn assert_agrees(name: &str, wasm: &[u8], calls: &[Call]) {
+    assert_agrees_with_layout(name, wasm, calls, codegen::Layout::Single);
+}
+
+/// As [`assert_agrees`], for a chosen layout.
+///
+/// Splitting the output across modules must not change what it does. It moves
+/// functions between files and makes them `pub(crate)`; if that ever changed a
+/// result, this is what would say so.
+pub fn assert_agrees_with_layout(name: &str, wasm: &[u8], calls: &[Call], layout: codegen::Layout) {
     let module = Module::parse(wasm).expect("parsing the module under test");
     let engine = run_in_node(name, wasm, calls, &module);
-    let ours = run_in_rust(name, &module, calls);
+    let ours = run_in_rust_with_layout(name, &module, calls, layout);
 
     assert_eq!(
         engine.len(),
@@ -396,8 +438,7 @@ pub fn assert_compiles(name: &str, wasm: &[u8]) {
 pub fn run_with_driver(name: &str, wasm: &[u8], driver: &str) -> String {
     let module = Module::parse(wasm).expect("parsing the module under test");
     let scratch = workspace_scratch(name);
-    let generated = codegen::generate(&module).expect("generating Rust");
-    std::fs::write(scratch.join("generated.rs"), &generated).expect("writing the generated module");
+    write_generated(&scratch, &module, codegen::Layout::for_module(&module));
     std::fs::write(scratch.join("main.rs"), driver).expect("writing the driver");
 
     let binary = scratch.join("driver");
