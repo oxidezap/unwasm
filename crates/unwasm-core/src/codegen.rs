@@ -801,6 +801,58 @@ struct Value {
     folded: bool,
 }
 
+impl Value {
+    /// The code, parenthesised unless it plainly does not need to be.
+    ///
+    /// Folding puts expressions inside other expressions, and Rust's
+    /// precedence is not wasm's: `a + b` folded into `{0} as u32` gives
+    /// `a + b as u32`, which casts `b` and adds it to `a`. The template cannot
+    /// know whether its operand is compound, so the operand answers for
+    /// itself — and answers conservatively, since a redundant pair of brackets
+    /// costs nothing and a missing pair is a wrong number.
+    fn as_operand(&self) -> String {
+        if is_atomic(&self.code) {
+            self.code.clone()
+        } else {
+            format!("({})", self.code)
+        }
+    }
+}
+
+/// Whether an expression can sit inside another without brackets.
+///
+/// The question is only about precedence, so it is answered by looking for an
+/// operator *outside* any brackets: `l0.wrapping_sub(2i32)` has none and binds
+/// tighter than anything it could be folded into, while `l1 as u32` has one and
+/// would bind the wrong way inside `{0} as i64`.
+///
+/// Anything not understood is treated as compound. A redundant pair of brackets
+/// costs a little noise; a missing pair costs a wrong number.
+fn is_atomic(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    let mut depth = 0usize;
+    let mut at = 0usize;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            // An operator at the top level means the expression is compound.
+            b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'<' | b'>' | b'=' | b'!'
+            | b'?' | b',' | b'{' | b'}'
+                if depth == 0 =>
+            {
+                return false;
+            }
+            // `as`, which is why a cast needs brackets inside another cast.
+            b'a' if depth == 0 && code[at..].starts_with("as ") => return false,
+            b' ' if depth == 0 => return false,
+            _ => {}
+        }
+        at += 1;
+    }
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrameKind {
     Block,
@@ -933,12 +985,43 @@ impl<'a> Body<'a> {
         self.stack.push(Value { code, ty, folded });
     }
 
+    /// How long an expression may get before it is given a name instead.
+    ///
+    /// wasm's stack consumes each value exactly once, so folding an expression
+    /// into its consumer never duplicates work — but it does nest, and nesting
+    /// without a limit turns a long chain of arithmetic into one unreadable
+    /// line. This is where a line stops being easier to read than two.
+    const FOLD_LIMIT: usize = 100;
+
     /// Pushes a computed value, naming it first.
+    ///
+    /// Anything that can trap or that touches state goes through here: naming
+    /// it is what makes it *happen*, at the point the module says it happens.
     fn push_temp(&mut self, code: &str, ty: ValType) {
         let name = format!("t{}", self.temps);
         self.temps += 1;
         self.line(&format!("let {name}: {} = {code};", ty.rust_name()));
         self.push(name, ty, true);
+    }
+
+    /// Pushes an expression that can be folded into whatever consumes it.
+    ///
+    /// Only for expressions that cannot trap and touch nothing: `a + b` used
+    /// once reads better inline than as a `let` two lines up, and one function
+    /// in the VoIP module spends 171704 of its 453292 lines on bindings of
+    /// exactly that kind.
+    ///
+    /// Purity is the whole condition, and the reason is `drop`. A folded value
+    /// that is dropped is never emitted at all — so folding a division would
+    /// lose the trap it owes on a zero divisor, and folding an atomic
+    /// read-modify-write would lose the write. The differential tests caught
+    /// both within a minute of the first attempt, which is what they are for.
+    fn push_pure(&mut self, code: &str, ty: ValType) {
+        if code.len() <= Self::FOLD_LIMIT {
+            self.push(code.to_string(), ty, true);
+        } else {
+            self.push_temp(code, ty);
+        }
     }
 
     fn pop(&mut self) -> Result<Value> {
@@ -988,8 +1071,16 @@ impl<'a> Body<'a> {
     /// `self.f1(self.f2())` does not borrow-check, and neither does a store
     /// whose value comes from a call. Naming the operands first sidesteps the
     /// whole question instead of relying on two-phase borrows to cover it.
+    ///
+    /// Only operands that mention `self` need it. An expression over locals —
+    /// which is most of them — borrows nothing and can stay where it is, and
+    /// leaving it there is most of what folding is worth: every argument of
+    /// every call and store would otherwise be named.
     fn spill_operands(&mut self, values: &mut [Value]) {
         for value in values.iter_mut() {
+            if !value.code.contains("self.") {
+                continue;
+            }
             if value.code.starts_with('t') && value.code[1..].chars().all(|c| c.is_ascii_digit()) {
                 continue;
             }
@@ -1204,7 +1295,7 @@ impl<'a> Body<'a> {
                 let alternative = self.pop()?;
                 let consequent = self.pop()?;
                 let ty = consequent.ty;
-                self.push_temp(
+                self.push_pure(
                     &format!(
                         "if {} != 0 {{ {} }} else {{ {} }}",
                         condition.code, consequent.code, alternative.code
@@ -1457,12 +1548,15 @@ impl<'a> Body<'a> {
         let operands = self.pop_n(num.operands().len())?;
         let code = ops::render(
             num.template(),
-            &operands
-                .iter()
-                .map(|value| value.code.clone())
-                .collect::<Vec<_>>(),
+            &operands.iter().map(Value::as_operand).collect::<Vec<_>>(),
         );
-        self.push_temp(&code, num.result());
+        // Everything that can trap is spelled as a call into the runtime, so
+        // the template says whether this is safe to fold.
+        if num.template().starts_with("rt::") {
+            self.push_temp(&code, num.result());
+        } else {
+            self.push_pure(&code, num.result());
+        }
         Ok(())
     }
 
@@ -1977,6 +2071,51 @@ mod tests {
         assert_eq!(escape_comment("a\tb"), "\"a\\tb\"");
         assert_eq!(escape_comment("say \"this\""), "\"say 'this'\"");
         assert_eq!(escape_comment("plain"), "\"plain\"");
+    }
+
+    #[test]
+    fn brackets_go_where_precedence_needs_them_and_nowhere_else() {
+        // A name, a call, and something already bracketed need none.
+        for atomic in [
+            "l0",
+            "t7",
+            "frame",
+            "self.g0_stack_pointer",
+            "5i32",
+            "l0.wrapping_sub(2i32)",
+            "self.memory.load32(l0, 4)",
+            "(a + b)",
+            "f32::from_bits(0x3f800000u32)",
+        ] {
+            assert!(is_atomic(atomic), "{atomic} was bracketed needlessly");
+        }
+        // Anything with an operator outside brackets does.
+        for compound in [
+            "l0 as u32",
+            "a + b",
+            "(a) + (b)",
+            "l0 >> 2",
+            "x as u32 as i64",
+            "if c != 0 { a } else { b }",
+        ] {
+            assert!(!is_atomic(compound), "{compound} needs brackets");
+        }
+    }
+
+    #[test]
+    fn an_operand_brackets_itself_when_it_has_to() {
+        let name = Value {
+            code: "l3".to_string(),
+            ty: ValType::I32,
+            folded: true,
+        };
+        assert_eq!(name.as_operand(), "l3");
+        let compound = Value {
+            code: "l3 as u32".to_string(),
+            ty: ValType::I32,
+            folded: true,
+        };
+        assert_eq!(compound.as_operand(), "(l3 as u32)");
     }
 
     #[test]

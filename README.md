@@ -57,6 +57,9 @@ compiler emitted. Level 0 does not pretend otherwise.
 
 Concretely:
 
+- **Expressions rather than one binding per instruction.** Pure arithmetic
+  folds into whatever consumes it, which is about a third of the emitted lines —
+  and, on the module that needed it most, 1.2 million of them.
 - **The whole MVP instruction set**, plus sign extension and the saturating
   truncations: 136 numeric opcodes, all of memory, `call_indirect`, `br_table`,
   passive segments.

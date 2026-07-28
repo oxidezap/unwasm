@@ -109,6 +109,25 @@ function that never writes the stack pointer back — is not in any reference. I
 was found by looking at what clang actually emitted at `-O0`, after the first
 version silently found no frames at all.
 
+## Folding is only for expressions that cannot trap
+
+`push_pure` folds an expression into whatever consumes it; `push_temp` gives it
+a name. The line between them is not readability, it is that **a folded value
+that is dropped is never emitted at all**. Fold a division and a dropped one
+stops trapping on a zero divisor; fold an atomic read-modify-write and a dropped
+one stops writing. Both happened in the first version and the differential tests
+caught them within a minute.
+
+So: anything that can trap or touch state gets a name. Everything that cannot —
+wrapping arithmetic, comparisons, bitwise ops, casts — folds. That is about a
+third of the emitted lines.
+
+Folding also means nesting, and Rust's precedence is not wasm's: `a + b` folded
+into `{0} as u32` gives `a + b as u32`, which is a different number.
+`Value::as_operand` brackets anything with a top-level operator, and `is_atomic`
+decides — conservatively, since a redundant bracket costs noise and a missing
+one costs an answer.
+
 ## The two rules the value stack lives by
 
 Both were learned from a real module rather than from reasoning:

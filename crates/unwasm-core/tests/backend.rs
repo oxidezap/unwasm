@@ -1010,3 +1010,190 @@ fn a_module_with_no_stack_pointer_has_no_frames_and_still_works() {
         &[common::call("f", &[common::Arg::I32(21)])],
     );
 }
+
+/// Folding must never lose an effect or a trap.
+///
+/// A folded value that is dropped is never emitted at all, so anything that
+/// *had* to happen cannot be folded. The first version of this folded
+/// everything and the differential tests caught it in a minute: a dropped
+/// division stopped trapping, and a dropped atomic stopped writing.
+#[test]
+fn a_dropped_division_still_traps() {
+    let wasm = common::assemble(
+        "fold-drop-div",
+        r#"(module
+            (func (export "divide_and_discard") (param i32) (param i32) (result i32)
+                local.get 0
+                local.get 1
+                i32.div_s
+                drop
+                i32.const 7))"#,
+    );
+    common::assert_agrees(
+        "fold-drop-div",
+        &wasm,
+        &[
+            common::call(
+                "divide_and_discard",
+                &[common::Arg::I32(10), common::Arg::I32(2)],
+            ),
+            // The divisor is zero: the result is discarded, and the trap is not.
+            common::call(
+                "divide_and_discard",
+                &[common::Arg::I32(10), common::Arg::I32(0)],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_dropped_load_still_traps() {
+    let wasm = common::assemble(
+        "fold-drop-load",
+        r#"(module
+            (memory (export "memory") 1)
+            (func (export "read_and_discard") (param i32) (result i32)
+                local.get 0
+                i32.load
+                drop
+                i32.const 7))"#,
+    );
+    common::assert_agrees(
+        "fold-drop-load",
+        &wasm,
+        &[
+            common::call("read_and_discard", &[common::Arg::I32(0)]),
+            common::call("read_and_discard", &[common::Arg::I32(65534)]),
+        ],
+    );
+}
+
+#[test]
+fn a_dropped_atomic_still_writes() {
+    let wasm = common::assemble(
+        "fold-drop-atomic",
+        r#"(module
+            (memory (export "memory") 1 1 shared)
+            (func (export "bump_and_discard") (param i32) (result i32)
+                local.get 0
+                i32.const 5
+                i32.atomic.rmw.add
+                drop
+                local.get 0
+                i32.atomic.load))"#,
+    );
+    let calls: Vec<_> = (0..3)
+        .map(|_| common::call("bump_and_discard", &[common::Arg::I32(0)]))
+        .collect();
+    common::assert_agrees("fold-drop-atomic", &wasm, &calls);
+}
+
+/// Folding changes where an expression is written, never when it happens.
+#[test]
+fn a_folded_value_is_still_read_before_the_local_changes() {
+    let wasm = common::assemble(
+        "fold-order",
+        r#"(module
+            (func (export "order") (param i32) (result i32)
+                local.get 0
+                i32.const 3
+                i32.mul        ;; folded: `l0 * 3`
+                i32.const 99
+                local.set 0    ;; l0 changes before the product is used
+                local.get 0
+                i32.add))"#,
+    );
+    common::assert_agrees(
+        "fold-order",
+        &wasm,
+        &[
+            common::call("order", &[common::Arg::I32(5)]),
+            common::call("order", &[common::Arg::I32(-2)]),
+        ],
+    );
+}
+
+/// Precedence: Rust's is not wasm's, and folding is what makes it matter.
+#[test]
+fn folding_keeps_the_arithmetic_it_was_given() {
+    // `(a + b) as u32 >> 1` folded carelessly becomes `a + (b as u32 >> 1)`.
+    // Every one of these is a shape where a missing bracket changes the answer.
+    let wasm = common::assemble(
+        "fold-precedence",
+        r#"(module
+            (func (export "cast_of_sum") (param i32) (param i32) (result i32)
+                local.get 0
+                local.get 1
+                i32.add
+                i32.const 1
+                i32.shr_u)
+            (func (export "sum_of_shifts") (param i32) (param i32) (result i32)
+                local.get 0
+                i32.const 2
+                i32.shl
+                local.get 1
+                i32.const 3
+                i32.shr_s
+                i32.mul)
+            (func (export "compare_of_products") (param i32) (param i32) (result i32)
+                local.get 0
+                local.get 1
+                i32.mul
+                local.get 1
+                local.get 0
+                i32.sub
+                i32.lt_u)
+            (func (export "negated_sum") (param f64) (param f64) (result f64)
+                local.get 0
+                local.get 1
+                f64.add
+                f64.neg
+                local.get 0
+                f64.mul))"#,
+    );
+    let mut calls = Vec::new();
+    for (a, b) in [(0, 0), (1, 2), (-1, 3), (i32::MIN, -1), (0x7FFF_FFFF, 1)] {
+        calls.push(common::call(
+            "cast_of_sum",
+            &[common::Arg::I32(a), common::Arg::I32(b)],
+        ));
+        calls.push(common::call(
+            "sum_of_shifts",
+            &[common::Arg::I32(a), common::Arg::I32(b)],
+        ));
+        calls.push(common::call(
+            "compare_of_products",
+            &[common::Arg::I32(a), common::Arg::I32(b)],
+        ));
+    }
+    for (a, b) in [(1.5, 2.5), (-0.0, 0.0), (f64::INFINITY, 1.0)] {
+        calls.push(common::call(
+            "negated_sum",
+            &[common::Arg::F64(a), common::Arg::F64(b)],
+        ));
+    }
+    common::assert_agrees("fold-precedence", &wasm, &calls);
+}
+
+#[test]
+fn a_long_chain_of_arithmetic_is_named_rather_than_nested_forever() {
+    // Folding without a limit turns a hundred additions into one line.
+    let mut wat =
+        String::from("(module (func (export \"chain\") (param i32) (result i32) local.get 0");
+    for _ in 0..40 {
+        wat.push_str(" i32.const 3 i32.add");
+    }
+    wat.push_str("))");
+    let wasm = common::assemble("fold-limit", &wat);
+    let code = common::decompile(&wasm);
+    let longest = code.lines().map(str::len).max().unwrap_or(0);
+    assert!(
+        longest < 400,
+        "the expression was never given a name: longest line is {longest}"
+    );
+    common::assert_agrees(
+        "fold-limit",
+        &wasm,
+        &[common::call("chain", &[common::Arg::I32(1)])],
+    );
+}
