@@ -43,18 +43,369 @@ pub struct StackPointer {
     pub evidence: Evidence,
 }
 
+/// One slot of a function's stack frame: an offset that is read or written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Slot {
+    /// The widest access seen, in bytes. Usually the size of what lives there.
+    pub width: u32,
+    /// How many times it is read.
+    pub reads: usize,
+    /// How many times it is written.
+    pub writes: usize,
+}
+
+/// A function's stack frame, as far as its own code reveals it.
+///
+/// This is the shadow stack: the region a C compiler carves out of linear
+/// memory for locals it cannot keep in wasm locals — anything whose address is
+/// taken, anything larger than a scalar, anything spilled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frame {
+    /// Bytes reserved by the prologue.
+    pub size: i32,
+    /// The wasm local holding the frame's base address.
+    pub base_local: u32,
+    /// The offsets used, and how.
+    pub slots: std::collections::BTreeMap<i32, Slot>,
+    /// Whether the base address goes somewhere this analysis cannot follow —
+    /// passed to a call, stored into memory, copied to another local.
+    ///
+    /// This is the question that decides whether the frame could ever be
+    /// modelled as variables rather than as memory, and it is answered
+    /// conservatively: anything not understood sets it.
+    pub escapes: bool,
+    /// Whether the prologue writes the reserved address back to the stack
+    /// pointer.
+    ///
+    /// A leaf function often does not: at `-O0` clang computes `sp - 32`, uses
+    /// it, and never publishes it, because nothing else will allocate while it
+    /// runs. A function that *does* publish is one that expects to call
+    /// something — which is a fact about the function worth having.
+    pub publishes: bool,
+}
+
 /// What could be read out of a module.
 #[derive(Debug, Clone, Default)]
 pub struct Analysis {
     /// The C stack pointer, if the module gave a reason to name one.
     pub stack_pointer: Option<StackPointer>,
+    /// Frames, by function index. Absent for a function with no prologue.
+    pub frames: std::collections::BTreeMap<u32, Frame>,
 }
 
 /// Reads a module for the things worth naming.
 #[must_use]
 pub fn analyse(module: &Module) -> Analysis {
+    let stack_pointer = find_stack_pointer(module);
     Analysis {
-        stack_pointer: find_stack_pointer(module),
+        frames: stack_pointer
+            .map(|sp| find_frames(module, sp))
+            .unwrap_or_default(),
+        stack_pointer,
+    }
+}
+
+fn find_frames(
+    module: &Module,
+    stack_pointer: StackPointer,
+) -> std::collections::BTreeMap<u32, Frame> {
+    let import_count = module.func_imports.len() as u32;
+    let mut frames = std::collections::BTreeMap::new();
+    for (at, func) in module.funcs.iter().enumerate() {
+        if let Some(frame) = read_frame(module, &func.body, stack_pointer.global) {
+            frames.insert(import_count + at as u32, frame);
+        }
+    }
+    frames
+}
+
+/// What a value on the abstract stack is, as far as this analysis cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tracked {
+    /// The frame base plus a constant.
+    Frame(i32),
+    /// A constant.
+    Const(i32),
+    /// Anything else.
+    Other,
+}
+
+/// Reads one function's frame.
+///
+/// The walk is a small abstract interpretation: it tracks which stack entries
+/// are the frame address and watches what happens to them. It is deliberately
+/// easy to defeat — anything it cannot model exactly sets `escapes` and stops
+/// claiming to know. That direction is the safe one: a frame wrongly marked as
+/// escaping costs a missed annotation, while one wrongly marked as contained
+/// would be a false statement about the code.
+fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame> {
+    let prologue = read_prologue(body, stack_pointer)?;
+    let (size, base_local) = (prologue.size, prologue.base_local);
+    let mut frame = Frame {
+        size,
+        base_local,
+        slots: std::collections::BTreeMap::new(),
+        escapes: false,
+        publishes: prologue.publishes,
+    };
+
+    let mut stack: Vec<Tracked> = Vec::new();
+    for op in &body[prologue.length..] {
+        // Control flow ends what this walk can follow. If the frame address is
+        // live across it, the analysis gives up rather than losing track of
+        // where it went.
+        if is_control_flow(op) {
+            if stack.iter().any(|value| matches!(value, Tracked::Frame(_))) {
+                frame.escapes = true;
+                return Some(frame);
+            }
+            stack.clear();
+            continue;
+        }
+
+        match op {
+            Op::LocalGet(index) if *index == base_local => stack.push(Tracked::Frame(0)),
+            Op::LocalGet(_) | Op::GlobalGet(_) => stack.push(Tracked::Other),
+            Op::I32Const(value) => stack.push(Tracked::Const(*value)),
+            Op::I64Const(_) | Op::F32Const(_) | Op::F64Const(_) => stack.push(Tracked::Other),
+
+            Op::Num(num) if num.name() == "I32Add" => {
+                let right = stack.pop().unwrap_or(Tracked::Other);
+                let left = stack.pop().unwrap_or(Tracked::Other);
+                // `frame + k` stays the frame; anything else is arithmetic on
+                // an address we can no longer place.
+                let sum = match (left, right) {
+                    (Tracked::Frame(at), Tracked::Const(k))
+                    | (Tracked::Const(k), Tracked::Frame(at)) => Tracked::Frame(at + k),
+                    (Tracked::Const(a), Tracked::Const(b)) => Tracked::Const(a.wrapping_add(b)),
+                    (left, right) => {
+                        if matches!(left, Tracked::Frame(_)) || matches!(right, Tracked::Frame(_)) {
+                            frame.escapes = true;
+                        }
+                        Tracked::Other
+                    }
+                };
+                stack.push(sum);
+            }
+
+            Op::Load { kind, mem } => {
+                let address = stack.pop().unwrap_or(Tracked::Other);
+                if let Tracked::Frame(at) = address {
+                    let offset = at + mem.offset as i32;
+                    let slot = frame.slots.entry(offset).or_default();
+                    slot.width = slot.width.max(width_of_load(*kind));
+                    slot.reads += 1;
+                }
+                stack.push(Tracked::Other);
+            }
+            Op::Store { kind, mem } => {
+                let value = stack.pop().unwrap_or(Tracked::Other);
+                let address = stack.pop().unwrap_or(Tracked::Other);
+                // Storing the frame address *into* memory is the plainest
+                // escape there is.
+                if matches!(value, Tracked::Frame(_)) {
+                    frame.escapes = true;
+                }
+                if let Tracked::Frame(at) = address {
+                    let offset = at + mem.offset as i32;
+                    let slot = frame.slots.entry(offset).or_default();
+                    slot.width = slot.width.max(width_of_store(*kind));
+                    slot.writes += 1;
+                }
+            }
+
+            // The epilogue: `frame + size` written back to the stack pointer.
+            Op::GlobalSet(index) if *index == stack_pointer => {
+                let value = stack.pop().unwrap_or(Tracked::Other);
+                if !matches!(value, Tracked::Frame(at) if at == size) {
+                    frame.escapes = true;
+                }
+            }
+
+            Op::LocalSet(index) | Op::LocalTee(index) => {
+                let value = stack.pop().unwrap_or(Tracked::Other);
+                // The base being reassigned, or copied somewhere this walk no
+                // longer follows.
+                if matches!(value, Tracked::Frame(_)) || *index == base_local {
+                    frame.escapes = true;
+                }
+                if matches!(op, Op::LocalTee(_)) {
+                    stack.push(value);
+                }
+            }
+
+            Op::Drop => {
+                stack.pop();
+            }
+
+            Op::Call(index) => {
+                let arity = module
+                    .func_type(*index)
+                    .map_or(usize::MAX, |ty| ty.params.len());
+                if !consume(&mut frame, &mut stack, arity) {
+                    return Some(frame);
+                }
+                let results = module.func_type(*index).map_or(1, |ty| ty.results.len());
+                stack.extend(std::iter::repeat_n(Tracked::Other, results));
+            }
+
+            // Everything else: pop what it takes, push what it makes, and treat
+            // a frame address reaching it as an escape.
+            other => {
+                let Some((takes, makes)) = arity_of(module, other) else {
+                    frame.escapes = true;
+                    return Some(frame);
+                };
+                if !consume(&mut frame, &mut stack, takes) {
+                    return Some(frame);
+                }
+                stack.extend(std::iter::repeat_n(Tracked::Other, makes));
+            }
+        }
+    }
+    Some(frame)
+}
+
+/// Pops `count` values, marking the frame as escaping if any of them was the
+/// frame address. Returns false when the analysis has given up.
+fn consume(frame: &mut Frame, stack: &mut Vec<Tracked>, count: usize) -> bool {
+    if count == usize::MAX {
+        frame.escapes = true;
+        return false;
+    }
+    for _ in 0..count {
+        if matches!(stack.pop(), Some(Tracked::Frame(_))) {
+            frame.escapes = true;
+        }
+    }
+    true
+}
+
+fn is_control_flow(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Block(_)
+            | Op::Loop(_)
+            | Op::If(_)
+            | Op::Else
+            | Op::End
+            | Op::Br(_)
+            | Op::BrIf(_)
+            | Op::BrTable { .. }
+            | Op::Return
+            | Op::Unreachable
+    )
+}
+
+/// How many values an instruction takes and makes. `None` for anything this
+/// analysis does not model, which makes the caller give up.
+fn arity_of(module: &Module, op: &Op) -> Option<(usize, usize)> {
+    Some(match op {
+        Op::Nop | Op::DataDrop(_) => (0, 0),
+        Op::Num(num) => (num.operands().len(), 1),
+        Op::GlobalSet(_) => (1, 0),
+        Op::Select => (3, 1),
+        Op::MemorySize => (0, 1),
+        Op::MemoryGrow => (1, 1),
+        Op::MemoryCopy | Op::MemoryFill | Op::MemoryInit(_) => (3, 0),
+        Op::CallIndirect { type_index } => {
+            let ty = module.types.get(*type_index as usize)?;
+            (ty.params.len() + 1, ty.results.len())
+        }
+        _ => return None,
+    })
+}
+
+fn width_of_load(kind: crate::module::LoadKind) -> u32 {
+    use crate::module::LoadKind as L;
+    match kind {
+        L::I32Load8S | L::I32Load8U | L::I64Load8S | L::I64Load8U => 1,
+        L::I32Load16S | L::I32Load16U | L::I64Load16S | L::I64Load16U => 2,
+        L::I32 | L::F32 | L::I64Load32S | L::I64Load32U => 4,
+        L::I64 | L::F64 => 8,
+    }
+}
+
+fn width_of_store(kind: crate::module::StoreKind) -> u32 {
+    use crate::module::StoreKind as S;
+    match kind {
+        S::I32Store8 | S::I64Store8 => 1,
+        S::I32Store16 | S::I64Store16 => 2,
+        S::I32 | S::F32 | S::I64Store32 => 4,
+        S::I64 | S::F64 => 8,
+    }
+}
+
+/// What a matched prologue says.
+struct Prologue {
+    size: i32,
+    base_local: u32,
+    /// Instructions the prologue occupies.
+    length: usize,
+    publishes: bool,
+}
+
+/// Matches the prologue: `global.get $sp; i32.const size; i32.sub`, then some
+/// way of keeping the result.
+///
+/// Three spellings turn up in practice, and the third was a surprise:
+///
+/// ```wat
+/// local.tee $base   global.set $sp     ;; the usual one
+/// local.set $base   local.get $base   global.set $sp
+/// local.set $base                      ;; a leaf function at -O0
+/// ```
+///
+/// The last one never writes the stack pointer back. clang emits it for a
+/// function that calls nothing: the space below the pointer is nobody else's
+/// while it runs, so reserving it formally would be wasted work. Requiring the
+/// `global.set` — which this did at first — misses every one of them.
+fn read_prologue(body: &[Op], stack_pointer: u32) -> Option<Prologue> {
+    let Op::GlobalGet(index) = body.first()? else {
+        return None;
+    };
+    if *index != stack_pointer {
+        return None;
+    }
+    let Op::I32Const(size) = body.get(1)? else {
+        return None;
+    };
+    if *size <= 0 {
+        return None;
+    }
+    if !matches!(body.get(2)?, Op::Num(num) if num.name() == "I32Sub") {
+        return None;
+    }
+
+    match body.get(3)? {
+        Op::LocalTee(base) => match body.get(4) {
+            Some(Op::GlobalSet(sp)) if *sp == stack_pointer => Some(Prologue {
+                size: *size,
+                base_local: *base,
+                length: 5,
+                publishes: true,
+            }),
+            _ => Some(Prologue {
+                size: *size,
+                base_local: *base,
+                length: 4,
+                publishes: false,
+            }),
+        },
+        Op::LocalSet(base) => {
+            let published = matches!(
+                (body.get(4), body.get(5)),
+                (Some(Op::LocalGet(again)), Some(Op::GlobalSet(sp)))
+                    if again == base && *sp == stack_pointer
+            );
+            Some(Prologue {
+                size: *size,
+                base_local: *base,
+                length: if published { 6 } else { 4 },
+                publishes: published,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -403,6 +754,511 @@ mod tests {
         let text = static_text(&module, 0).expect("text");
         assert!(text.ends_with('…'), "{text}");
         assert!(text.chars().count() <= 121);
+    }
+
+    // ---- frames ----
+
+    fn framed_module(body: Vec<Op>) -> Module {
+        let mut module = module_with_globals(1, true);
+        module.exports.push(crate::module::Export {
+            name: "__stack_pointer".into(),
+            kind: ExportKind::Global,
+            index: 0,
+        });
+        module.types = vec![FuncType::default()];
+        with_bodies(module, vec![body])
+    }
+
+    /// `global.get $sp; i32.const size; i32.sub; local.tee $base; global.set $sp`
+    fn frame_prologue(size: i32, base: u32) -> Vec<Op> {
+        vec![
+            Op::GlobalGet(0),
+            Op::I32Const(size),
+            Op::Num(NumOp::I32Sub),
+            Op::LocalTee(base),
+            Op::GlobalSet(0),
+        ]
+    }
+
+    fn frame_epilogue(size: i32, base: u32) -> Vec<Op> {
+        vec![
+            Op::LocalGet(base),
+            Op::I32Const(size),
+            Op::Num(NumOp::I32Add),
+            Op::GlobalSet(0),
+        ]
+    }
+
+    fn frame_of(body: Vec<Op>) -> Frame {
+        let module = framed_module(body);
+        analyse(&module)
+            .frames
+            .get(&0)
+            .cloned()
+            .expect("the function has a frame")
+    }
+
+    fn store(offset: u64) -> Op {
+        Op::Store {
+            kind: crate::module::StoreKind::I32,
+            mem: crate::module::MemArg { offset },
+        }
+    }
+
+    fn load(offset: u64) -> Op {
+        Op::Load {
+            kind: crate::module::LoadKind::I32,
+            mem: crate::module::MemArg { offset },
+        }
+    }
+
+    #[test]
+    fn a_frame_records_its_size_and_the_local_that_holds_it() {
+        let mut body = frame_prologue(32, 1);
+        body.extend(frame_epilogue(32, 1));
+        let frame = frame_of(body);
+        assert_eq!(frame.size, 32);
+        assert_eq!(frame.base_local, 1);
+        assert!(!frame.escapes);
+        assert!(frame.slots.is_empty());
+    }
+
+    #[test]
+    fn a_function_with_no_prologue_has_no_frame() {
+        let module = framed_module(vec![Op::I32Const(1), Op::Drop]);
+        assert!(analyse(&module).frames.is_empty());
+    }
+
+    #[test]
+    fn slots_are_collected_with_their_width_and_direction() {
+        let mut body = frame_prologue(48, 0);
+        // frame[12] = x, twice
+        body.extend([Op::LocalGet(0), Op::I32Const(7), store(12)]);
+        body.extend([Op::LocalGet(0), Op::I32Const(9), store(12)]);
+        // read frame[12] and frame[16]
+        body.extend([Op::LocalGet(0), load(12), Op::Drop]);
+        body.extend([Op::LocalGet(0), load(16), Op::Drop]);
+        // a byte at frame[20]
+        body.extend([
+            Op::LocalGet(0),
+            Op::I32Const(1),
+            Op::Store {
+                kind: crate::module::StoreKind::I32Store8,
+                mem: crate::module::MemArg { offset: 20 },
+            },
+        ]);
+        body.extend(frame_epilogue(48, 0));
+
+        let frame = frame_of(body);
+        assert!(!frame.escapes, "nothing here leaves the function");
+        assert_eq!(frame.slots.len(), 3);
+        assert_eq!(
+            frame.slots[&12],
+            Slot {
+                width: 4,
+                reads: 1,
+                writes: 2
+            }
+        );
+        assert_eq!(
+            frame.slots[&16],
+            Slot {
+                width: 4,
+                reads: 1,
+                writes: 0
+            }
+        );
+        assert_eq!(
+            frame.slots[&20],
+            Slot {
+                width: 1,
+                reads: 0,
+                writes: 1
+            }
+        );
+    }
+
+    #[test]
+    fn an_offset_added_before_the_access_lands_in_the_same_place() {
+        // `frame + 8` then `i32.load offset=4` is frame[12], the same slot the
+        // direct `i32.load offset=12` reaches.
+        let mut body = frame_prologue(16, 0);
+        body.extend([
+            Op::LocalGet(0),
+            Op::I32Const(8),
+            Op::Num(NumOp::I32Add),
+            load(4),
+            Op::Drop,
+        ]);
+        body.extend([Op::LocalGet(0), load(12), Op::Drop]);
+        body.extend(frame_epilogue(16, 0));
+
+        let frame = frame_of(body);
+        assert_eq!(frame.slots.len(), 1, "{:?}", frame.slots);
+        assert_eq!(frame.slots[&12].reads, 2);
+    }
+
+    #[test]
+    fn passing_the_frame_address_to_a_call_is_an_escape() {
+        let mut module = module_with_globals(1, true);
+        module.exports.push(crate::module::Export {
+            name: "__stack_pointer".into(),
+            kind: ExportKind::Global,
+            index: 0,
+        });
+        module.types = vec![
+            FuncType::default(),
+            FuncType {
+                params: vec![ValType::I32],
+                results: Vec::new(),
+            },
+        ];
+        let mut body = frame_prologue(16, 0);
+        body.extend([Op::LocalGet(0), Op::Call(1)]);
+        body.extend(frame_epilogue(16, 0));
+        let mut module = with_bodies(module, vec![body, Vec::new()]);
+        module.funcs[1].type_index = 1;
+
+        let frame = analyse(&module).frames[&0].clone();
+        assert!(
+            frame.escapes,
+            "the callee can do anything with that address"
+        );
+    }
+
+    #[test]
+    fn storing_the_frame_address_into_memory_is_an_escape() {
+        let mut body = frame_prologue(16, 0);
+        // frame[0] = frame — a self-referential pointer, and an address that
+        // now lives somewhere this walk cannot follow.
+        body.extend([Op::LocalGet(0), Op::LocalGet(0), store(0)]);
+        body.extend(frame_epilogue(16, 0));
+        assert!(frame_of(body).escapes);
+    }
+
+    #[test]
+    fn copying_the_frame_address_to_another_local_is_an_escape() {
+        let mut body = frame_prologue(16, 0);
+        body.extend([Op::LocalGet(0), Op::LocalSet(3)]);
+        body.extend(frame_epilogue(16, 0));
+        assert!(frame_of(body).escapes);
+    }
+
+    #[test]
+    fn reassigning_the_base_local_is_an_escape() {
+        let mut body = frame_prologue(16, 0);
+        body.extend([Op::I32Const(1234), Op::LocalSet(0)]);
+        body.extend(frame_epilogue(16, 0));
+        assert!(frame_of(body).escapes);
+    }
+
+    #[test]
+    fn arithmetic_that_is_not_a_constant_offset_is_an_escape() {
+        // `frame + n` where n is a parameter: the slot could be anywhere.
+        let mut body = frame_prologue(16, 0);
+        body.extend([
+            Op::LocalGet(0),
+            Op::LocalGet(1),
+            Op::Num(NumOp::I32Add),
+            load(0),
+            Op::Drop,
+        ]);
+        body.extend(frame_epilogue(16, 0));
+        assert!(frame_of(body).escapes);
+    }
+
+    #[test]
+    fn a_frame_address_live_across_control_flow_ends_the_analysis() {
+        let mut body = frame_prologue(16, 0);
+        body.extend([Op::LocalGet(0), Op::Block(crate::module::BlockType::Empty)]);
+        body.extend(frame_epilogue(16, 0));
+        assert!(
+            frame_of(body).escapes,
+            "the walk cannot follow it, so it must not claim to"
+        );
+    }
+
+    #[test]
+    fn control_flow_with_no_frame_address_pending_is_fine() {
+        let mut body = frame_prologue(16, 0);
+        body.extend([Op::LocalGet(0), Op::I32Const(1), store(4)]);
+        body.push(Op::Block(crate::module::BlockType::Empty));
+        body.push(Op::End);
+        body.extend([Op::LocalGet(0), load(4), Op::Drop]);
+        body.extend(frame_epilogue(16, 0));
+        let frame = frame_of(body);
+        assert!(!frame.escapes);
+        assert_eq!(
+            frame.slots[&4],
+            Slot {
+                width: 4,
+                reads: 1,
+                writes: 1
+            }
+        );
+    }
+
+    #[test]
+    fn an_epilogue_that_restores_the_wrong_amount_is_an_escape() {
+        // Off by a frame size means the stack pointer is left somewhere else,
+        // and whatever this function is doing is not the shape assumed here.
+        let mut body = frame_prologue(16, 0);
+        body.extend(frame_epilogue(32, 0));
+        assert!(frame_of(body).escapes);
+    }
+
+    #[test]
+    fn an_instruction_the_walk_does_not_model_ends_it() {
+        let mut body = frame_prologue(16, 0);
+        body.push(Op::LocalGet(0));
+        // A call_indirect naming a type that does not exist: the walk cannot
+        // know the arity, so it must stop rather than lose track of the stack.
+        body.push(Op::CallIndirect { type_index: 99 });
+        assert!(frame_of(body).escapes);
+    }
+
+    #[test]
+    fn a_prologue_written_with_a_set_and_a_get_is_recognised() {
+        let mut body = vec![
+            Op::GlobalGet(0),
+            Op::I32Const(64),
+            Op::Num(NumOp::I32Sub),
+            Op::LocalSet(2),
+            Op::LocalGet(2),
+            Op::GlobalSet(0),
+        ];
+        body.extend([Op::LocalGet(2), Op::I32Const(5), store(8)]);
+        body.extend(frame_epilogue(64, 2));
+        let frame = frame_of(body);
+        assert_eq!(frame.size, 64);
+        assert_eq!(frame.base_local, 2);
+        assert!(!frame.escapes);
+        assert_eq!(frame.slots[&8].writes, 1);
+    }
+
+    #[test]
+    fn the_walk_keeps_its_footing_through_the_rest_of_the_instruction_set() {
+        // None of these involve the frame address, and all of them have to
+        // leave the abstract stack balanced — if the arity were wrong, a later
+        // `local.get $base` would be popped by the wrong instruction and an
+        // escape would go unnoticed.
+        let mut body = frame_prologue(32, 0);
+        body.extend([
+            Op::Nop,
+            Op::I64Const(1),
+            Op::Drop,
+            Op::F32Const(1.0),
+            Op::Drop,
+            Op::F64Const(1.0),
+            Op::Drop,
+            Op::I32Const(2),
+            Op::I32Const(3),
+            Op::Num(NumOp::I32Add),
+            Op::Drop,
+            Op::MemorySize,
+            Op::Drop,
+            Op::I32Const(1),
+            Op::MemoryGrow,
+            Op::Drop,
+            Op::I32Const(0),
+            Op::I32Const(0),
+            Op::I32Const(0),
+            Op::MemoryFill,
+            Op::I32Const(0),
+            Op::I32Const(0),
+            Op::I32Const(0),
+            Op::MemoryCopy,
+            Op::I32Const(0),
+            Op::I32Const(0),
+            Op::I32Const(0),
+            Op::MemoryInit(0),
+            Op::DataDrop(0),
+            Op::I32Const(1),
+            Op::I32Const(2),
+            Op::I32Const(3),
+            Op::Select,
+            Op::Drop,
+            Op::I32Const(7),
+            Op::LocalTee(4),
+            Op::Drop,
+            Op::I32Const(9),
+            Op::GlobalSet(0),
+        ]);
+        // And after all of that, an access still lands in the right slot.
+        body.extend([Op::LocalGet(0), Op::I32Const(11), store(4)]);
+        let frame = frame_of(body);
+        assert_eq!(frame.slots[&4].writes, 1, "{:?}", frame.slots);
+    }
+
+    #[test]
+    fn eight_byte_accesses_are_recorded_as_eight_bytes() {
+        let mut body = frame_prologue(32, 0);
+        body.extend([
+            Op::LocalGet(0),
+            Op::I64Const(1),
+            Op::Store {
+                kind: crate::module::StoreKind::I64,
+                mem: crate::module::MemArg { offset: 0 },
+            },
+            Op::LocalGet(0),
+            Op::Load {
+                kind: crate::module::LoadKind::F64,
+                mem: crate::module::MemArg { offset: 8 },
+            },
+            Op::Drop,
+        ]);
+        let frame = frame_of(body);
+        assert_eq!(frame.slots[&0].width, 8);
+        assert_eq!(frame.slots[&8].width, 8);
+    }
+
+    #[test]
+    fn a_call_to_a_function_that_is_not_there_ends_the_walk() {
+        // The arity is unknown, so the stack cannot be kept straight past it.
+        let mut body = frame_prologue(16, 0);
+        body.push(Op::Call(77));
+        assert!(frame_of(body).escapes);
+    }
+
+    #[test]
+    fn a_call_that_does_not_take_the_frame_address_is_not_an_escape() {
+        let mut module = module_with_globals(1, true);
+        module.exports.push(crate::module::Export {
+            name: "__stack_pointer".into(),
+            kind: ExportKind::Global,
+            index: 0,
+        });
+        module.types = vec![
+            FuncType::default(),
+            FuncType {
+                params: vec![ValType::I32],
+                results: vec![ValType::I32],
+            },
+        ];
+        let mut body = frame_prologue(16, 0);
+        body.extend([Op::I32Const(5), Op::Call(1), Op::Drop]);
+        body.extend([Op::LocalGet(0), Op::I32Const(1), store(0)]);
+        let mut module = with_bodies(module, vec![body, Vec::new()]);
+        module.funcs[1].type_index = 1;
+
+        let frame = analyse(&module).frames[&0].clone();
+        assert!(!frame.escapes, "{frame:?}");
+        assert_eq!(frame.slots[&0].writes, 1);
+    }
+
+    #[test]
+    fn an_indirect_call_taking_the_frame_address_is_an_escape() {
+        let mut module = module_with_globals(1, true);
+        module.exports.push(crate::module::Export {
+            name: "__stack_pointer".into(),
+            kind: ExportKind::Global,
+            index: 0,
+        });
+        module.types = vec![
+            FuncType::default(),
+            FuncType {
+                params: vec![ValType::I32],
+                results: Vec::new(),
+            },
+        ];
+        let mut body = frame_prologue(16, 0);
+        body.extend([
+            Op::LocalGet(0),
+            Op::I32Const(0),
+            Op::CallIndirect { type_index: 1 },
+        ]);
+        let module = with_bodies(module, vec![body]);
+        assert!(analyse(&module).frames[&0].escapes);
+    }
+
+    #[test]
+    fn a_prologue_that_is_not_one_is_refused_at_every_step() {
+        let cases: Vec<Vec<Op>> = vec![
+            // Does not start with the stack pointer.
+            vec![Op::I32Const(16), Op::Num(NumOp::I32Sub)],
+            // Reads a different global.
+            vec![
+                Op::GlobalGet(1),
+                Op::I32Const(16),
+                Op::Num(NumOp::I32Sub),
+                Op::LocalTee(0),
+            ],
+            // Reserves nothing.
+            vec![
+                Op::GlobalGet(0),
+                Op::I32Const(0),
+                Op::Num(NumOp::I32Sub),
+                Op::LocalTee(0),
+            ],
+            // Adds instead of subtracting: that is an epilogue.
+            vec![
+                Op::GlobalGet(0),
+                Op::I32Const(16),
+                Op::Num(NumOp::I32Add),
+                Op::LocalTee(0),
+            ],
+            // Keeps the result nowhere this analysis can name.
+            vec![
+                Op::GlobalGet(0),
+                Op::I32Const(16),
+                Op::Num(NumOp::I32Sub),
+                Op::GlobalSet(0),
+            ],
+            // Runs out before it says where the address went.
+            vec![Op::GlobalGet(0), Op::I32Const(16), Op::Num(NumOp::I32Sub)],
+        ];
+        for (at, body) in cases.into_iter().enumerate() {
+            let module = framed_module(body);
+            assert!(
+                analyse(&module).frames.is_empty(),
+                "case {at} was read as a prologue"
+            );
+        }
+    }
+
+    #[test]
+    fn a_leaf_prologue_is_recognised_and_marked_unpublished() {
+        // No `global.set`: clang omits it for a function that calls nothing.
+        let mut body = vec![
+            Op::GlobalGet(0),
+            Op::I32Const(16),
+            Op::Num(NumOp::I32Sub),
+            Op::LocalSet(1),
+        ];
+        body.extend([Op::LocalGet(1), Op::I32Const(3), store(0)]);
+        let frame = frame_of(body);
+        assert!(!frame.publishes);
+        assert_eq!(frame.base_local, 1);
+        assert_eq!(frame.slots[&0].writes, 1);
+
+        // The `local.tee` spelling of the same thing.
+        let mut body = vec![
+            Op::GlobalGet(0),
+            Op::I32Const(16),
+            Op::Num(NumOp::I32Sub),
+            Op::LocalTee(1),
+            Op::Drop,
+        ];
+        body.extend([Op::LocalGet(1), Op::I32Const(3), store(0)]);
+        let frame = frame_of(body);
+        assert!(!frame.publishes);
+    }
+
+    #[test]
+    fn a_published_prologue_says_so() {
+        let mut body = frame_prologue(16, 0);
+        body.extend(frame_epilogue(16, 0));
+        assert!(frame_of(body).publishes);
+    }
+
+    #[test]
+    fn frames_are_not_looked_for_without_a_stack_pointer() {
+        // No stack pointer identified means no basis for calling anything a
+        // frame — the prologue shape alone is not enough.
+        let module = with_bodies(module_with_globals(1, false), vec![frame_prologue(16, 0)]);
+        let analysis = analyse(&module);
+        assert!(analysis.stack_pointer.is_none());
+        assert!(analysis.frames.is_empty());
     }
 
     #[test]

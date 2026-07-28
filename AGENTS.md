@@ -95,6 +95,20 @@ would otherwise miss it.
 - `tests/emscripten.rs` — the toolchain the captured modules were built with:
   its libc, its libm, its C++ vtables
 
+## The frame walk gives up early, on purpose
+
+`read_frame` tracks which abstract stack entries are the frame address. Anything
+it cannot model exactly — an unknown arity, a frame address live across control
+flow, arithmetic that is not a constant offset — sets `escapes` and stops. That
+direction is the safe one: a frame wrongly called escaping costs an annotation,
+while one wrongly called contained is a false statement about the code, and the
+next level would build variable promotion on top of it.
+
+The three prologue spellings are in `read_prologue`, and the third one — a leaf
+function that never writes the stack pointer back — is not in any reference. It
+was found by looking at what clang actually emitted at `-O0`, after the first
+version silently found no frames at all.
+
 ## The two rules the value stack lives by
 
 Both were learned from a real module rather than from reasoning:

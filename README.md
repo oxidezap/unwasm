@@ -143,6 +143,47 @@ On the mozjpeg capture that recovers 247 strings, including the Rust panic
 messages that name the failing function — which is how `wa-wasm-oracle` worked
 out that module's calling convention in the first place.
 
+### The shadow stack
+
+A C function's locals do not all fit in wasm locals: anything whose address is
+taken, anything larger than a scalar, anything spilled, lives in a frame carved
+out of linear memory. The analysis reads that frame back:
+
+```rust
+/// Stack frame: 32 bytes, based at `frame`, not published (nothing is
+/// called while it is live).
+///
+/// | offset | width | reads | writes |
+/// |--------|-------|-------|--------|
+/// | +16    | 4B    | 1     | 1      |
+/// | +20    | 2B    | 0     | 1      |
+/// | +22    | 1B    | 0     | 1      |
+```
+
+That is `struct Point { int x; short y; char tag; }`, and its layout is legible
+without a single name having survived. The base local is renamed `frame`; the
+others keep their indices, because the index is what a `local.get 3` in the
+bytes refers to.
+
+Two things it reports honestly rather than glossing over:
+
+- **When the address escapes.** If the frame is passed to a call, stored into
+  memory, or copied to another local, the summary says so — the slots listed
+  are then only the accesses that could be followed, not the whole frame.
+- **When a frame is never published.** A leaf function at `-O0` computes
+  `sp - 32`, uses it, and never writes it back, because nothing else will
+  allocate while it runs. Requiring the write — which this did at first — misses
+  every leaf function in a module.
+
+What it does *not* do is turn slots into Rust variables. It could, for the
+frames that do not escape; it would also stop the decompilation being
+byte-exact, because the bytes a promoted slot used to leave in linear memory
+would no longer be there. That is a real property to give up, and not one to
+give up quietly, so it waits for a level that says it is doing so. Across the
+captures, the frames that stay put are 0.7% to 28% of the total — so the prize
+is smaller than it sounds, and would need a real dataflow analysis rather than
+this linear walk to grow.
+
 ## Usage
 
 ```console

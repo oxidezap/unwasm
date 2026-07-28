@@ -904,3 +904,115 @@ fn a_string_containing_a_comment_terminator_cannot_break_the_output() {
     // And it still builds and runs, which is the property that matters.
     common::assert_agrees("hostile", &wasm, &[common::call("at", &[])]);
 }
+
+/// The frame summary is a reading of the function, and reading must not change
+/// what it does.
+#[test]
+fn a_frame_is_summarised_and_the_function_still_agrees() {
+    const SOURCE: &str = r#"
+        struct Point { int x; short y; char tag; };
+        int through_a_struct(int a, int b) {
+            struct Point point = { a, (short)b, (char)(a ^ b) };
+            point.x += point.y;
+            return point.x + point.tag;
+        }
+        int through_an_array(int n) {
+            int values[8];
+            for (int i = 0; i < 8; i++) values[i] = i * n;
+            int total = 0;
+            for (int i = 0; i < 8; i++) total += values[i];
+            return total;
+        }
+    "#;
+    // -O0 is where the shadow stack shows: at -O1 the struct is promoted into
+    // wasm locals and there is no frame at all.
+    let wasm = common::compile_c("frames", SOURCE, "-O0");
+    let code = common::decompile(&wasm);
+
+    assert!(
+        code.contains("Stack frame:"),
+        "no frame was reported:\n{code}"
+    );
+    assert!(code.contains("based at `frame`"));
+    assert!(code.contains("| offset | width | reads | writes |"));
+    // The frame base gets the name, and the other locals keep their indices.
+    assert!(code.contains("let mut frame: i32"), "{code}");
+
+    let mut calls = Vec::new();
+    for (a, b) in [(0, 0), (5, -3), (1, 70000)] {
+        calls.push(common::call(
+            "through_a_struct",
+            &[common::Arg::I32(a), common::Arg::I32(b)],
+        ));
+    }
+    for n in [0, 3, -7] {
+        calls.push(common::call("through_an_array", &[common::Arg::I32(n)]));
+    }
+    common::assert_agrees("frames", &wasm, &calls);
+}
+
+#[test]
+fn the_summary_says_when_the_frame_address_leaves_the_function() {
+    // `memcpy` takes the address, so nothing can be claimed about what happens
+    // to the slots after that — and the summary has to say so rather than list
+    // the accesses as if they were all of them.
+    const SOURCE: &str = r#"
+        void copy_bytes(void *destination, const void *source, unsigned long count);
+        int leaks_its_frame(int n) {
+            char buffer[16];
+            for (int i = 0; i < 16; i++) buffer[i] = (char)(n + i);
+            char other[16];
+            copy_bytes(other, buffer, 16);
+            return other[0] + other[15];
+        }
+    "#;
+    let wasm = common::compile_c("escaping", SOURCE, "-O0");
+    let code = common::decompile(&wasm);
+    assert!(
+        code.contains("The address leaves this function"),
+        "an escape was not reported:\n{code}"
+    );
+}
+
+#[test]
+fn a_leaf_frame_is_marked_as_not_published() {
+    // A function that calls nothing does not write the reserved address back
+    // to the stack pointer — clang skips it, and requiring the write is how an
+    // analysis misses every leaf function in a module.
+    const SOURCE: &str = r#"
+        int leaf(int a) {
+            volatile int slot = a * 3;
+            return slot + 1;
+        }
+    "#;
+    let wasm = common::compile_c("leaf", SOURCE, "-O0");
+    let code = common::decompile(&wasm);
+    assert!(
+        code.contains("not published"),
+        "the leaf frame was misread:\n{code}"
+    );
+    common::assert_agrees(
+        "leaf",
+        &wasm,
+        &[
+            common::call("leaf", &[common::Arg::I32(0)]),
+            common::call("leaf", &[common::Arg::I32(7)]),
+        ],
+    );
+}
+
+#[test]
+fn a_module_with_no_stack_pointer_has_no_frames_and_still_works() {
+    let wasm = common::assemble(
+        "framless",
+        "(module (func (export \"f\") (param i32) (result i32) local.get 0 i32.const 2 i32.mul))",
+    );
+    let code = common::decompile(&wasm);
+    assert!(!code.contains("Stack frame:"), "{code}");
+    assert!(!code.contains("stack_pointer"), "{code}");
+    common::assert_agrees(
+        "framless",
+        &wasm,
+        &[common::call("f", &[common::Arg::I32(21)])],
+    );
+}

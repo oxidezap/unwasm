@@ -28,7 +28,10 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use crate::analysis::{self, Analysis, Evidence};
+// `Frame` is taken in this file by the control-flow frame, which is a
+// different thing entirely: one is a `block` being emitted, the other is the C
+// stack frame the module carved out of linear memory.
+use crate::analysis::{self, Analysis, Evidence, Frame as StackFrame};
 use crate::error::{Error, Result};
 use crate::module::{
     BlockType, ConstExpr, ExportKind, Func, LoadKind, Module, Op, StoreKind, ValType,
@@ -638,6 +641,10 @@ impl<'a> Generator<'a> {
         } else {
             let _ = writeln!(out, "    /// Function #{index}, unnamed in the module.");
         }
+        let frame = self.analysis.frames.get(&index);
+        if let Some(frame) = frame {
+            out.push_str(&frame_summary(frame));
+        }
         // `pub(crate)` rather than private: under a split layout the callers
         // live in sibling modules, and a private method would be visible only
         // in the one it was defined in.
@@ -690,6 +697,8 @@ struct Frame {
 struct Body<'a> {
     module: &'a Module,
     analysis: &'a Analysis,
+    /// This function's C stack frame, when it has one.
+    frame: Option<&'a StackFrame>,
     func: &'a Func,
     ty: &'a crate::module::FuncType,
     index: u32,
@@ -718,6 +727,7 @@ impl<'a> Body<'a> {
         Self {
             module,
             analysis,
+            frame: analysis.frames.get(&index),
             func,
             ty,
             index,
@@ -742,12 +752,17 @@ impl<'a> Body<'a> {
         // rebound as `l0..` so that `local.set` on a parameter is the same
         // statement as `local.set` on a local.
         for (at, param) in self.ty.params.iter().enumerate() {
-            self.line(&format!("let mut l{at}: {} = p{at};", param.rust_name()));
+            self.line(&format!(
+                "let mut {}: {} = p{at};",
+                self.local_ident(at as u32),
+                param.rust_name()
+            ));
         }
         for (at, local) in self.func.locals.iter().enumerate() {
             let at = self.ty.params.len() + at;
             self.line(&format!(
-                "let mut l{at}: {} = {};",
+                "let mut {}: {} = {};",
+                self.local_ident(at as u32),
                 local.rust_name(),
                 local.zero()
             ));
@@ -1070,19 +1085,19 @@ impl<'a> Body<'a> {
             }
             Op::LocalGet(index) => {
                 let ty = self.local_type(*index)?;
-                self.push(format!("l{index}"), ty, true);
+                self.push(self.local_ident(*index), ty, true);
             }
             Op::LocalSet(index) => {
                 let value = self.pop()?;
                 self.spill_stack();
-                self.line(&format!("l{index} = {};", value.code));
+                self.line(&format!("{} = {};", self.local_ident(*index), value.code));
             }
             Op::LocalTee(index) => {
                 let value = self.pop()?;
                 self.spill_stack();
-                self.line(&format!("l{index} = {};", value.code));
+                self.line(&format!("{} = {};", self.local_ident(*index), value.code));
                 let ty = self.local_type(*index)?;
-                self.push(format!("l{index}"), ty, true);
+                self.push(self.local_ident(*index), ty, true);
             }
             Op::GlobalGet(index) => {
                 let ty = self.global_type(*index)?;
@@ -1335,6 +1350,19 @@ impl<'a> Body<'a> {
         Ok(())
     }
 
+    /// The Rust name for a wasm local.
+    ///
+    /// The one local worth a real name is the frame base: `frame` says what it
+    /// is, where `l3` says only where it was. Everything else keeps its index,
+    /// because the index is what a `local.get 3` in the bytes refers to and a
+    /// reader tracing one should not have to translate.
+    fn local_ident(&self, index: u32) -> String {
+        match self.frame {
+            Some(frame) if frame.base_local == index => "frame".to_string(),
+            _ => format!("l{index}"),
+        }
+    }
+
     fn local_type(&self, index: u32) -> Result<ValType> {
         let at = index as usize;
         if let Some(param) = self.ty.params.get(at) {
@@ -1420,6 +1448,51 @@ pub fn exported_functions(module: &Module) -> Vec<(&crate::module::Export, Strin
             name = format!("{name}_{}", export.index);
         }
         out.push((export, name));
+    }
+    out
+}
+
+/// The doc comment describing a function's stack frame.
+///
+/// The frame is the part of a C function that wasm cannot show directly: its
+/// locals live in linear memory, addressed off a base the prologue reserves.
+/// Naming the slots does not recover the variables, but it does say how many
+/// there are, how wide, and which are read before they are written.
+fn frame_summary(frame: &StackFrame) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "    ///");
+    let _ = writeln!(
+        out,
+        "    /// Stack frame: {} bytes, based at `frame`{}.",
+        frame.size,
+        if frame.publishes {
+            ", published to the stack pointer"
+        } else {
+            // Worth saying: it is how a leaf function is spelled.
+            ", not published (nothing is called while it is live)"
+        }
+    );
+    if frame.escapes {
+        // Saying this plainly matters: the slots below are what could be
+        // followed, not what is there.
+        let _ = writeln!(
+            out,
+            "    /// The address leaves this function, so the slots below are only\n    /// the accesses this analysis could follow — not the whole frame."
+        );
+    }
+    if frame.slots.is_empty() {
+        let _ = writeln!(out, "    /// No slot accesses were resolved.");
+        return out;
+    }
+    let _ = writeln!(out, "    ///");
+    let _ = writeln!(out, "    /// | offset | width | reads | writes |");
+    let _ = writeln!(out, "    /// |--------|-------|-------|--------|");
+    for (offset, slot) in &frame.slots {
+        let _ = writeln!(
+            out,
+            "    /// | +{offset} | {}B | {} | {} |",
+            slot.width, slot.reads, slot.writes
+        );
     }
     out
 }

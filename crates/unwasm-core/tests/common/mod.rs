@@ -437,8 +437,20 @@ pub fn assert_compiles(name: &str, wasm: &[u8]) {
 /// answers is something only the caller can supply.
 pub fn run_with_driver(name: &str, wasm: &[u8], driver: &str) -> String {
     let module = Module::parse(wasm).expect("parsing the module under test");
+    let layout = codegen::Layout::for_module(&module);
+    run_with_driver_in_layout(name, wasm, driver, layout)
+}
+
+/// As [`run_with_driver`], in a chosen layout.
+pub fn run_with_driver_in_layout(
+    name: &str,
+    wasm: &[u8],
+    driver: &str,
+    layout: codegen::Layout,
+) -> String {
+    let module = Module::parse(wasm).expect("parsing the module under test");
     let scratch = workspace_scratch(name);
-    write_generated(&scratch, &module, codegen::Layout::for_module(&module));
+    write_generated(&scratch, &module, layout);
     std::fs::write(scratch.join("main.rs"), driver).expect("writing the driver");
 
     let binary = scratch.join("driver");

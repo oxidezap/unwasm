@@ -249,3 +249,52 @@ fn an_unwritable_directory_reports_the_path() {
         "{stderr}"
     );
 }
+
+#[test]
+fn inspect_reports_what_the_analysis_could_make_of_the_module() {
+    // A module with a stack pointer and a frame: the two things `inspect`
+    // reports beyond the section counts.
+    let path = fixture(
+        "sample-analysis",
+        r#"(module
+            (memory (export "memory") 1)
+            (global $sp (export "__stack_pointer") (mut i32) (i32.const 65536))
+            (func (export "framed") (param i32) (result i32)
+                (local i32)
+                global.get $sp
+                i32.const 16
+                i32.sub
+                local.tee 1
+                global.set $sp
+                local.get 1
+                local.get 0
+                i32.store offset=4
+                local.get 1
+                i32.load offset=4
+                local.get 1
+                i32.const 16
+                i32.add
+                global.set $sp))"#,
+    );
+    let (ok, stdout, stderr) = run(&["inspect", path.to_str().expect("utf-8 path")]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("stack pointer: global #0 (by its exported name)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("frames: 1 functions"), "{stdout}");
+    assert!(stdout.contains("1 whose address stays put"), "{stdout}");
+    assert!(stdout.contains("largest 16 bytes"), "{stdout}");
+}
+
+#[test]
+fn inspect_says_when_it_could_not_identify_a_stack_pointer() {
+    let path = fixture(
+        "sample-nosp",
+        "(module (func (export \"f\") (result i32) i32.const 1))",
+    );
+    let (ok, stdout, _) = run(&["inspect", path.to_str().expect("utf-8 path")]);
+    assert!(ok);
+    assert!(stdout.contains("stack pointer: not identified"), "{stdout}");
+    assert!(!stdout.contains("frames:"), "{stdout}");
+}

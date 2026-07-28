@@ -150,6 +150,44 @@ fn inspect(arguments: &[String]) -> Result<String, String> {
             out.push_str(&format!("  {}::{}\n", import.module, import.field));
         }
     }
+    // What the analysis could make of the module, in one line each: this is
+    // the cheapest way to see whether a module is worth reading further.
+    let analysis = unwasm_core::analysis::analyse(&module);
+    match analysis.stack_pointer {
+        Some(found) => out.push_str(&format!(
+            "stack pointer: global #{} ({})\n",
+            found.global,
+            match found.evidence {
+                unwasm_core::analysis::Evidence::Exported => "by its exported name".to_string(),
+                unwasm_core::analysis::Evidence::Prologue { functions } =>
+                    format!("by {functions} prologues"),
+            }
+        )),
+        None => out.push_str("stack pointer: not identified\n"),
+    }
+    if !analysis.frames.is_empty() {
+        let contained = analysis
+            .frames
+            .values()
+            .filter(|frame| !frame.escapes)
+            .count();
+        let slots: usize = analysis
+            .frames
+            .values()
+            .map(|frame| frame.slots.len())
+            .sum();
+        let largest = analysis
+            .frames
+            .values()
+            .map(|frame| frame.size)
+            .max()
+            .unwrap_or(0);
+        out.push_str(&format!(
+            "frames: {} functions, {contained} whose address stays put, {slots} slots, largest {largest} bytes\n",
+            analysis.frames.len()
+        ));
+    }
+
     out.push_str("\nexports:\n");
     for export in &module.exports {
         out.push_str(&format!(
