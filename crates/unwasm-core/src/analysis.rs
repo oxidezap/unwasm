@@ -406,6 +406,67 @@ mod tests {
     }
 
     #[test]
+    fn a_prologue_that_never_stores_back_is_not_one() {
+        // `global.get; i32.const; i32.sub` and then something else entirely:
+        // arithmetic on a global, not a frame being reserved.
+        let body = vec![
+            Op::GlobalGet(0),
+            Op::I32Const(32),
+            Op::Num(NumOp::I32Sub),
+            Op::LocalSet(0),
+            Op::LocalSet(1),
+            Op::LocalSet(2),
+        ];
+        let module = with_bodies(module_with_globals(1, true), vec![body.clone(), body]);
+        assert!(analyse(&module).stack_pointer.is_none());
+    }
+
+    #[test]
+    fn a_body_too_short_to_be_a_prologue_is_not_one() {
+        let module = with_bodies(
+            module_with_globals(1, true),
+            vec![
+                vec![Op::GlobalGet(0)],
+                vec![Op::GlobalGet(0), Op::I32Const(4)],
+            ],
+        );
+        assert!(analyse(&module).stack_pointer.is_none());
+    }
+
+    #[test]
+    fn a_length_that_runs_past_the_segment_is_refused() {
+        let module = module_with_data(0, b"short");
+        assert_eq!(static_text_of_length(&module, 0, 50), None);
+        // And a length that is not a length at all.
+        assert_eq!(static_text_of_length(&module, 0, 0), None);
+        assert_eq!(static_text_of_length(&module, 0, 100_000), None);
+    }
+
+    #[test]
+    fn a_length_that_covers_only_binary_is_refused() {
+        let module = module_with_data(0, &[0x01, 0x02, 0x03, 0x04, 0x05]);
+        assert_eq!(static_text_of_length(&module, 0, 4), None);
+    }
+
+    #[test]
+    fn a_length_shorter_than_a_name_is_refused() {
+        let module = module_with_data(0, b"abcdef");
+        assert_eq!(static_text_of_length(&module, 0, 2), None);
+        assert_eq!(
+            static_text_of_length(&module, 0, 6).as_deref(),
+            Some("abcdef")
+        );
+    }
+
+    #[test]
+    fn a_very_long_slice_is_cut_like_a_very_long_string() {
+        let bytes = "y".repeat(300).into_bytes();
+        let module = module_with_data(0, &bytes);
+        let text = static_text_of_length(&module, 0, 300).expect("text");
+        assert!(text.ends_with('…'), "{text}");
+    }
+
+    #[test]
     fn an_address_outside_every_segment_reads_back_as_nothing() {
         let module = module_with_data(1024, b"hello\0");
         assert_eq!(static_text(&module, 0), None);

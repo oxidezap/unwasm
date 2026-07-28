@@ -99,18 +99,39 @@ pub enum Layout {
 }
 
 impl Layout {
-    /// The layout a module of this size wants.
+    /// Functions per file when a module is large enough to want splitting.
     ///
-    /// Small modules stay in one file, where a single file is easier to read
-    /// and to drop into a project; past a few hundred functions the compile
-    /// time decides, and it wants the split.
+    /// Chosen by measurement, not by taste. The 2.0 MiB capture — 3055
+    /// functions, 655k lines — compiled by rustc:
+    ///
+    /// | functions/file | files | time     |
+    /// |----------------|-------|----------|
+    /// | all            | 1     | 22m49s   |
+    /// | 256            | 13    | 7m36s    |
+    /// | 64             | 49    | 2m34s    |
+    /// | 16             | 192   | 25.7s    |
+    /// | 4              | 764   | 10.4s    |
+    ///
+    /// Sixteen is where the curve flattens against something a person still has
+    /// to navigate: it is 53× faster than one file, and going four times finer
+    /// buys only another 2.5× for four times the files. The system time is the
+    /// tell — 1102s for one file against 12.6s for 192, which is a single
+    /// enormous codegen unit thrashing rather than any real work.
+    pub const FUNCTIONS_PER_FILE: usize = 16;
+
+    /// Below this, one file. A 478-function capture compiles in about 2.5
+    /// seconds whole, and one file is easier to read and to drop into a
+    /// project than two hundred.
+    pub const SPLIT_ABOVE: usize = 512;
+
+    /// The layout a module of this size wants.
     #[must_use]
     pub fn for_module(module: &Module) -> Self {
-        if module.funcs.len() <= 256 {
+        if module.funcs.len() <= Self::SPLIT_ABOVE {
             Self::Single
         } else {
             Self::Split {
-                functions_per_file: 256,
+                functions_per_file: Self::FUNCTIONS_PER_FILE,
             }
         }
     }

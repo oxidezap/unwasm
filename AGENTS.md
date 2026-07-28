@@ -133,10 +133,14 @@ rejects each case, so a change in that answer is visible.
 ## Layout is a compile-time decision, and it was measured
 
 rustc partitions codegen units along module boundaries. The 2.0 MiB capture in
-one file took **22m49s**; split across 13 module files, **7m36s** — same binary,
-same behaviour. The number in `README.md` is from a real run, not an estimate,
-and any change to the default should be measured the same way rather than
-argued about.
+one file took **22m49s**; split at 16 functions per file — 192 files — **25.7s**.
+Same binary, same behaviour, 53×.
+
+The default was chosen from the whole curve (1 / 13 / 49 / 192 / 764 files:
+22m49s / 7m36s / 2m34s / 25.7s / 10.4s), not from the first improvement that
+looked good. The table is in `Layout::FUNCTIONS_PER_FILE`. Any change to it
+should be measured the same way rather than argued about — and the system time
+is the number to watch, since it was 1102s for one file and 12.6s for 192.
 
 ## Open work
 

@@ -82,18 +82,37 @@ name:
 COs9e0Kj0ic:   478 functions,  73703 lines of Rust  (VOPRF/crypto, 236 KiB)
 php8T1oSIZM:   321 functions,  79486 lines          (mozjpeg, 376 KiB)
 9Nbh3eMuVjD:  7865 functions, 977766 lines          (2.9 MiB)
-ayqr5HQtlkb:  3055 functions, 655585 lines          (2.0 MiB)
+ayqr5HQtlkb:  3055 functions, 660186 lines          (2.0 MiB)
 rogm88TRRiw:  2157 functions, 508994 lines          (2.1 MiB)
-D5pLH9sfOOl:  refused — imported memory             (VoIP/PJSIP, 9.4 MiB)
+D5pLH9sfOOl:  refused — shared imported memory      (VoIP/PJSIP, 9.4 MiB)
 ```
 
 `COs9e0Kj0ic` compiles with rustc in about 2.5 seconds and instantiates, which
 runs the module's own `__wasm_call_ctors` and every static initialiser with it.
 
-`ayqr5HQtlkb` — 2.0 MiB of wasm, 3055 functions, 655k lines of Rust in one file
-— also compiles and instantiates, in **22m49s**. That is the scaling limit, and
-it is rustc's single compilation unit rather than anything in the decompiler:
-the emitter takes about a second.
+`ayqr5HQtlkb` — 2.0 MiB of wasm, 3055 functions, 660k lines of Rust — compiles
+and instantiates in **23 seconds**, split across 192 module files. In a single
+file the same module took **22m49s**.
+
+### The split, and why it is not cosmetic
+
+rustc partitions codegen units along module boundaries, so one enormous module
+becomes one enormous unit. Measured on that capture, same binary each time:
+
+| functions/file | files | rustc  | vs. one file |
+|----------------|-------|--------|--------------|
+| all            | 1     | 22m49s | 1×           |
+| 256            | 13    | 7m36s  | 3×           |
+| 64             | 49    | 2m34s  | 8.9×         |
+| **16**         | 192   | 25.7s  | **53×**      |
+| 4              | 764   | 10.4s  | 132×         |
+
+The system time is the tell: 1102s for one file against 12.6s for 192. That is
+not work, it is a single codegen unit thrashing. Sixteen is the default —
+53× faster, and still a number of files a person can navigate; going four times
+finer buys another 2.5× for four times the files. `--split <n>` overrides it,
+and a module of 512 functions or fewer stays in one file, where it compiles in
+seconds anyway.
 
 ### What the module says about itself
 
@@ -225,12 +244,14 @@ becomes a panic two years later.
 
 ## Known limits
 
-- **One file.** 655k lines in a single compilation unit is 23 minutes of rustc
-  (against ~1 second to emit them). Splitting the output into several `mod`s so
-  the compiler can parallelise is the next practical piece of work, and it is
-  purely mechanical.
-- **Imported memory is refused**, which is what the 9.4 MiB VoIP module needs —
-  it expects a shared memory from its host. Threads and atomics with it.
+- **Compile time still scales with the module**, just not catastrophically:
+  23 seconds for 2.0 MiB of wasm. The 9.4 MiB VoIP module would be several
+  minutes, if the rest of it were supported.
+- **The VoIP module needs the whole threading model.** It imports
+  `(memory 160 32768 shared)` and its `target_features` asks for `atomics`,
+  `reference-types` and `multivalue`. Imported memory alone would not be
+  enough, and what "faithful" means for atomics in a single-threaded target is
+  a design question rather than an implementation one.
 - **No SIMD, no reference types, no exceptions, no multi-value.** Each is
   refused by name.
 - **Level 0 only.** Linear memory is bytes; a C local that lived in the shadow

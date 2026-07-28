@@ -730,7 +730,7 @@ fn the_layout_a_module_gets_by_default_follows_its_size() {
 
     // A module past the threshold, built rather than hand-written.
     let mut wat = String::from("(module");
-    for index in 0..300 {
+    for index in 0..600 {
         wat.push_str(&format!(
             " (func (export \"f{index}\") (result i32) i32.const {index})"
         ));
@@ -741,12 +741,16 @@ fn the_layout_a_module_gets_by_default_follows_its_size() {
     assert_eq!(
         codegen::Layout::for_module(&module),
         codegen::Layout::Split {
-            functions_per_file: 256
+            functions_per_file: codegen::Layout::FUNCTIONS_PER_FILE
         }
     );
     let files =
         codegen::generate_files(&module, codegen::Layout::for_module(&module)).expect("generating");
-    assert_eq!(files.len(), 3, "mod.rs plus two parts");
+    assert_eq!(
+        files.len(),
+        600usize.div_ceil(codegen::Layout::FUNCTIONS_PER_FILE) + 1,
+        "one mod.rs plus a part per group"
+    );
 }
 
 #[test]
