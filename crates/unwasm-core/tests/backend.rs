@@ -1013,7 +1013,10 @@ fn a_module_with_no_stack_pointer_has_no_frames_and_still_works() {
     );
     let code = common::decompile(&wasm);
     assert!(!code.contains("Stack frame:"), "{code}");
-    assert!(!code.contains("stack_pointer"), "{code}");
+    // The declaration, not the word: the embedded runtime's own documentation
+    // mentions `__stack_pointer`, and always will.
+    assert!(!code.contains("stack_pointer:"), "{code}");
+    assert!(!code.contains("g0_stack_pointer"), "{code}");
     common::assert_agrees(
         "framless",
         &wasm,

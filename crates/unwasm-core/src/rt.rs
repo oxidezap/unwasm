@@ -518,6 +518,607 @@ impl Memory {
     }
 }
 
+/// A memory several instances share, which is what a threaded module has.
+///
+/// Emscripten's pthreads are wasm instances over one `shared` memory: the
+/// module is instantiated once per thread, each with its own globals — its own
+/// `__stack_pointer` above all — and all of them addressing the same bytes.
+/// This is that, in safe Rust: an `Arc<[AtomicU8]>` every instance holds a
+/// handle to.
+///
+/// Three consequences worth knowing before using it:
+///
+/// - **Every byte is an `AtomicU8`, read and written `Relaxed`.** A wasm plain
+///   load or store on a shared memory is exactly a relaxed atomic — the spec
+///   has no data races, only unsynchronised accesses — so this is the faithful
+///   model rather than a conservative one. It does cost: the optimiser cannot
+///   vectorise it.
+/// - **An atomic access takes a lock for its duration.** Byte-wise atomics
+///   cannot make a four-byte read-modify-write atomic on their own. The lock is
+///   stronger than the spec asks for and never weaker, and atomics are rare
+///   next to plain accesses.
+/// - **The size is reserved up front and `grow` only publishes more of it.**
+///   A shared memory cannot be reallocated while other threads hold handles to
+///   it, so the reservation is allocated at construction and growth moves a
+///   counter. Past the reservation `grow` returns -1, which is an answer the
+///   spec allows and which says exactly what happened.
+#[derive(Debug, Clone)]
+pub struct SharedMemory {
+    /// The bytes, all of the reservation.
+    cells: std::sync::Arc<Vec<std::sync::atomic::AtomicU8>>,
+    /// How many pages are currently addressable.
+    pages: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// The maximum the memory type declared.
+    max_pages: Option<u32>,
+    /// Held for the duration of an atomic access, so a four-byte one is not
+    /// four separate ones.
+    atomics: std::sync::Arc<std::sync::Mutex<()>>,
+    /// Threads parked in `memory.atomic.wait`.
+    waiters: std::sync::Arc<Waiters>,
+    /// Watchpoints, shared so a hit from any thread lands in one list.
+    watch: std::sync::Arc<std::sync::Mutex<Watchpoints>>,
+}
+
+/// Threads parked on an address, and the generation that wakes them.
+#[derive(Debug, Default)]
+struct Waiters {
+    /// Address to `(generation, how many are parked)`.
+    parked: std::sync::Mutex<std::collections::BTreeMap<usize, (u64, usize)>>,
+    /// Signalled by every `notify`.
+    wake: std::sync::Condvar,
+}
+
+impl SharedMemory {
+    /// A shared memory of `min_pages`, able to grow to `reserved_pages`.
+    ///
+    /// # Panics
+    ///
+    /// If the reservation is smaller than the initial size, which is a host
+    /// mistake rather than a guest one.
+    #[must_use]
+    pub fn new(min_pages: u32, max_pages: Option<u32>, reserved_pages: u32) -> Self {
+        assert!(
+            reserved_pages >= min_pages,
+            "the reservation must cover the memory the module declares"
+        );
+        let mut cells = Vec::with_capacity(reserved_pages as usize * PAGE_SIZE);
+        cells.resize_with(reserved_pages as usize * PAGE_SIZE, || {
+            std::sync::atomic::AtomicU8::new(0)
+        });
+        Self {
+            cells: std::sync::Arc::new(cells),
+            pages: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(min_pages)),
+            max_pages,
+            atomics: std::sync::Arc::default(),
+            waiters: std::sync::Arc::default(),
+            watch: std::sync::Arc::default(),
+        }
+    }
+
+    /// How many pages were reserved, which is the ceiling `grow` can reach.
+    #[must_use]
+    pub fn reserved_pages(&self) -> u32 {
+        (self.cells.len() / PAGE_SIZE) as u32
+    }
+
+    /// `memory.size`.
+    #[must_use]
+    pub fn size(&self) -> i32 {
+        self.pages.load(std::sync::atomic::Ordering::Acquire) as i32
+    }
+
+    /// `memory.grow`, within the reservation.
+    pub fn grow(&mut self, delta_pages: u32) -> i32 {
+        let old = self.pages.load(std::sync::atomic::Ordering::Acquire);
+        let new = u64::from(old) + u64::from(delta_pages);
+        if new > u64::from(self.max_pages.unwrap_or(65536))
+            || new > u64::from(self.reserved_pages())
+        {
+            return -1;
+        }
+        self.pages
+            .store(new as u32, std::sync::atomic::Ordering::Release);
+        old as i32
+    }
+
+    /// The committed bytes, copied out. For comparing one run against another.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<u8> {
+        (0..self.byte_len()).map(|at| self.byte_at(at)).collect()
+    }
+
+    fn range(&self, addr: i32, offset: u64, size: u64) -> usize {
+        let end = u64::from(addr as u32) + offset + size;
+        if end > self.byte_len() as u64 {
+            trap("out of bounds memory access");
+        }
+        (u64::from(addr as u32) + offset) as usize
+    }
+
+    fn get(&self, at: usize) -> u8 {
+        self.cells[at].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set(&self, at: usize, value: u8) {
+        self.cells[at].store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn read<const N: usize>(&self, addr: i32, offset: u64) -> [u8; N] {
+        let at = self.range(addr, offset, N as u64);
+        let mut bytes = [0u8; N];
+        for (step, byte) in bytes.iter_mut().enumerate() {
+            *byte = self.get(at + step);
+        }
+        bytes
+    }
+
+    fn write_bytes<const N: usize>(&self, addr: i32, offset: u64, bytes: [u8; N]) {
+        let at = self.range(addr, offset, N as u64);
+        for (step, byte) in bytes.iter().enumerate() {
+            self.set(at + step, *byte);
+        }
+    }
+
+    /// `i32.load8_u`
+    pub fn load8_u(&self, addr: i32, offset: u64) -> i32 {
+        i32::from(self.read::<1>(addr, offset)[0])
+    }
+    /// `i32.load8_s`
+    pub fn load8_s(&self, addr: i32, offset: u64) -> i32 {
+        i32::from(self.read::<1>(addr, offset)[0] as i8)
+    }
+    /// `i32.load16_u`
+    pub fn load16_u(&self, addr: i32, offset: u64) -> i32 {
+        i32::from(u16::from_le_bytes(self.read(addr, offset)))
+    }
+    /// `i32.load16_s`
+    pub fn load16_s(&self, addr: i32, offset: u64) -> i32 {
+        i32::from(i16::from_le_bytes(self.read(addr, offset)))
+    }
+    /// `i32.load`
+    pub fn load32(&self, addr: i32, offset: u64) -> i32 {
+        i32::from_le_bytes(self.read(addr, offset))
+    }
+    /// `i64.load`
+    pub fn load64(&self, addr: i32, offset: u64) -> i64 {
+        i64::from_le_bytes(self.read(addr, offset))
+    }
+    /// `f32.load`
+    pub fn load_f32(&self, addr: i32, offset: u64) -> f32 {
+        f32::from_le_bytes(self.read(addr, offset))
+    }
+    /// `f64.load`
+    pub fn load_f64(&self, addr: i32, offset: u64) -> f64 {
+        f64::from_le_bytes(self.read(addr, offset))
+    }
+    /// `i64.load8_s`
+    pub fn load8_s_i64(&self, addr: i32, offset: u64) -> i64 {
+        i64::from(self.read::<1>(addr, offset)[0] as i8)
+    }
+    /// `i64.load8_u`
+    pub fn load8_u_i64(&self, addr: i32, offset: u64) -> i64 {
+        i64::from(self.read::<1>(addr, offset)[0])
+    }
+    /// `i64.load16_s`
+    pub fn load16_s_i64(&self, addr: i32, offset: u64) -> i64 {
+        i64::from(i16::from_le_bytes(self.read(addr, offset)))
+    }
+    /// `i64.load16_u`
+    pub fn load16_u_i64(&self, addr: i32, offset: u64) -> i64 {
+        i64::from(u16::from_le_bytes(self.read(addr, offset)))
+    }
+    /// `i64.load32_s`
+    pub fn load32_s_i64(&self, addr: i32, offset: u64) -> i64 {
+        i64::from(i32::from_le_bytes(self.read(addr, offset)))
+    }
+    /// `i64.load32_u`
+    pub fn load32_u_i64(&self, addr: i32, offset: u64) -> i64 {
+        i64::from(u32::from_le_bytes(self.read(addr, offset)))
+    }
+
+    /// `i32.store8` / `i64.store8`
+    pub fn store8(&mut self, addr: i32, offset: u64, value: i64) {
+        self.write_bytes(addr, offset, [value as u8]);
+    }
+    /// `i32.store16` / `i64.store16`
+    pub fn store16(&mut self, addr: i32, offset: u64, value: i64) {
+        self.write_bytes(addr, offset, (value as u16).to_le_bytes());
+    }
+    /// `i32.store` / `i64.store32`
+    pub fn store32(&mut self, addr: i32, offset: u64, value: i64) {
+        self.write_bytes(addr, offset, (value as u32).to_le_bytes());
+    }
+    /// `i64.store`
+    pub fn store64(&mut self, addr: i32, offset: u64, value: i64) {
+        self.write_bytes(addr, offset, value.to_le_bytes());
+    }
+    /// `f32.store`
+    pub fn store_f32(&mut self, addr: i32, offset: u64, value: f32) {
+        self.write_bytes(addr, offset, value.to_le_bytes());
+    }
+    /// `f64.store`
+    pub fn store_f64(&mut self, addr: i32, offset: u64, value: f64) {
+        self.write_bytes(addr, offset, value.to_le_bytes());
+    }
+
+    /// `memory.fill`
+    pub fn fill(&mut self, addr: i32, value: i32, len: i32) {
+        let at = self.range(addr, 0, u64::from(len as u32));
+        for step in 0..len as u32 as usize {
+            self.set(at + step, value as u8);
+        }
+    }
+
+    /// `memory.copy`, which moves as `memmove` does.
+    pub fn copy(&mut self, dst: i32, src: i32, len: i32) {
+        let len = len as u32 as usize;
+        let to = self.range(dst, 0, len as u64);
+        let from = self.range(src, 0, len as u64);
+        // Through a buffer: the ranges may overlap, and another thread reading
+        // the middle of a byte-by-byte move would see it half done either way.
+        let moving: Vec<u8> = (0..len).map(|step| self.get(from + step)).collect();
+        for (step, byte) in moving.iter().enumerate() {
+            self.set(to + step, *byte);
+        }
+    }
+
+    /// `memory.init`
+    pub fn init(&mut self, dst: i32, segment: &[u8], src: i32, len: i32) {
+        let len = len as u32 as usize;
+        let src = src as u32 as usize;
+        if src + len > segment.len() {
+            trap("out of bounds memory access");
+        }
+        let to = self.range(dst, 0, len as u64);
+        for (step, byte) in segment[src..src + len].iter().enumerate() {
+            self.set(to + step, *byte);
+        }
+    }
+
+    fn atomic_at(&self, addr: i32, offset: u64, bytes: u32) -> usize {
+        let at = self.range(addr, offset, u64::from(bytes));
+        if !at.is_multiple_of(bytes as usize) {
+            trap("unaligned atomic operation");
+        }
+        at
+    }
+
+    /// Reads `bytes` bytes as one atomic access.
+    pub fn atomic_load(&self, addr: i32, offset: u64, bytes: u32) -> i64 {
+        let at = self.atomic_at(addr, offset, bytes);
+        let _held = self.atomics.lock();
+        let mut value = 0u64;
+        for step in 0..bytes as usize {
+            value |= u64::from(self.get(at + step)) << (8 * step);
+        }
+        value as i64
+    }
+
+    /// Writes the low `bytes` bytes as one atomic access.
+    pub fn atomic_store(&mut self, addr: i32, offset: u64, bytes: u32, value: i64) {
+        let at = self.atomic_at(addr, offset, bytes);
+        let _held = self.atomics.lock();
+        let value = value as u64;
+        for step in 0..bytes as usize {
+            self.set(at + step, (value >> (8 * step)) as u8);
+        }
+    }
+
+    /// A read-modify-write, atomic against every other thread.
+    pub fn atomic_rmw(&mut self, addr: i32, offset: u64, bytes: u32, op: Rmw, value: i64) -> i64 {
+        let at = self.atomic_at(addr, offset, bytes);
+        let _held = self.atomics.lock();
+        let mut old = 0u64;
+        for step in 0..bytes as usize {
+            old |= u64::from(self.get(at + step)) << (8 * step);
+        }
+        let value_u = value as u64;
+        let result = match op {
+            Rmw::Add => old.wrapping_add(value_u),
+            Rmw::Sub => old.wrapping_sub(value_u),
+            Rmw::And => old & value_u,
+            Rmw::Or => old | value_u,
+            Rmw::Xor => old ^ value_u,
+            Rmw::Xchg => value_u,
+        };
+        for step in 0..bytes as usize {
+            self.set(at + step, (result >> (8 * step)) as u8);
+        }
+        old as i64
+    }
+
+    /// Compare-and-exchange, atomic against every other thread.
+    pub fn atomic_cmpxchg(
+        &mut self,
+        addr: i32,
+        offset: u64,
+        bytes: u32,
+        expected: i64,
+        replacement: i64,
+    ) -> i64 {
+        let at = self.atomic_at(addr, offset, bytes);
+        let _held = self.atomics.lock();
+        let mut old = 0u64;
+        for step in 0..bytes as usize {
+            old |= u64::from(self.get(at + step)) << (8 * step);
+        }
+        let mask = if bytes >= 8 {
+            u64::MAX
+        } else {
+            (1u64 << (8 * bytes)) - 1
+        };
+        if old == expected as u64 & mask {
+            let replacement = replacement as u64;
+            for step in 0..bytes as usize {
+                self.set(at + step, (replacement >> (8 * step)) as u8);
+            }
+        }
+        old as i64
+    }
+
+    /// `memory.atomic.notify`: wakes up to `count` threads parked here.
+    ///
+    /// Returns how many were parked, which with real threads is a real number
+    /// rather than the zero a single-threaded model has to report.
+    pub fn atomic_notify_count(&self, addr: i32, offset: u64, count: i32) -> i32 {
+        let at = self.atomic_at(addr, offset, 4);
+        let mut parked = self
+            .waiters
+            .parked
+            .lock()
+            .unwrap_or_else(|held| held.into_inner());
+        let woken = match parked.get_mut(&at) {
+            Some((generation, waiting)) => {
+                *generation += 1;
+                let woken = (*waiting).min(count.max(0) as usize);
+                woken as i32
+            }
+            None => 0,
+        };
+        drop(parked);
+        self.waiters.wake.notify_all();
+        woken
+    }
+
+    /// `memory.atomic.notify` with no count, which wakes everybody.
+    pub fn atomic_notify(&self, addr: i32, offset: u64) -> i32 {
+        self.atomic_notify_count(addr, offset, i32::MAX)
+    }
+
+    /// `memory.atomic.wait32` / `wait64`, for real.
+    ///
+    /// Returns 0 if it was woken, 1 if the value had already changed, and 2 on
+    /// timeout. The value is compared while holding the parking lock, so a
+    /// notify that lands between the comparison and the parking cannot be lost.
+    pub fn atomic_wait(
+        &self,
+        addr: i32,
+        offset: u64,
+        bytes: u32,
+        expected: i64,
+        timeout: i64,
+    ) -> i32 {
+        let at = self.atomic_at(addr, offset, bytes);
+        let mut parked = self
+            .waiters
+            .parked
+            .lock()
+            .unwrap_or_else(|held| held.into_inner());
+        if self.atomic_load(addr, offset, bytes) != expected {
+            return 1;
+        }
+        if timeout == 0 {
+            return 2;
+        }
+        let generation = {
+            let entry = parked.entry(at).or_insert((0, 0));
+            entry.1 += 1;
+            entry.0
+        };
+        let deadline = if timeout < 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_nanos(timeout as u64))
+        };
+        let mut answer = 0;
+        loop {
+            let woken = parked
+                .get(&at)
+                .is_some_and(|(current, _)| *current != generation);
+            if woken {
+                break;
+            }
+            match deadline {
+                None => {
+                    parked = self
+                        .waiters
+                        .wake
+                        .wait(parked)
+                        .unwrap_or_else(|held| held.into_inner());
+                }
+                Some(deadline) => {
+                    let (next, timed_out) = self
+                        .waiters
+                        .wake
+                        .wait_timeout(parked, deadline)
+                        .unwrap_or_else(|held| held.into_inner());
+                    parked = next;
+                    if timed_out.timed_out() {
+                        answer = 2;
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(entry) = parked.get_mut(&at) {
+            entry.1 = entry.1.saturating_sub(1);
+        }
+        answer
+    }
+
+    /// Watches `bytes` bytes from `address`, in every thread.
+    pub fn watch(&mut self, address: i32, bytes: i32) {
+        let from = address as u32;
+        self.watchpoints()
+            .ranges
+            .push((from, from.wrapping_add(bytes as u32)));
+    }
+
+    /// Panic at the first watched write rather than recording it.
+    pub fn stop_on_hit(&mut self, stop: bool) {
+        self.watchpoints().stop = stop;
+    }
+
+    /// The writes to watched addresses so far, from every thread.
+    #[must_use]
+    pub fn hits(&self) -> Vec<Hit> {
+        self.watch
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .hits
+            .clone()
+    }
+
+    fn watchpoints(&self) -> std::sync::MutexGuard<'_, Watchpoints> {
+        self.watch.lock().unwrap_or_else(|held| held.into_inner())
+    }
+
+    /// Records a write that has already happened, if anyone is watching it.
+    fn note(&self, site: u32, addr: i32, offset: u64, bytes: u64, kind: WriteKind) {
+        let mut watch = self.watchpoints();
+        if watch.ranges.is_empty() {
+            return;
+        }
+        let start = u64::from(addr as u32) + offset;
+        let end = start + bytes;
+        let watched = watch
+            .ranges
+            .iter()
+            .any(|(from, to)| start < u64::from(*to) && end > u64::from(*from));
+        if !watched {
+            return;
+        }
+        watch.hits.push(Hit {
+            site,
+            address: start as u32 as i32,
+            bytes: bytes as u32,
+            kind,
+        });
+        let stop = watch.stop;
+        drop(watch);
+        if stop {
+            panic!(
+                "watchpoint: function #{site} wrote {bytes} bytes at {start:#x} ({kind:?}) \
+                 on thread {:?}",
+                std::thread::current().id()
+            );
+        }
+    }
+
+    /// `i32.store8` / `i64.store8`, reporting to any watchpoint.
+    pub fn store8_at(&mut self, site: u32, addr: i32, offset: u64, value: i64) {
+        self.store8(addr, offset, value);
+        self.note(site, addr, offset, 1, WriteKind::Store);
+    }
+    /// `i32.store16` / `i64.store16`, reporting to any watchpoint.
+    pub fn store16_at(&mut self, site: u32, addr: i32, offset: u64, value: i64) {
+        self.store16(addr, offset, value);
+        self.note(site, addr, offset, 2, WriteKind::Store);
+    }
+    /// `i32.store` / `i64.store32`, reporting to any watchpoint.
+    pub fn store32_at(&mut self, site: u32, addr: i32, offset: u64, value: i64) {
+        self.store32(addr, offset, value);
+        self.note(site, addr, offset, 4, WriteKind::Store);
+    }
+    /// `i64.store`, reporting to any watchpoint.
+    pub fn store64_at(&mut self, site: u32, addr: i32, offset: u64, value: i64) {
+        self.store64(addr, offset, value);
+        self.note(site, addr, offset, 8, WriteKind::Store);
+    }
+    /// `f32.store`, reporting to any watchpoint.
+    pub fn store_f32_at(&mut self, site: u32, addr: i32, offset: u64, value: f32) {
+        self.store_f32(addr, offset, value);
+        self.note(site, addr, offset, 4, WriteKind::Store);
+    }
+    /// `f64.store`, reporting to any watchpoint.
+    pub fn store_f64_at(&mut self, site: u32, addr: i32, offset: u64, value: f64) {
+        self.store_f64(addr, offset, value);
+        self.note(site, addr, offset, 8, WriteKind::Store);
+    }
+    /// `memory.fill`, reporting to any watchpoint.
+    pub fn fill_at(&mut self, site: u32, addr: i32, value: i32, len: i32) {
+        self.fill(addr, value, len);
+        self.note(site, addr, 0, u64::from(len as u32), WriteKind::Fill);
+    }
+    /// `memory.copy`, reporting to any watchpoint on the destination.
+    pub fn copy_at(&mut self, site: u32, dst: i32, src: i32, len: i32) {
+        self.copy(dst, src, len);
+        self.note(site, dst, 0, u64::from(len as u32), WriteKind::Copy);
+    }
+    /// `memory.init`, reporting to any watchpoint on the destination.
+    pub fn init_at(&mut self, site: u32, dst: i32, segment: &[u8], src: i32, len: i32) {
+        self.init(dst, segment, src, len);
+        self.note(site, dst, 0, u64::from(len as u32), WriteKind::Init);
+    }
+    /// An atomic store, reporting to any watchpoint.
+    pub fn atomic_store_at(&mut self, site: u32, addr: i32, offset: u64, bytes: u32, value: i64) {
+        self.atomic_store(addr, offset, bytes, value);
+        self.note(site, addr, offset, u64::from(bytes), WriteKind::Atomic);
+    }
+    /// An atomic read-modify-write, reporting to any watchpoint.
+    pub fn atomic_rmw_at(
+        &mut self,
+        site: u32,
+        addr: i32,
+        offset: u64,
+        bytes: u32,
+        op: Rmw,
+        value: i64,
+    ) -> i64 {
+        let old = self.atomic_rmw(addr, offset, bytes, op, value);
+        self.note(site, addr, offset, u64::from(bytes), WriteKind::Atomic);
+        old
+    }
+    /// An atomic compare-and-exchange, reporting to any watchpoint.
+    pub fn atomic_cmpxchg_at(
+        &mut self,
+        site: u32,
+        addr: i32,
+        offset: u64,
+        bytes: u32,
+        expected: i64,
+        replacement: i64,
+    ) -> i64 {
+        let old = self.atomic_cmpxchg(addr, offset, bytes, expected, replacement);
+        self.note(site, addr, offset, u64::from(bytes), WriteKind::Atomic);
+        old
+    }
+}
+
+impl Access for SharedMemory {
+    fn byte_at(&self, at: usize) -> u8 {
+        if at >= self.byte_len() {
+            trap("out of bounds memory access");
+        }
+        self.get(at)
+    }
+    fn set_byte_at(&mut self, at: usize, value: u8) {
+        if at >= self.byte_len() {
+            trap("out of bounds memory access");
+        }
+        self.set(at, value);
+    }
+    fn byte_len(&self) -> usize {
+        self.pages.load(std::sync::atomic::Ordering::Acquire) as usize * PAGE_SIZE
+    }
+}
+
+impl PartialEq for SharedMemory {
+    fn eq(&self, other: &Self) -> bool {
+        self.snapshot() == other.snapshot()
+    }
+}
+
 /// An exception thrown by the guest, on its way out through Rust's unwinder.
 ///
 /// Emscripten compiles a C++ `throw` into a call to the imported
@@ -548,6 +1149,40 @@ pub fn throw(exception: i32, info: i32) -> ! {
     std::panic::panic_any(GuestException { exception, info });
 }
 
+/// The byte-addressable part of a memory, so a host can read one without
+/// caring whether the module declared it shared.
+///
+/// Both memories implement it, and [`Caller`] is generic over it. A host
+/// written against `Caller` therefore compiles unchanged for a threaded module
+/// — which matters, because whether a memory is shared is the module's choice
+/// and not the host author's.
+pub trait Access {
+    /// The byte at `at`. Traps if it is outside the memory.
+    fn byte_at(&self, at: usize) -> u8;
+    /// Writes the byte at `at`. Traps if it is outside the memory.
+    fn set_byte_at(&mut self, at: usize, value: u8);
+    /// How many bytes there are.
+    fn byte_len(&self) -> usize;
+}
+
+impl Access for Memory {
+    fn byte_at(&self, at: usize) -> u8 {
+        match self.data.get(at) {
+            Some(byte) => *byte,
+            None => trap("out of bounds memory access"),
+        }
+    }
+    fn set_byte_at(&mut self, at: usize, value: u8) {
+        match self.data.get_mut(at) {
+            Some(byte) => *byte = value,
+            None => trap("out of bounds memory access"),
+        }
+    }
+    fn byte_len(&self) -> usize {
+        self.data.len()
+    }
+}
+
 /// What an import is given besides its arguments.
 ///
 /// A wasm import receives numbers, and almost every interesting one is a
@@ -560,26 +1195,32 @@ pub fn throw(exception: i32, info: i32) -> ! {
 /// and adding a field costs nothing, while adding a parameter changes every
 /// host ever written.
 #[derive(Debug)]
-pub struct Caller<'a> {
-    /// The instance's linear memory.
-    pub memory: &'a mut Memory,
+pub struct Caller<'a, M: Access = Memory> {
+    /// The instance's linear memory. `Memory` unless the module declared a
+    /// shared one, in which case [`SharedMemory`].
+    pub memory: &'a mut M,
 }
 
-impl Caller<'_> {
+impl<M: Access> Caller<'_, M> {
     /// The `len` bytes at `addr`.
+    ///
+    /// A copy rather than a slice: a shared memory is not a `&[u8]` anybody
+    /// can borrow, since another thread may be writing it.
     ///
     /// # Panics
     ///
     /// Traps if the range leaves the memory, exactly as a guest load would:
     /// a host reading past the end is the same mistake with the same answer.
     #[must_use]
-    pub fn bytes(&self, addr: i32, len: i32) -> &[u8] {
+    pub fn bytes(&self, addr: i32, len: i32) -> Vec<u8> {
         let start = u64::from(addr as u32);
         let end = start + u64::from(len as u32);
-        if end > self.memory.data.len() as u64 {
+        if end > self.memory.byte_len() as u64 {
             trap("out of bounds memory access");
         }
-        &self.memory.data[start as usize..end as usize]
+        (start..end)
+            .map(|at| self.memory.byte_at(at as usize))
+            .collect()
     }
 
     /// Writes `bytes` at `addr`.
@@ -590,10 +1231,12 @@ impl Caller<'_> {
     pub fn write(&mut self, addr: i32, bytes: &[u8]) {
         let start = u64::from(addr as u32);
         let end = start + bytes.len() as u64;
-        if end > self.memory.data.len() as u64 {
+        if end > self.memory.byte_len() as u64 {
             trap("out of bounds memory access");
         }
-        self.memory.data[start as usize..end as usize].copy_from_slice(bytes);
+        for (step, byte) in bytes.iter().enumerate() {
+            self.memory.set_byte_at(start as usize + step, *byte);
+        }
     }
 
     /// The NUL-terminated string at `addr`, without its terminator.
@@ -603,15 +1246,37 @@ impl Caller<'_> {
     /// Traps if there is no NUL before the end of memory. Returning what was
     /// found instead would hand the host a string the guest never wrote.
     #[must_use]
-    pub fn cstring(&self, addr: i32) -> &[u8] {
+    pub fn cstring(&self, addr: i32) -> Vec<u8> {
         let start = u64::from(addr as u32) as usize;
-        if start > self.memory.data.len() {
+        if start > self.memory.byte_len() {
             trap("out of bounds memory access");
         }
-        match self.memory.data[start..].iter().position(|byte| *byte == 0) {
-            Some(length) => &self.memory.data[start..start + length],
-            None => trap("unterminated string"),
+        let mut text = Vec::new();
+        for at in start..self.memory.byte_len() {
+            let byte = self.memory.byte_at(at);
+            if byte == 0 {
+                return text;
+            }
+            text.push(byte);
         }
+        trap("unterminated string")
+    }
+
+    /// The four bytes at `addr`, as the little-endian i32 the guest wrote.
+    #[must_use]
+    pub fn read_i32(&self, addr: i32) -> i32 {
+        let bytes = self.bytes(addr, 4);
+        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    /// Writes an i32 at `addr`.
+    pub fn write_i32(&mut self, addr: i32, value: i32) {
+        self.write(addr, &value.to_le_bytes());
+    }
+
+    /// Writes an i64 at `addr`.
+    pub fn write_i64(&mut self, addr: i32, value: i64) {
+        self.write(addr, &value.to_le_bytes());
     }
 }
 
@@ -887,6 +1552,240 @@ mod tests {
             memory: &mut memory,
         };
         let _ = caller.cstring(0);
+    }
+
+    // ---- a memory several threads share ----
+
+    #[test]
+    fn a_shared_memory_starts_at_its_declared_size_inside_its_reservation() {
+        let memory = SharedMemory::new(2, Some(8), 4);
+        assert_eq!(memory.size(), 2);
+        assert_eq!(memory.reserved_pages(), 4);
+        assert_eq!(memory.snapshot().len(), 2 * PAGE_SIZE);
+        assert!(memory.snapshot().iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    #[should_panic(expected = "the reservation must cover")]
+    fn reserving_less_than_the_module_asks_for_is_a_host_mistake() {
+        let _ = SharedMemory::new(4, None, 2);
+    }
+
+    #[test]
+    fn growing_publishes_reserved_pages_and_stops_at_the_reservation() {
+        let mut memory = SharedMemory::new(1, Some(8), 3);
+        assert_eq!(memory.grow(1), 1);
+        assert_eq!(memory.size(), 2);
+        // Past the reservation is a refusal, not a reallocation: another
+        // thread is holding this memory and it cannot move.
+        assert_eq!(memory.grow(2), -1);
+        assert_eq!(memory.size(), 2);
+        // And past the declared maximum, even inside the reservation.
+        let mut small = SharedMemory::new(1, Some(2), 8);
+        assert_eq!(small.grow(1), 1);
+        assert_eq!(small.grow(1), -1);
+    }
+
+    #[test]
+    fn a_shared_memory_reads_and_writes_what_a_plain_one_does() {
+        let mut memory = SharedMemory::new(1, None, 1);
+        memory.store8(0, 0, 0xFF);
+        memory.store16(0, 8, 0xBEEF);
+        memory.store32(0, 16, 0x1234_5678);
+        memory.store64(0, 24, 0x0102_0304_0506_0708);
+        memory.store_f32(0, 40, 1.5);
+        memory.store_f64(0, 48, -2.25);
+        assert_eq!(memory.load8_u(0, 0), 255);
+        assert_eq!(memory.load8_s(0, 0), -1);
+        assert_eq!(memory.load16_u(0, 8), 0xBEEF);
+        assert_eq!(memory.load16_s(0, 8), 0xBEEF_u16 as i16 as i32);
+        assert_eq!(memory.load32(0, 16), 0x1234_5678);
+        assert_eq!(memory.load64(0, 24), 0x0102_0304_0506_0708);
+        assert_eq!(memory.load_f32(0, 40), 1.5);
+        assert_eq!(memory.load_f64(0, 48), -2.25);
+        assert_eq!(memory.load8_s_i64(0, 0), -1);
+        assert_eq!(memory.load8_u_i64(0, 0), 255);
+        assert_eq!(memory.load16_s_i64(0, 8), 0xBEEF_u16 as i16 as i64);
+        assert_eq!(memory.load16_u_i64(0, 8), 0xBEEF);
+        assert_eq!(memory.load32_s_i64(0, 16), 0x1234_5678);
+        assert_eq!(memory.load32_u_i64(0, 16), 0x1234_5678);
+
+        memory.fill(64, 7, 4);
+        memory.copy(72, 64, 4);
+        memory.init(80, b"abcd", 1, 2);
+        assert_eq!(memory.load32(64, 0), 0x0707_0707);
+        assert_eq!(memory.load32(72, 0), 0x0707_0707);
+        assert_eq!(
+            memory.load16_u(80, 0),
+            u32::from(u16::from_le_bytes(*b"bc")) as i32
+        );
+    }
+
+    #[test]
+    fn a_shared_copy_that_overlaps_moves_the_bytes_it_started_with() {
+        let mut memory = SharedMemory::new(1, None, 1);
+        memory.init(0, b"12345678", 0, 8);
+        memory.copy(2, 0, 6);
+        assert_eq!(&memory.snapshot()[0..8], b"12123456");
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds memory access")]
+    fn a_shared_access_past_the_committed_size_traps_even_inside_the_reservation() {
+        // The reservation is not the memory: bytes beyond `memory.size()` are
+        // not addressable, and a host that could reach them would be reading
+        // pages the module never grew into.
+        let memory = SharedMemory::new(1, None, 4);
+        let _ = memory.load32(PAGE_SIZE as i32, 0);
+    }
+
+    #[test]
+    fn two_threads_see_each_other_writes() {
+        let memory = SharedMemory::new(1, None, 1);
+        let mut writer = memory.clone();
+        let handle = std::thread::spawn(move || {
+            writer.store32(64, 0, 0x2A);
+            writer.atomic_notify(64, 0)
+        });
+        handle.join().expect("the writer finishes");
+        assert_eq!(memory.load32(64, 0), 0x2A, "one memory, two handles");
+    }
+
+    #[test]
+    fn an_atomic_read_modify_write_from_two_threads_loses_nothing() {
+        // Byte-wise atomics cannot make a four-byte add atomic on their own,
+        // which is what the lock inside `atomic_rmw` is for. Without it this
+        // test loses increments.
+        let memory = SharedMemory::new(1, None, 1);
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let mut counter = memory.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..500 {
+                        counter.atomic_rmw(0, 0, 4, Rmw::Add, 1);
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("each thread finishes");
+        }
+        assert_eq!(memory.atomic_load(0, 0, 4), 2000);
+    }
+
+    #[test]
+    fn waiting_is_woken_by_a_notify_from_another_thread() {
+        let memory = SharedMemory::new(1, None, 1);
+        let waiting = memory.clone();
+        let waiter = std::thread::spawn(move || waiting.atomic_wait(0, 0, 4, 0, -1));
+        // Wake it until it is actually parked: a notify that arrives before
+        // the wait is not lost — the value is compared under the parking lock —
+        // but it is not a wake-up either.
+        let mut woken = 0;
+        while woken == 0 {
+            std::thread::yield_now();
+            woken = memory.atomic_notify(0, 0);
+        }
+        assert_eq!(waiter.join().expect("the waiter returns"), 0);
+    }
+
+    #[test]
+    fn waiting_for_a_value_that_already_changed_returns_immediately() {
+        let mut memory = SharedMemory::new(1, None, 1);
+        memory.atomic_store(0, 0, 4, 7);
+        assert_eq!(memory.atomic_wait(0, 0, 4, 0, -1), 1);
+        // A zero timeout expires immediately whoever else is running.
+        assert_eq!(memory.atomic_wait(0, 0, 4, 7, 0), 2);
+        // And a real timeout expires when nobody notifies.
+        assert_eq!(memory.atomic_wait(0, 0, 4, 7, 1_000_000), 2);
+    }
+
+    #[test]
+    fn notifying_an_address_nobody_waits_on_wakes_nothing() {
+        let memory = SharedMemory::new(1, None, 1);
+        assert_eq!(memory.atomic_notify(0, 0), 0);
+        assert_eq!(memory.atomic_notify_count(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn a_shared_atomic_access_that_is_not_aligned_traps() {
+        let memory = SharedMemory::new(1, None, 1);
+        let unaligned = std::panic::catch_unwind(|| memory.atomic_load(1, 0, 4));
+        assert!(unaligned.is_err());
+    }
+
+    #[test]
+    fn a_shared_cmpxchg_exchanges_only_on_a_match() {
+        let mut memory = SharedMemory::new(1, None, 1);
+        memory.atomic_store(0, 0, 4, 5);
+        assert_eq!(memory.atomic_cmpxchg(0, 0, 4, 4, 9), 5);
+        assert_eq!(memory.atomic_load(0, 0, 4), 5, "no match, no write");
+        assert_eq!(memory.atomic_cmpxchg(0, 0, 4, 5, 9), 5);
+        assert_eq!(memory.atomic_load(0, 0, 4), 9);
+        // The comparison is at the access width, so the high bits of what the
+        // module passes do not decide it.
+        memory.atomic_store(0, 0, 1, 3);
+        assert_eq!(memory.atomic_cmpxchg(0, 0, 1, 0x103, 4), 3);
+        assert_eq!(memory.atomic_load(0, 0, 1), 4);
+    }
+
+    #[test]
+    fn a_shared_rmw_covers_every_operation() {
+        let mut memory = SharedMemory::new(1, None, 1);
+        memory.atomic_store(0, 0, 4, 0b1100);
+        assert_eq!(memory.atomic_rmw(0, 0, 4, Rmw::Or, 0b0011), 0b1100);
+        assert_eq!(memory.atomic_rmw(0, 0, 4, Rmw::And, 0b1010), 0b1111);
+        assert_eq!(memory.atomic_rmw(0, 0, 4, Rmw::Xor, 0b0110), 0b1010);
+        assert_eq!(memory.atomic_rmw(0, 0, 4, Rmw::Sub, 1), 0b1100);
+        assert_eq!(memory.atomic_rmw(0, 0, 4, Rmw::Xchg, 42), 0b1011);
+        assert_eq!(memory.atomic_load(0, 0, 4), 42);
+    }
+
+    #[test]
+    fn a_watchpoint_on_a_shared_memory_collects_from_every_thread() {
+        let mut memory = SharedMemory::new(1, None, 1);
+        memory.watch(256, 4);
+        memory.store32_at(1, 256, 0, 1);
+        memory.store8_at(2, 256, 0, 1);
+        memory.store16_at(3, 256, 0, 1);
+        memory.store64_at(4, 256, 0, 1);
+        memory.store_f32_at(5, 256, 0, 1.0);
+        memory.store_f64_at(6, 256, 0, 1.0);
+        memory.fill_at(7, 256, 0, 4);
+        memory.copy_at(8, 256, 0, 4);
+        memory.init_at(9, 256, b"abcd", 0, 4);
+        memory.atomic_store_at(10, 256, 0, 4, 1);
+        memory.atomic_rmw_at(11, 256, 0, 4, Rmw::Add, 1);
+        memory.atomic_cmpxchg_at(12, 256, 0, 4, 0, 1);
+        memory.store32_at(13, 1024, 0, 1);
+
+        let mut other = memory.clone();
+        std::thread::spawn(move || other.store32_at(99, 256, 0, 5))
+            .join()
+            .expect("the other thread finishes");
+
+        let sites: Vec<u32> = memory.hits().iter().map(|hit| hit.site).collect();
+        assert_eq!(sites, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 99]);
+    }
+
+    #[test]
+    #[should_panic(expected = "watchpoint: function #3 wrote 4 bytes at 0x100")]
+    fn stopping_on_a_shared_hit_names_the_thread() {
+        let mut memory = SharedMemory::new(1, None, 1);
+        memory.watch(0x100, 4);
+        memory.stop_on_hit(true);
+        memory.store32_at(3, 0x100, 0, 1);
+    }
+
+    #[test]
+    fn two_shared_memories_holding_the_same_bytes_compare_equal() {
+        let mut one = SharedMemory::new(1, None, 1);
+        let mut two = SharedMemory::new(1, None, 2);
+        assert_eq!(one, two, "the reservation is not the memory");
+        one.store32(0, 0, 1);
+        assert_ne!(one, two);
+        two.store32(0, 0, 1);
+        assert_eq!(one, two);
     }
 
     #[test]

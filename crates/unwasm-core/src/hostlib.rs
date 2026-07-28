@@ -201,23 +201,20 @@ impl Wasi {
     }
 
     /// Reads an iovec array: `count` pairs of (address, length).
-    fn iovecs(caller: &rt::Caller<'_>, iovs: i32, count: i32) -> Vec<(i32, i32)> {
+    fn iovecs<M: rt::Access>(caller: &rt::Caller<'_, M>, iovs: i32, count: i32) -> Vec<(i32, i32)> {
         (0..count)
             .map(|at| {
                 let entry = iovs.wrapping_add(at.wrapping_mul(8));
-                (
-                    caller.memory.load32(entry, 0),
-                    caller.memory.load32(entry, 4),
-                )
+                (caller.read_i32(entry), caller.read_i32(entry + 4))
             })
             .collect()
     }
 
     /// `fd_write`: gathers the iovecs and appends them where the descriptor
     /// points.
-    pub fn fd_write(
+    pub fn fd_write<M: rt::Access>(
         &mut self,
-        caller: &mut rt::Caller<'_>,
+        caller: &mut rt::Caller<'_, M>,
         fd: i32,
         iovs: i32,
         count: i32,
@@ -225,7 +222,7 @@ impl Wasi {
     ) -> i32 {
         let mut bytes = Vec::new();
         for (address, length) in Self::iovecs(caller, iovs, count) {
-            bytes.extend_from_slice(caller.bytes(address, length));
+            bytes.extend_from_slice(&caller.bytes(address, length));
         }
         let total = bytes.len() as i64;
         match self.open.get_mut(&fd) {
@@ -255,14 +252,14 @@ impl Wasi {
             }
             None => return errno::BADF,
         }
-        caller.memory.store32(written, 0, total);
+        caller.write_i32(written, total as i32);
         errno::SUCCESS
     }
 
     /// `fd_read`: scatters into the iovecs, stopping at the end of the source.
-    pub fn fd_read(
+    pub fn fd_read<M: rt::Access>(
         &mut self,
-        caller: &mut rt::Caller<'_>,
+        caller: &mut rt::Caller<'_, M>,
         fd: i32,
         iovs: i32,
         count: i32,
@@ -308,15 +305,15 @@ impl Wasi {
         } else {
             self.stdin_position = start + taken;
         }
-        caller.memory.store32(read, 0, taken as i64);
+        caller.write_i32(read, taken as i32);
         errno::SUCCESS
     }
 
     /// `fd_pread`: a read at an explicit offset, which does not move the
     /// position.
-    pub fn fd_pread(
+    pub fn fd_pread<M: rt::Access>(
         &mut self,
-        caller: &mut rt::Caller<'_>,
+        caller: &mut rt::Caller<'_, M>,
         fd: i32,
         iovs: i32,
         count: i32,
@@ -341,9 +338,9 @@ impl Wasi {
     }
 
     /// `fd_seek`. Reports where it landed through `out`.
-    pub fn fd_seek(
+    pub fn fd_seek<M: rt::Access>(
         &mut self,
-        caller: &mut rt::Caller<'_>,
+        caller: &mut rt::Caller<'_, M>,
         fd: i32,
         offset: i64,
         whence: i32,
@@ -374,7 +371,7 @@ impl Wasi {
         if let Some(Descriptor::File(open)) = self.open.get_mut(&fd) {
             open.position = position as u64;
         }
-        caller.memory.store64(out, 0, position);
+        caller.write_i64(out, position);
         errno::SUCCESS
     }
 
@@ -388,26 +385,32 @@ impl Wasi {
     }
 
     /// `environ_sizes_get`: how many entries, and how many bytes they need.
-    pub fn environ_sizes_get(&self, caller: &mut rt::Caller<'_>, count: i32, size: i32) -> i32 {
+    pub fn environ_sizes_get<M: rt::Access>(
+        &self,
+        caller: &mut rt::Caller<'_, M>,
+        count: i32,
+        size: i32,
+    ) -> i32 {
         let bytes: usize = self
             .environment
             .iter()
             .map(|entry| entry.len() + 1)
             .sum::<usize>();
-        caller
-            .memory
-            .store32(count, 0, self.environment.len() as i64);
-        caller.memory.store32(size, 0, bytes as i64);
+        caller.write_i32(count, self.environment.len() as i32);
+        caller.write_i32(size, bytes as i32);
         errno::SUCCESS
     }
 
     /// `environ_get`: the pointers, then the strings they point at.
-    pub fn environ_get(&self, caller: &mut rt::Caller<'_>, pointers: i32, buffer: i32) -> i32 {
+    pub fn environ_get<M: rt::Access>(
+        &self,
+        caller: &mut rt::Caller<'_, M>,
+        pointers: i32,
+        buffer: i32,
+    ) -> i32 {
         let mut at = buffer;
         for (index, entry) in self.environment.iter().enumerate() {
-            caller
-                .memory
-                .store32(pointers + (index as i32) * 4, 0, i64::from(at));
+            caller.write_i32(pointers + (index as i32) * 4, at);
             let mut bytes = entry.clone().into_bytes();
             bytes.push(0);
             caller.write(at, &bytes);
@@ -417,24 +420,32 @@ impl Wasi {
     }
 
     /// `args_sizes_get`.
-    pub fn args_sizes_get(&self, caller: &mut rt::Caller<'_>, count: i32, size: i32) -> i32 {
+    pub fn args_sizes_get<M: rt::Access>(
+        &self,
+        caller: &mut rt::Caller<'_, M>,
+        count: i32,
+        size: i32,
+    ) -> i32 {
         let bytes: usize = self
             .arguments
             .iter()
             .map(|entry| entry.len() + 1)
             .sum::<usize>();
-        caller.memory.store32(count, 0, self.arguments.len() as i64);
-        caller.memory.store32(size, 0, bytes as i64);
+        caller.write_i32(count, self.arguments.len() as i32);
+        caller.write_i32(size, bytes as i32);
         errno::SUCCESS
     }
 
     /// `args_get`.
-    pub fn args_get(&self, caller: &mut rt::Caller<'_>, pointers: i32, buffer: i32) -> i32 {
+    pub fn args_get<M: rt::Access>(
+        &self,
+        caller: &mut rt::Caller<'_, M>,
+        pointers: i32,
+        buffer: i32,
+    ) -> i32 {
         let mut at = buffer;
         for (index, entry) in self.arguments.iter().enumerate() {
-            caller
-                .memory
-                .store32(pointers + (index as i32) * 4, 0, i64::from(at));
+            caller.write_i32(pointers + (index as i32) * 4, at);
             let mut bytes = entry.clone().into_bytes();
             bytes.push(0);
             caller.write(at, &bytes);
@@ -444,7 +455,12 @@ impl Wasi {
     }
 
     /// `random_get`, from the seeded generator described at the top.
-    pub fn random_get(&mut self, caller: &mut rt::Caller<'_>, buffer: i32, length: i32) -> i32 {
+    pub fn random_get<M: rt::Access>(
+        &mut self,
+        caller: &mut rt::Caller<'_, M>,
+        buffer: i32,
+        length: i32,
+    ) -> i32 {
         let length = length as u32 as usize;
         let mut bytes = Vec::with_capacity(length);
         while bytes.len() < length {
@@ -456,10 +472,10 @@ impl Wasi {
     }
 
     /// `clock_time_get`, in nanoseconds, from [`Self::now_milliseconds`].
-    pub fn clock_time_get(&self, caller: &mut rt::Caller<'_>, out: i32) -> i32 {
+    pub fn clock_time_get<M: rt::Access>(&self, caller: &mut rt::Caller<'_, M>, out: i32) -> i32 {
         #[allow(clippy::cast_possible_truncation)]
         let nanoseconds = (self.now_milliseconds * 1_000_000.0) as i64;
-        caller.memory.store64(out, 0, nanoseconds);
+        caller.write_i64(out, nanoseconds);
         errno::SUCCESS
     }
 
@@ -496,16 +512,21 @@ impl Wasi {
     /// The directory descriptor is ignored: every path in this filesystem is
     /// absolute, and resolving a relative one against a directory that does
     /// not exist would be inventing a tree.
-    pub fn openat_at(&mut self, caller: &rt::Caller<'_>, path: i32, flags: i32) -> i32 {
-        let path = String::from_utf8_lossy(caller.cstring(path)).into_owned();
+    pub fn openat_at<M: rt::Access>(
+        &mut self,
+        caller: &rt::Caller<'_, M>,
+        path: i32,
+        flags: i32,
+    ) -> i32 {
+        let path = String::from_utf8_lossy(&caller.cstring(path)).into_owned();
         // musl's values, which is what an Emscripten module was built against:
         // O_CREAT is 0o100 and O_APPEND 0o2000.
         self.openat(&path, flags & 0o100 != 0, flags & 0o2000 != 0)
     }
 
     /// `__syscall_unlinkat`. Returns 0, or the negative errno a syscall does.
-    pub fn unlinkat(&mut self, caller: &rt::Caller<'_>, path: i32) -> i32 {
-        let path = String::from_utf8_lossy(caller.cstring(path)).into_owned();
+    pub fn unlinkat<M: rt::Access>(&mut self, caller: &rt::Caller<'_, M>, path: i32) -> i32 {
+        let path = String::from_utf8_lossy(&caller.cstring(path)).into_owned();
         if self.files.remove(&path).is_some() {
             0
         } else {
@@ -610,14 +631,14 @@ impl Cxx {
 ///
 /// Always. A failed assertion in the guest is not something a host can carry
 /// on from, and the four strings are exactly what makes it diagnosable.
-pub fn assert_fail(
-    caller: &rt::Caller<'_>,
+pub fn assert_fail<M: rt::Access>(
+    caller: &rt::Caller<'_, M>,
     expression: i32,
     file: i32,
     line: i32,
     function: i32,
 ) -> ! {
-    let text = |address: i32| String::from_utf8_lossy(caller.cstring(address)).into_owned();
+    let text = |address: i32| String::from_utf8_lossy(&caller.cstring(address)).into_owned();
     panic!(
         "assertion failed: {} at {}:{line} in {}",
         text(expression),
@@ -652,7 +673,7 @@ impl Emscripten {
     ///
     /// Returns 1 on success and 0 on refusal, which is the opposite of
     /// `memory.grow`'s convention and is what the module checks.
-    pub fn resize_heap(caller: &mut rt::Caller<'_>, bytes: i32) -> i32 {
+    pub fn resize_heap(caller: &mut rt::Caller<'_, rt::Memory>, bytes: i32) -> i32 {
         let wanted = u64::from(bytes as u32);
         let have = caller.memory.data.len() as u64;
         if wanted <= have {
@@ -670,15 +691,20 @@ impl Emscripten {
     /// `u32::MAX`, because the module divides it by the page size and a value
     /// that is not a multiple of one is a number no memory can ever have.
     #[must_use]
-    pub fn heap_max(caller: &rt::Caller<'_>) -> i32 {
+    pub fn heap_max(caller: &rt::Caller<'_, rt::Memory>) -> i32 {
         let pages = u64::from(caller.memory.max_pages.unwrap_or(65536));
         let bytes = pages * rt::PAGE_SIZE as u64;
         bytes.min(0xFFFF_0000) as u32 as i32
     }
 
     /// `emscripten_console_error`: a string, straight to `stderr`.
-    pub fn console_error(&self, caller: &rt::Caller<'_>, wasi: &mut Wasi, text: i32) {
-        wasi.stderr.extend_from_slice(caller.cstring(text));
+    pub fn console_error<M: rt::Access>(
+        &self,
+        caller: &rt::Caller<'_, M>,
+        wasi: &mut Wasi,
+        text: i32,
+    ) {
+        wasi.stderr.extend_from_slice(&caller.cstring(text));
         wasi.stderr.push(b'\n');
     }
 }
@@ -716,10 +742,16 @@ pub struct Embind {
 
 impl Embind {
     /// Records a registration whose second argument is its name.
-    pub fn register(&mut self, caller: &rt::Caller<'_>, kind: &str, name: i32, arguments: &[i32]) {
+    pub fn register<M: rt::Access>(
+        &mut self,
+        caller: &rt::Caller<'_, M>,
+        kind: &str,
+        name: i32,
+        arguments: &[i32],
+    ) {
         self.registrations.push(Registration {
             kind: kind.to_string(),
-            name: String::from_utf8_lossy(caller.cstring(name)).into_owned(),
+            name: String::from_utf8_lossy(&caller.cstring(name)).into_owned(),
             arguments: arguments.to_vec(),
         });
     }
