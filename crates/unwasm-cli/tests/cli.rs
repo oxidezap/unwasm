@@ -351,7 +351,10 @@ fn host_writes_to_a_file_and_says_how_much_is_left_to_do() {
         destination.to_str().expect("utf-8 path"),
     ]);
     assert!(ok, "{stderr}");
-    assert!(stdout.contains("1 methods to implement"), "{stdout}");
+    assert!(
+        stdout.contains("1 methods, 1 of them still to implement"),
+        "{stdout}"
+    );
     let written = std::fs::read_to_string(&destination).expect("the file exists");
     assert!(written.contains("pub struct Host"));
 }

@@ -490,12 +490,277 @@ impl Wasi {
         fd
     }
 
+    /// `__syscall_openat(dirfd, path, flags, mode)`, which is how Emscripten
+    /// spells `open`.
+    ///
+    /// The directory descriptor is ignored: every path in this filesystem is
+    /// absolute, and resolving a relative one against a directory that does
+    /// not exist would be inventing a tree.
+    pub fn openat_at(&mut self, caller: &rt::Caller<'_>, path: i32, flags: i32) -> i32 {
+        let path = String::from_utf8_lossy(caller.cstring(path)).into_owned();
+        // musl's values, which is what an Emscripten module was built against:
+        // O_CREAT is 0o100 and O_APPEND 0o2000.
+        self.openat(&path, flags & 0o100 != 0, flags & 0o2000 != 0)
+    }
+
+    /// `__syscall_unlinkat`. Returns 0, or the negative errno a syscall does.
+    pub fn unlinkat(&mut self, caller: &rt::Caller<'_>, path: i32) -> i32 {
+        let path = String::from_utf8_lossy(caller.cstring(path)).into_owned();
+        if self.files.remove(&path).is_some() {
+            0
+        } else {
+            -errno::NOENT
+        }
+    }
+
     /// The size of what a descriptor refers to, for `fstat`.
     #[must_use]
     pub fn size_of(&self, fd: i32) -> Option<usize> {
         match self.open.get(&fd)? {
             Descriptor::File(open) => self.files.get(&open.path).map(Vec::len),
             _ => Some(0),
+        }
+    }
+}
+
+// ---- the C++ runtime ----
+
+/// The exception entry points a module built with `-fexceptions` imports.
+///
+/// Emscripten's JavaScript glue keeps a stack of thrown objects and hands the
+/// current one back to `__cxa_begin_catch`; this is the same, in a `Vec`. What
+/// it deliberately does not do is invent a type match: `__cxa_find_matching_catch`
+/// returns the exception and lets the personality code in the module decide,
+/// which is what the glue does too.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Cxx {
+    /// Exceptions thrown and not yet caught, innermost last.
+    pub thrown: Vec<rt::GuestException>,
+    /// How many are currently being caught, for `__cxa_uncaught_exceptions`.
+    pub caught: Vec<rt::GuestException>,
+}
+
+impl Cxx {
+    /// `__cxa_throw(exception, info, destructor)`.
+    ///
+    /// # Panics
+    ///
+    /// Always: a throw is a panic carrying the exception, which is what a
+    /// generated `invoke_*` trampoline catches.
+    pub fn throw(&mut self, exception: i32, info: i32) -> ! {
+        self.thrown.push(rt::GuestException { exception, info });
+        rt::throw(exception, info);
+    }
+
+    /// `__cxa_begin_catch(pointer)`. Returns the pointer it was given, and
+    /// moves the exception to the caught list.
+    pub fn begin_catch(&mut self, pointer: i32) -> i32 {
+        if let Some(at) = self
+            .thrown
+            .iter()
+            .rposition(|exception| exception.exception == pointer)
+        {
+            let exception = self.thrown.remove(at);
+            self.caught.push(exception);
+        }
+        pointer
+    }
+
+    /// `__cxa_end_catch`.
+    pub fn end_catch(&mut self) {
+        self.caught.pop();
+    }
+
+    /// `__cxa_rethrow`, and `__resumeException`.
+    ///
+    /// # Panics
+    ///
+    /// Always, unless there is nothing to rethrow — which is a bug in the
+    /// module rather than in the host, and traps rather than returning.
+    pub fn rethrow(&mut self) -> ! {
+        match self.caught.pop().or_else(|| self.thrown.pop()) {
+            Some(exception) => rt::throw(exception.exception, exception.info),
+            None => rt::trap("__cxa_rethrow with nothing in flight"),
+        }
+    }
+
+    /// `__cxa_uncaught_exceptions`.
+    #[must_use]
+    pub fn uncaught(&self) -> i32 {
+        self.thrown.len() as i32
+    }
+
+    /// `__cxa_find_matching_catch_N` and `__cxa_get_exception_ptr`.
+    ///
+    /// The type ids the module passes are not compared: the glue does not
+    /// either, and a host that guessed at C++ type matching would be inventing
+    /// an answer the module then acts on.
+    #[must_use]
+    pub fn in_flight(&self) -> i32 {
+        self.caught
+            .last()
+            .or_else(|| self.thrown.last())
+            .map_or(0, |exception| exception.exception)
+    }
+}
+
+/// What `__assert_fail` was told, in a form a person can read.
+///
+/// # Panics
+///
+/// Always. A failed assertion in the guest is not something a host can carry
+/// on from, and the four strings are exactly what makes it diagnosable.
+pub fn assert_fail(
+    caller: &rt::Caller<'_>,
+    expression: i32,
+    file: i32,
+    line: i32,
+    function: i32,
+) -> ! {
+    let text = |address: i32| String::from_utf8_lossy(caller.cstring(address)).into_owned();
+    panic!(
+        "assertion failed: {} at {}:{line} in {}",
+        text(expression),
+        text(file),
+        text(function)
+    );
+}
+
+// ---- Emscripten's own runtime ----
+
+/// The parts of Emscripten's JavaScript runtime that are not JavaScript.
+///
+/// `emscripten_asm_const_*` is not here and cannot be: it runs a string of
+/// JavaScript the module carries, and there is no honest mechanical answer.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Emscripten {
+    /// How many times the runtime was asked to stay alive.
+    pub keepalive: i32,
+    /// Callbacks `emscripten_async_call` was given: `(function, argument,
+    /// milliseconds)`. Recorded rather than run — running them would need a
+    /// way back into the instance, and inventing a schedule is worse than
+    /// saying what was asked for.
+    pub scheduled: Vec<(i32, i32, i32)>,
+    /// Whether the module asked to exit while keeping the runtime alive.
+    pub exited_with_live_runtime: bool,
+    /// How many logical cores to report.
+    pub cores: i32,
+}
+
+impl Emscripten {
+    /// `emscripten_resize_heap(bytes)`: grow linear memory to at least that.
+    ///
+    /// Returns 1 on success and 0 on refusal, which is the opposite of
+    /// `memory.grow`'s convention and is what the module checks.
+    pub fn resize_heap(caller: &mut rt::Caller<'_>, bytes: i32) -> i32 {
+        let wanted = u64::from(bytes as u32);
+        let have = caller.memory.data.len() as u64;
+        if wanted <= have {
+            return 1;
+        }
+        let pages = wanted.div_ceil(rt::PAGE_SIZE as u64) - have / rt::PAGE_SIZE as u64;
+        i32::from(caller.memory.grow(pages as u32) >= 0)
+    }
+
+    /// `emscripten_get_heap_max`: the ceiling the memory type declared, or the
+    /// one a 32-bit memory has regardless.
+    ///
+    /// A memory with no declared maximum can reach 4 GiB, which does not fit
+    /// in the i32 this returns. The answer is a page short of it rather than
+    /// `u32::MAX`, because the module divides it by the page size and a value
+    /// that is not a multiple of one is a number no memory can ever have.
+    #[must_use]
+    pub fn heap_max(caller: &rt::Caller<'_>) -> i32 {
+        let pages = u64::from(caller.memory.max_pages.unwrap_or(65536));
+        let bytes = pages * rt::PAGE_SIZE as u64;
+        bytes.min(0xFFFF_0000) as u32 as i32
+    }
+
+    /// `emscripten_console_error`: a string, straight to `stderr`.
+    pub fn console_error(&self, caller: &rt::Caller<'_>, wasi: &mut Wasi, text: i32) {
+        wasi.stderr.extend_from_slice(caller.cstring(text));
+        wasi.stderr.push(b'\n');
+    }
+}
+
+// ---- embind, and emval ----
+
+/// One `_embind_register_*` call, as it happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Registration {
+    /// Which registration it was, without the `_embind_register_` prefix.
+    pub kind: String,
+    /// The name it registered, when the call carries one.
+    pub name: String,
+    /// The arguments, in order, for anything the name does not cover.
+    pub arguments: Vec<i32>,
+}
+
+/// What embind registered and what emval is holding.
+///
+/// Registration is recorded rather than acted on. Acting on it would mean
+/// building a JavaScript type system, and what a reader wants from a run is
+/// the list: which classes, which methods, in which order — the same list
+/// `unwasm inspect` recovers statically, confirmed by the module actually
+/// running.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Embind {
+    /// Every registration, in the order the module made it.
+    pub registrations: Vec<Registration>,
+    /// emval handles by number, with their reference counts. Handle 0 is
+    /// never given out: the module treats it as null.
+    pub handles: std::collections::BTreeMap<i32, i32>,
+    /// The next handle to hand out.
+    pub next_handle: i32,
+}
+
+impl Embind {
+    /// Records a registration whose second argument is its name.
+    pub fn register(&mut self, caller: &rt::Caller<'_>, kind: &str, name: i32, arguments: &[i32]) {
+        self.registrations.push(Registration {
+            kind: kind.to_string(),
+            name: String::from_utf8_lossy(caller.cstring(name)).into_owned(),
+            arguments: arguments.to_vec(),
+        });
+    }
+
+    /// Records a registration that carries no name.
+    pub fn register_unnamed(&mut self, kind: &str, arguments: &[i32]) {
+        self.registrations.push(Registration {
+            kind: kind.to_string(),
+            name: String::new(),
+            arguments: arguments.to_vec(),
+        });
+    }
+
+    /// `_emval_take_value`: a new handle, with one reference.
+    pub fn take_value(&mut self) -> i32 {
+        if self.next_handle < 1 {
+            self.next_handle = 1;
+        }
+        let handle = self.next_handle;
+        self.next_handle += 1;
+        self.handles.insert(handle, 1);
+        handle
+    }
+
+    /// `_emval_incref`.
+    pub fn incref(&mut self, handle: i32) {
+        if handle != 0 {
+            *self.handles.entry(handle).or_insert(0) += 1;
+        }
+    }
+
+    /// `_emval_decref`. A handle whose count reaches zero is released.
+    pub fn decref(&mut self, handle: i32) {
+        if handle == 0 {
+            return;
+        }
+        if let Some(count) = self.handles.get_mut(&handle) {
+            *count -= 1;
+            if *count <= 0 {
+                self.handles.remove(&handle);
+            }
         }
     }
 }
@@ -845,6 +1110,233 @@ mod tests {
         assert_eq!(wasi.size_of(99), None);
         wasi.files.remove("/f");
         assert_eq!(wasi.size_of(fd), None, "and neither has a file that went");
+    }
+
+    // ---- the C++ runtime ----
+
+    #[test]
+    fn an_exception_is_thrown_caught_and_ended() {
+        let mut cxx = Cxx::default();
+        let thrown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut throwing = Cxx::default();
+            throwing.throw(0x1000, 0x2000)
+        }));
+        let payload = thrown.expect_err("a throw does not return");
+        assert_eq!(
+            payload.downcast_ref::<rt::GuestException>(),
+            Some(&rt::GuestException {
+                exception: 0x1000,
+                info: 0x2000
+            })
+        );
+
+        // The trampoline caught it; the module then asks for it by pointer.
+        cxx.thrown.push(rt::GuestException {
+            exception: 0x1000,
+            info: 0x2000,
+        });
+        assert_eq!(cxx.uncaught(), 1);
+        assert_eq!(cxx.begin_catch(0x1000), 0x1000);
+        assert_eq!(cxx.uncaught(), 0, "it is being caught, not in flight");
+        assert_eq!(cxx.in_flight(), 0x1000);
+        cxx.end_catch();
+        assert_eq!(cxx.in_flight(), 0, "and nothing is left");
+    }
+
+    #[test]
+    fn beginning_a_catch_for_something_that_was_not_thrown_still_answers() {
+        // The module hands back a pointer it got from the personality routine,
+        // and a host that lost track must not lose the pointer with it.
+        let mut cxx = Cxx::default();
+        assert_eq!(cxx.begin_catch(0x40), 0x40);
+        assert!(cxx.caught.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "wasm trap: __cxa_rethrow with nothing in flight")]
+    fn rethrowing_nothing_traps_rather_than_inventing_an_exception() {
+        Cxx::default().rethrow();
+    }
+
+    #[test]
+    fn rethrowing_takes_the_one_being_caught_first() {
+        let mut cxx = Cxx::default();
+        cxx.thrown.push(rt::GuestException {
+            exception: 1,
+            info: 0,
+        });
+        cxx.caught.push(rt::GuestException {
+            exception: 2,
+            info: 0,
+        });
+        let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cxx.rethrow()));
+        let payload = again.expect_err("a rethrow does not return");
+        assert_eq!(
+            payload
+                .downcast_ref::<rt::GuestException>()
+                .map(|exception| exception.exception),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn a_rethrow_with_only_a_thrown_one_takes_that() {
+        let mut cxx = Cxx::default();
+        cxx.thrown.push(rt::GuestException {
+            exception: 9,
+            info: 0,
+        });
+        let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cxx.rethrow()));
+        assert!(again.is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed: x != 0 at check.c:42 in verify")]
+    fn a_failed_assertion_reads_all_four_of_its_strings() {
+        let mut memory = memory();
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
+        caller.write(100, b"x != 0\0");
+        caller.write(200, b"check.c\0");
+        caller.write(300, b"verify\0");
+        assert_fail(&caller, 100, 200, 42, 300);
+    }
+
+    // ---- Emscripten's runtime ----
+
+    #[test]
+    fn resizing_the_heap_grows_it_and_reports_the_way_the_module_expects() {
+        let mut memory = rt::Memory::new(1, Some(4));
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
+        // 1 on success, which is the opposite of `memory.grow`'s convention.
+        assert_eq!(Emscripten::resize_heap(&mut caller, 3 * 65536), 1);
+        assert_eq!(caller.memory.size(), 3);
+        // Already big enough is success without growing.
+        assert_eq!(Emscripten::resize_heap(&mut caller, 65536), 1);
+        assert_eq!(caller.memory.size(), 3);
+        // Past the declared maximum is a refusal, and nothing moves.
+        assert_eq!(Emscripten::resize_heap(&mut caller, 9 * 65536), 0);
+        assert_eq!(caller.memory.size(), 3);
+    }
+
+    #[test]
+    fn the_heap_maximum_is_what_the_memory_type_declared() {
+        let mut memory = rt::Memory::new(1, Some(4));
+        let caller = rt::Caller {
+            memory: &mut memory,
+        };
+        assert_eq!(Emscripten::heap_max(&caller), 4 * 65536);
+
+        // Undeclared means the ceiling a 32-bit memory has anyway, which does
+        // not fit in an i32 and comes back as -65536 rather than as a wrap to
+        // something small.
+        let mut memory = rt::Memory::new(1, None);
+        let caller = rt::Caller {
+            memory: &mut memory,
+        };
+        assert_eq!(Emscripten::heap_max(&caller) as u32, 0xFFFF_0000);
+    }
+
+    #[test]
+    fn console_error_goes_to_stderr_with_a_newline() {
+        let mut memory = memory();
+        let mut wasi = Wasi::default();
+        let emscripten = Emscripten::default();
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
+        caller.write(64, b"something went wrong\0");
+        emscripten.console_error(&caller, &mut wasi, 64);
+        assert_eq!(wasi.stderr_text(), "something went wrong\n");
+    }
+
+    // ---- embind ----
+
+    #[test]
+    fn a_registration_is_recorded_with_the_name_it_carried() {
+        let mut memory = memory();
+        let mut embind = Embind::default();
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
+        caller.write(64, b"Uint8List\0");
+        embind.register(&caller, "class", 64, &[1, 2, 3]);
+        embind.register_unnamed("void", &[9]);
+        assert_eq!(
+            embind.registrations,
+            vec![
+                Registration {
+                    kind: "class".to_string(),
+                    name: "Uint8List".to_string(),
+                    arguments: vec![1, 2, 3],
+                },
+                Registration {
+                    kind: "void".to_string(),
+                    name: String::new(),
+                    arguments: vec![9],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_emval_handle_is_counted_and_released() {
+        let mut embind = Embind::default();
+        let handle = embind.take_value();
+        assert_eq!(handle, 1, "zero is null and is never handed out");
+        assert_eq!(embind.handles[&handle], 1);
+        embind.incref(handle);
+        assert_eq!(embind.handles[&handle], 2);
+        embind.decref(handle);
+        embind.decref(handle);
+        assert!(!embind.handles.contains_key(&handle), "released at zero");
+
+        // Null is not a handle, in either direction.
+        embind.incref(0);
+        embind.decref(0);
+        assert!(embind.handles.is_empty());
+        // And decrementing something that is not held is not a panic.
+        embind.decref(77);
+        assert!(embind.handles.is_empty());
+    }
+
+    #[test]
+    fn handles_keep_going_up() {
+        let mut embind = Embind::default();
+        assert_eq!(embind.take_value(), 1);
+        assert_eq!(embind.take_value(), 2);
+        embind.decref(1);
+        assert_eq!(embind.take_value(), 3, "a released number is not reused");
+    }
+
+    // ---- syscalls ----
+
+    #[test]
+    fn openat_reads_its_path_out_of_memory_and_honours_the_flags() {
+        let mut memory = memory();
+        let mut wasi = Wasi::default();
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
+        caller.write(64, b"/notes.txt\0");
+        // Without O_CREAT a missing file is a negative errno, not a descriptor.
+        assert_eq!(wasi.openat_at(&caller, 64, 0), -errno::NOENT);
+        let fd = wasi.openat_at(&caller, 64, 0o100);
+        assert!(fd > 0, "O_CREAT makes it");
+        assert!(wasi.files.contains_key("/notes.txt"));
+
+        // O_APPEND reaches the descriptor.
+        let appending = wasi.openat_at(&caller, 64, 0o2000);
+        assert!(matches!(
+            &wasi.open[&appending],
+            Descriptor::File(open) if open.append
+        ));
+
+        assert_eq!(wasi.unlinkat(&caller, 64), 0);
+        assert_eq!(wasi.unlinkat(&caller, 64), -errno::NOENT);
     }
 
     #[test]

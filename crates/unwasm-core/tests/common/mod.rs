@@ -547,6 +547,17 @@ pub fn run_with_driver_in_layout(
 ///
 /// For the layouts `run_with_driver` does not produce — a partial
 /// decompilation, say — where the point is that what came out still builds.
+/// As [`run_with_generated`], with a generated host beside the module.
+///
+/// The driver, the module and the host are three files because that is how
+/// `unwasm decompile` and `unwasm host` write them, and a test that flattened
+/// them into one would not be testing what a user compiles.
+pub fn run_with_host(name: &str, generated: &str, host: &str, driver: &str) -> String {
+    let scratch = workspace_scratch(name);
+    write_atomically(&scratch.join("host.rs"), host.as_bytes());
+    run_with_generated(name, generated, driver)
+}
+
 pub fn run_with_generated(name: &str, generated: &str, driver: &str) -> String {
     let scratch = workspace_scratch(name);
     let single = scratch.join("generated.rs");

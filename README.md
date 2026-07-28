@@ -296,8 +296,29 @@ this linear walk to grow.
 
 ### What is left for a host
 
-After decompiling, what remains is the part only a host can answer. `unwasm
-host` writes the skeleton:
+After decompiling, what remains is the part only a host can answer — and half
+of it is not application-specific at all. `unwasm host` writes both: the
+mechanical imports, implemented, and the rest as `todo!()`.
+
+A small Emscripten program needs nothing beyond the mechanical set, which means
+it *runs*:
+
+```console
+$ emcc -O1 hello.c -o hello.wasm -sSTANDALONE_WASM --no-entry
+$ unwasm decompile hello.wasm -o src/generated.rs
+$ unwasm host hello.wasm -o src/host.rs
+$ cargo run
+hello 42 1.500
+```
+
+That `printf` went through the module's own musl — formatting, the stdio
+buffer, the iovec array — and came out of the generated `fd_write`. The
+filesystem it writes to is a `BTreeMap<String, Vec<u8>>` in the host struct;
+nothing escapes to the real one, because a module you are running to find out
+what it does should not be able to open `/etc/passwd`. Randomness and the
+clock are supplied rather than taken, so two runs produce the same bytes.
+
+The skeleton:
 
 ```console
 $ unwasm host D5pLH9sfOOl.wasm -o host.rs
@@ -334,9 +355,14 @@ adding a parameter changes every host ever written.
 
 Grouped by where each import comes from, because 102 methods in one list is a
 wall and the same 102 split into "these are WASI", "these are the C++ runtime"
-and "these 35 are yours" is a plan. Every body is `todo!()` — a skeleton
-returning zero would compile, run, and be wrong, and the module could not tell
-"not written yet" from "answered 0".
+and "these are yours" is a plan. What is left is `todo!()` rather than a stub
+returning zero — a stub compiles, runs, and is wrong, and the module cannot
+tell "not written yet" from "answered 0".
+
+An implementation is emitted only when the signature matches exactly.
+Emscripten has changed these shapes before, and a body written for the other
+shape would read the wrong argument as a pointer. `_embind_register_class`
+with two arguments instead of thirteen stays a `todo!()`.
 
 ### Reading a module rather than translating it
 
@@ -684,9 +710,12 @@ import stays the host's to implement.
 - **Compile time still scales with the module**, just not catastrophically:
   23 seconds for 2.0 MiB of wasm. The 9.4 MiB VoIP module would be several
   minutes, if the rest of it were supported.
-- **The VoIP module compiles and instantiates, but cannot do anything yet**:
-  102 host imports remain, and 35 of them are WhatsApp's own callbacks that
-  only the application can answer. `unwasm host` writes the skeleton.
+- **The VoIP module compiles and instantiates; half its host is written for
+  you.** `unwasm host` implements 51 of its 102 imports — WASI, the C++
+  runtime, Emscripten's runtime, embind's registrations — and leaves 51,
+  which are WhatsApp's own callbacks, `stat` (a struct layout nobody should
+  guess at) and `emscripten_asm_const_*` (which runs JavaScript the module
+  carries).
 - **No SIMD, no reference types, no exceptions, no multi-value.** Each is
   refused by name.
 - **Level 0 only.** Linear memory is bytes; a C local that lived in the shadow

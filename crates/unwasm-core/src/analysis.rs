@@ -557,7 +557,11 @@ const EMBIND_DEFINES_TYPE: &[&str] = &[
 ///
 /// From embind's own signatures. A registration not listed here is still
 /// reported — that it happened is worth knowing — just without a name.
-const EMBIND_NAME_ARGUMENT: &[(&str, usize)] = &[
+/// Which argument of each `_embind_register_*` call carries the name.
+///
+/// Public because the host generator answers the same calls at run time and
+/// must agree with what the static reader claims about them.
+pub const EMBIND_NAME_ARGUMENT: &[(&str, usize)] = &[
     ("_embind_register_void", 1),
     ("_embind_register_bool", 1),
     ("_embind_register_integer", 1),

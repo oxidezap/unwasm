@@ -274,9 +274,15 @@ fn host(arguments: &[String]) -> Result<String, String> {
         Some(destination) => {
             std::fs::write(&destination, &skeleton)
                 .map_err(|error| format!("writing {destination}: {error}"))?;
+            // Only the trait's own methods: the embedded library above it
+            // has plenty of `fn`s and none of them are the host's to write.
+            let trait_body = skeleton
+                .split_once("impl Imports for Host {")
+                .map_or("", |(_, rest)| rest);
             Ok(format!(
-                "wrote {destination} ({} methods to implement)\n",
-                skeleton.matches("    fn ").count()
+                "wrote {destination} ({} methods, {} of them still to implement)\n",
+                trait_body.matches("\n    fn ").count(),
+                trait_body.matches("todo!(\"").count()
             ))
         }
         None => Ok(skeleton),

@@ -212,6 +212,134 @@ impl ImportGroup {
     }
 }
 
+/// A wasm signature as a short string: the parameters, then `->`, then the
+/// result. `i` is i32, `j` i64, `f` f32, `d` f64.
+///
+/// A host implementation is only emitted when this matches exactly. Emscripten
+/// has changed the shape of these imports before — `fd_seek` took a split i64
+/// once — and a body written for the other shape would not compile, or worse
+/// would compile and read the wrong argument.
+fn shape(ty: &crate::module::FuncType) -> String {
+    let letter = |value: &ValType| match value {
+        ValType::I32 => 'i',
+        ValType::I64 => 'j',
+        ValType::F32 => 'f',
+        ValType::F64 => 'd',
+    };
+    let params: String = ty.params.iter().map(letter).collect();
+    let results: String = ty.results.iter().map(letter).collect();
+    format!("{params}->{results}")
+}
+
+/// The body for an import the host library already answers, if this is one.
+///
+/// Everything here is mechanical: it is the same for every module an
+/// Emscripten toolchain produced, which is precisely why it is worth writing
+/// once. Anything that is *not* mechanical stays a `todo!()` — the
+/// application's own callbacks, and the ones no host can answer honestly, like
+/// `emscripten_asm_const_int`, which runs a string of JavaScript the module
+/// carries.
+fn known_import(field: &str, ty: &crate::module::FuncType) -> Option<&'static str> {
+    let shape = shape(ty);
+    let body = match (field, shape.as_str()) {
+        // ---- WASI
+        ("fd_write", "iiii->i") => "self.wasi.fd_write(caller, p0, p1, p2, p3)",
+        ("fd_read", "iiii->i") => "self.wasi.fd_read(caller, p0, p1, p2, p3)",
+        ("fd_pread", "iiiji->i") => "self.wasi.fd_pread(caller, p0, p1, p2, p3, p4)",
+        ("fd_seek", "ijii->i") => "self.wasi.fd_seek(caller, p0, p1, p2, p3)",
+        ("fd_close", "i->i") => "self.wasi.fd_close(p0)",
+        ("environ_sizes_get", "ii->i") => "self.wasi.environ_sizes_get(caller, p0, p1)",
+        ("environ_get", "ii->i") => "self.wasi.environ_get(caller, p0, p1)",
+        ("args_sizes_get", "ii->i") => "self.wasi.args_sizes_get(caller, p0, p1)",
+        ("args_get", "ii->i") => "self.wasi.args_get(caller, p0, p1)",
+        ("random_get", "ii->i") | ("getentropy", "ii->i") => "self.wasi.random_get(caller, p0, p1)",
+        ("clock_time_get", "iji->i") => "self.wasi.clock_time_get(caller, p2)",
+        ("proc_exit", "i->") | ("exit", "i->") => "runtime::exit(p0)",
+
+        // ---- the C++ runtime
+        ("__cxa_throw", "iii->") => "self.cxx.throw(p0, p1)",
+        ("__cxa_begin_catch", "i->i") => "self.cxx.begin_catch(p0)",
+        ("__cxa_end_catch", "->") => "self.cxx.end_catch()",
+        ("__cxa_rethrow", "->") => "self.cxx.rethrow()",
+        ("__resumeException", "i->") => "self.cxx.rethrow()",
+        ("__cxa_uncaught_exceptions", "->i") => "self.cxx.uncaught()",
+        // The type ids are not compared: the JavaScript glue does not compare
+        // them either, and the module's own personality code decides.
+        ("__cxa_get_exception_ptr", "i->i")
+        | ("__cxa_find_matching_catch_2", "->i")
+        | ("__cxa_find_matching_catch_3", "i->i")
+        | ("__cxa_find_matching_catch_4", "ii->i") => "self.cxx.in_flight()",
+        ("__assert_fail", "iiii->") => "runtime::assert_fail(caller, p0, p1, p2, p3)",
+
+        // ---- Emscripten's runtime
+        ("emscripten_resize_heap", "i->i") => "runtime::Emscripten::resize_heap(caller, p0)",
+        ("emscripten_get_heap_max", "->i") => "runtime::Emscripten::heap_max(caller)",
+        ("emscripten_date_now", "->d") | ("emscripten_get_now", "->d") => {
+            "self.wasi.now_milliseconds"
+        }
+        ("_emscripten_get_now_is_monotonic", "->i") => "1",
+        ("emscripten_num_logical_cores", "->i") => "self.emscripten.cores",
+        ("emscripten_console_error", "i->") => {
+            "self.emscripten.console_error(caller, &mut self.wasi, p0)"
+        }
+        ("emscripten_memcpy_js", "iii->") => "caller.memory.copy(p0, p1, p2)",
+        ("emscripten_runtime_keepalive_push", "->") => "self.emscripten.keepalive += 1",
+        ("emscripten_runtime_keepalive_pop", "->") => "self.emscripten.keepalive -= 1",
+        ("emscripten_async_call", "iii->") => "self.emscripten.scheduled.push((p0, p1, p2))",
+        ("emscripten_exit_with_live_runtime", "->") => {
+            "self.emscripten.exited_with_live_runtime = true"
+        }
+        ("emscripten_check_blocking_allowed", "->") => "()",
+        ("abort", "->") => "rt::trap(\"the module called abort\")",
+
+        // ---- the syscalls that are honest over an in-memory filesystem
+        ("__syscall_openat", "iiii->i") => "self.wasi.openat_at(caller, p1, p2)",
+        ("__syscall_unlinkat", "iii->i") => "self.wasi.unlinkat(caller, p1)",
+        // Nothing here is a terminal, and saying so is an answer rather than a
+        // guess. The rest of the syscalls stay `todo!()`: `stat` would mean
+        // inventing a struct layout, and a wrong one is worse than none.
+        ("__syscall_ioctl", "iii->i") => "-runtime::errno::NOTTY",
+
+        // ---- embind and emval
+        ("_emval_incref", "i->") => "self.embind.incref(p0)",
+        ("_emval_decref", "i->") => "self.embind.decref(p0)",
+        ("_emval_take_value", "ii->i") => "self.embind.take_value()",
+        _ => return None,
+    };
+    Some(body)
+}
+
+/// The body for an `_embind_register_*` call, which records rather than acts.
+///
+/// The argument carrying the name comes from the same table the static reader
+/// uses, so what a run reports and what `unwasm inspect` claims cannot drift
+/// apart.
+fn known_registration(field: &str, ty: &crate::module::FuncType) -> Option<String> {
+    let at = analysis::EMBIND_NAME_ARGUMENT
+        .iter()
+        .find(|(name, _)| *name == field)?
+        .1;
+    // Every registration takes its name as an i32 address, and the ones that
+    // do not are not this.
+    if ty.params.get(at) != Some(&ValType::I32) {
+        return None;
+    }
+    let kind = field.trim_start_matches("_embind_register_");
+    // The i64 arguments of `_embind_register_bigint` are its bounds, not
+    // anything a reader looks up, and they do not fit an i32 list.
+    let rest: Vec<String> = ty
+        .params
+        .iter()
+        .enumerate()
+        .filter(|(index, param)| *index != at && **param == ValType::I32)
+        .map(|(index, _)| format!("p{index}"))
+        .collect();
+    Some(format!(
+        "self.embind.register(caller, \"{kind}\", p{at}, &[{}])",
+        rest.join(", ")
+    ))
+}
+
 /// Generates a host skeleton: an `impl Imports` with every method the module
 /// still needs, grouped by where it comes from.
 ///
@@ -233,23 +361,51 @@ pub fn generate_host(module: &Module) -> Result<String> {
 ",
         "//
 ",
-        "// Every method is `todo!()` rather than a stub returning zero. A stub that
+        "// The mechanical imports are implemented: WASI over an in-memory
 ",
-        "// returns zero compiles, runs, and is wrong, and the module cannot tell it
+        "// filesystem, the C++ runtime's exception entry points, Emscripten's own
 ",
-        "// apart from an answer.
+        "// runtime, and embind's registrations, which are recorded. What is left
+",
+        "// as `todo!()` is what no host can answer for you — the application's own
+",
+        "// callbacks, and the ones that run JavaScript the module carries.
+",
+        "//
+",
+        "// A `todo!()` rather than a stub returning zero: a stub that returns zero
+",
+        "// compiles, runs, and is wrong, and the module cannot tell it apart from
+",
+        "// an answer.
 
 ",
         "use crate::generated::{self, rt, Imports};
 
 ",
-        "/// State the host needs. Start empty and add as the imports need it.
-",
-        "#[derive(Debug, Default)]
-",
-        "pub struct Host {}
-
-",
+    ));
+    // The library, embedded rather than depended on, exactly as the runtime is.
+    out.push_str("/// The mechanical half of a host. Regenerate rather than edit.\n");
+    out.push_str("#[allow(dead_code)]\npub mod runtime {\n");
+    for line in strip_tests(include_str!("hostlib.rs")).lines() {
+        if line.is_empty() {
+            out.push('\n');
+        } else {
+            let _ = writeln!(out, "    {line}");
+        }
+    }
+    out.push_str("}\n\n");
+    out.push_str(concat!(
+        "/// State the host needs. The four pieces the library answers with, and\n",
+        "/// room for whatever the application's own imports need.\n",
+        "#[derive(Debug, Default)]\n",
+        "pub struct Host {\n",
+        "    /// WASI, and the filesystem it reads.\n    pub wasi: runtime::Wasi,\n",
+        "    /// Exceptions in flight.\n    pub cxx: runtime::Cxx,\n",
+        "    /// Emscripten's runtime state.\n    pub emscripten: runtime::Emscripten,\n",
+        "    /// What embind registered, and what emval is holding.\n",
+        "    pub embind: runtime::Embind,\n",
+        "}\n\n",
     ));
 
     let mut grouped: std::collections::BTreeMap<ImportGroup, Vec<usize>> = Default::default();
@@ -269,9 +425,24 @@ pub fn generate_host(module: &Module) -> Result<String> {
     }
 
     let total: usize = grouped.values().map(Vec::len).sum();
+    let answered = grouped
+        .values()
+        .flatten()
+        .filter(|index| {
+            let import = &module.func_imports[**index];
+            module
+                .types
+                .get(import.type_index as usize)
+                .is_some_and(|ty| {
+                    known_import(&import.field, ty).is_some()
+                        || known_registration(&import.field, ty).is_some()
+                })
+        })
+        .count();
     let _ = writeln!(
         out,
-        "impl Imports for Host {{\n    // {total} methods. {} of the module's {} imports are Emscripten\n    // exception trampolines and are generated, so they are not here.",
+        "impl Imports for Host {{\n    // {total} methods, {answered} of them answered by the library above\n    // and {} left for you. {} of the module's {} imports are Emscripten\n    // exception trampolines and are generated, so they are not here.",
+        total - answered,
         analysis.invokes.len(),
         module.func_imports.len()
     );
@@ -283,12 +454,22 @@ pub fn generate_host(module: &Module) -> Result<String> {
             let ty = module.types.get(import.type_index as usize);
             let signature = ty.map_or_else(String::new, signature_of);
             let result = ty.map_or_else(String::new, return_type);
+            let body = ty.and_then(|ty| {
+                known_import(&import.field, ty)
+                    .map(str::to_string)
+                    .or_else(|| known_registration(&import.field, ty))
+            });
+            let (caller, body) = match body {
+                Some(body) => ("caller", body),
+                None => (
+                    "_caller",
+                    format!("todo!(\"{}::{}\")", import.module, import.field),
+                ),
+            };
             let _ = writeln!(
                 out,
-                "\n    fn {}(&mut self, _caller: &mut rt::Caller<'_>{signature}) {result} {{\n        todo!(\"{}::{}\")\n    }}",
+                "\n    fn {}(&mut self, {caller}: &mut rt::Caller<'_>{signature}) {result} {{\n        {body}\n    }}",
                 import_ident(import.module.as_str(), import.field.as_str()),
-                import.module,
-                import.field
             );
         }
     }

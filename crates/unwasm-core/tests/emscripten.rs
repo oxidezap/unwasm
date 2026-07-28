@@ -19,6 +19,7 @@
 mod common;
 
 use common::{Arg::I32, Arg::I64, assert_agrees, call, compile_emscripten};
+use unwasm_core::{Module, codegen};
 
 #[test]
 #[ignore = "needs emcc"]
@@ -212,4 +213,59 @@ fn what_emscripten_emits_that_is_not_supported_is_named() {
             eprintln!("refused as expected: {message}");
         }
     }
+}
+
+/// The whole thing, end to end: a C program with a `printf` in it, compiled by
+/// Emscripten, decompiled to Rust, given the generated host, and run.
+///
+/// What this exercises is not the arithmetic — the differential tests cover
+/// that — but the boundary. `printf` goes through musl's stdio, which formats
+/// into a buffer and calls `fd_write` with an iovec array; the host has to
+/// follow the pointers into linear memory to see any of it. Before the host
+/// library existed, the furthest a decompiled Emscripten module could get was
+/// instantiation.
+#[test]
+#[ignore = "needs emcc"]
+fn a_decompiled_emscripten_program_prints_through_the_generated_host() {
+    let wasm = compile_emscripten(
+        "em-printf",
+        r#"#include <stdio.h>
+           #include <string.h>
+           #include <stdlib.h>
+           __attribute__((export_name("go")))
+           int go(int n) {
+               char *text = malloc(32);
+               strcpy(text, "hello");
+               printf("%s %d %.3f\n", text, n * 2, 1.5);
+               fprintf(stderr, "done\n");
+               free(text);
+               return (int)strlen(text);
+           }"#,
+        "c",
+        &["-O1"],
+    );
+    let module = Module::parse(&wasm).expect("the module decodes");
+    let generated = codegen::generate(&module).expect("generates");
+    let host = codegen::generate_host(&module).expect("generates a host");
+    assert!(
+        !host.contains("todo!(\""),
+        "every import of this module is a mechanical one:\n{host}"
+    );
+
+    const DRIVER: &str = r#"
+mod generated;
+mod host;
+fn main() {
+    let mut instance = generated::Instance::with_host(host::Host::default());
+    let returned = instance.go(21);
+    print!("{}", instance.host.wasi.stdout_text());
+    print!("{}", instance.host.wasi.stderr_text());
+    println!("returned {returned}");
+}
+"#;
+    let output = common::run_with_host("em-printf", &generated, &host, DRIVER);
+    assert_eq!(
+        output, "hello 42 1.500\ndone\nreturned 5\n",
+        "the guest's own libc formatted every one of those"
+    );
 }
