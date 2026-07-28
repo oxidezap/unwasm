@@ -607,7 +607,10 @@ fn calls_reports_both_directions_for_one_function() {
     );
     let (ok, stdout, stderr) = run(&["calls", path.to_str().expect("utf-8 path"), "1"]);
     assert!(ok, "{stderr}");
-    assert!(stdout.contains("called by 1:"), "{stdout}");
+    assert!(
+        stdout.contains("called by 1 from 1 call sites:"),
+        "{stdout}"
+    );
     assert!(stdout.contains("f0"), "{stdout}");
     assert!(stdout.contains("calls 1:"), "{stdout}");
     assert!(stdout.contains("f2"), "{stdout}");
@@ -619,7 +622,10 @@ fn calls_reports_both_directions_for_one_function() {
     let (ok, stdout, _) = run(&["calls", path.to_str().expect("utf-8 path"), "0"]);
     assert!(ok);
     assert!(stdout.contains("exported as: entry"), "{stdout}");
-    assert!(stdout.contains("called by 0:"), "{stdout}");
+    assert!(
+        stdout.contains("called by 0 from 0 call sites:"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -875,4 +881,138 @@ fn a_catalogue_that_is_not_one_is_refused_with_the_line_that_is_wrong() {
     ]);
     assert!(!ok);
     assert!(stderr.contains("--signatures needs a path"), "{stderr}");
+}
+
+// ---- reading affordances ----
+
+#[test]
+fn only_can_bring_the_functions_it_calls_along() {
+    // Reading one function and needing the next is the same minute; a second
+    // invocation for it is a minute more.
+    let path = fixture(
+        "with-callees",
+        r#"(module
+            (func $leaf (param i32) (result i32) local.get 0)
+            (func $middle (param i32) (result i32) local.get 0 call $leaf)
+            (func (export "top") (param i32) (result i32) local.get 0 call $middle))"#,
+    );
+    let alone = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--only",
+        "2",
+    ]);
+    assert!(alone.0, "{}", alone.2);
+    assert_eq!(alone.1.matches("was not decompiled").count(), 2);
+
+    let with = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--only",
+        "2",
+        "--with-callees",
+    ]);
+    assert!(with.0, "{}", with.2);
+    // `middle` comes along; `leaf`, which is two levels down, does not.
+    assert_eq!(
+        with.1.matches("was not decompiled").count(),
+        1,
+        "one level, not the transitive closure"
+    );
+
+    let (ok, _, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--with-callees",
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("expands --only"), "{stderr}");
+}
+
+#[test]
+fn frames_lists_the_functions_that_write_outside_themselves() {
+    let path = fixture(
+        "frames-outside",
+        r#"(module
+            (memory 1)
+            (global $sp (export "__stack_pointer") (mut i32) (i32.const 65536))
+            (func (export "tidy") (local i32)
+                global.get $sp i32.const 32 i32.sub local.tee 0 global.set $sp
+                local.get 0 i32.const 1 i32.store offset=4
+                local.get 0 i32.const 32 i32.add global.set $sp)
+            (func (export "overrun") (local i32)
+                global.get $sp i32.const 32 i32.sub local.tee 0 global.set $sp
+                local.get 0 i32.const 1 i32.store offset=64
+                local.get 0 i32.const 32 i32.add global.set $sp)
+            (func (export "indexed") (param i32) (local i32)
+                global.get $sp i32.const 32 i32.sub local.tee 1 global.set $sp
+                local.get 1 local.get 0 i32.add i32.const 1 i32.store
+                local.get 1 i32.const 32 i32.add global.set $sp))"#,
+    );
+    let (ok, stdout, stderr) = run(&["frames", path.to_str().expect("utf-8 path")]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("3 of 3 frames"), "{stdout}");
+    assert!(stdout.contains("(address escapes)"), "{stdout}");
+
+    let (ok, stdout, stderr) = run(&["frames", path.to_str().expect("utf-8 path"), "--outside"]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("writes frame + 64 (4 bytes) — outside"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("1 writes through a computed frame address"),
+        "an indexed array in the frame cannot be checked, and says so: {stdout}"
+    );
+    assert!(stdout.contains("2 of 3 frames"), "{stdout}");
+    assert!(
+        !stdout.contains("f0 "),
+        "the tidy one is not a suspect: {stdout}"
+    );
+
+    let (ok, _, stderr) = run(&["frames"]);
+    assert!(!ok);
+    assert!(stderr.contains("needs a module path"), "{stderr}");
+    let (ok, _, stderr) = run(&["frames", path.to_str().expect("utf-8 path"), "--nope"]);
+    assert!(!ok);
+    assert!(stderr.contains("unexpected argument `--nope`"), "{stderr}");
+}
+
+#[test]
+fn instrument_stores_routes_writes_through_the_watchpoint_runtime() {
+    let path = fixture(
+        "instrumented",
+        r#"(module
+            (memory 1)
+            (func (export "write") (param i32) i32.const 8 local.get 0 i32.store))"#,
+    );
+    let (ok, plain, stderr) = run(&["decompile", path.to_str().expect("utf-8 path")]);
+    assert!(ok, "{stderr}");
+    assert!(!plain.contains("self.memory.store32_at("), "{plain}");
+
+    let (ok, instrumented, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--instrument-stores",
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(
+        instrumented.contains("self.memory.store32_at(0,"),
+        "{instrumented}"
+    );
+}
+
+#[test]
+fn calls_reports_the_number_of_call_sites() {
+    let path = fixture(
+        "call-sites",
+        r#"(module
+            (func $shared (result i32) i32.const 1)
+            (func (export "caller") (result i32)
+                call $shared drop
+                call $shared))"#,
+    );
+    let (ok, stdout, stderr) = run(&["calls", path.to_str().expect("utf-8 path"), "0"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("called by 1 from 2 call sites"), "{stdout}");
 }

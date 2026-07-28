@@ -83,10 +83,11 @@ fn strip_tests(source: &str) -> &str {
 }
 
 /// How the output is laid out across files.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Layout {
     /// Everything in one file. Simple to read and to move around, and what a
     /// small module wants.
+    #[default]
     Single,
     /// Functions spread over `part0.rs`, `part1.rs`, … beside a `mod.rs`.
     ///
@@ -337,9 +338,46 @@ pub fn generate_with(
     only: Option<&std::collections::BTreeSet<u32>>,
     signatures: &Signatures,
 ) -> Result<Vec<GeneratedFile>> {
-    let mut generator = Generator::new(module, layout);
-    generator.only = only.cloned();
-    generator.signatures = signatures.clone();
+    generate_options(
+        module,
+        &Options {
+            layout,
+            only: only.cloned(),
+            signatures: signatures.clone(),
+            instrument_stores: false,
+        },
+    )
+}
+
+/// Everything a caller can ask the emitter for.
+///
+/// A struct rather than more parameters: there are already four ways to ask
+/// for output and combining them pairwise is how an emitter ends up with eight
+/// entry points that disagree.
+#[derive(Debug, Clone, Default)]
+pub struct Options {
+    /// How the output is spread across files.
+    pub layout: Layout,
+    /// Decompile only these, stubbing the rest.
+    pub only: Option<std::collections::BTreeSet<u32>>,
+    /// Names for library code the module does not name.
+    pub signatures: Signatures,
+    /// Route every memory write through the watchpoint-aware runtime, so a
+    /// host can ask which function wrote an address. Costs a comparison per
+    /// write when nothing is watched, and nothing at all when it is not set.
+    pub instrument_stores: bool,
+}
+
+/// Generates with [`Options`].
+///
+/// # Errors
+///
+/// As [`generate`].
+pub fn generate_options(module: &Module, options: &Options) -> Result<Vec<GeneratedFile>> {
+    let mut generator = Generator::new(module, options.layout);
+    generator.only = options.only.clone();
+    generator.signatures = options.signatures.clone();
+    generator.instrument = options.instrument_stores;
     generator.run()
 }
 
@@ -430,6 +468,8 @@ struct Generator<'a> {
     signatures: Signatures,
     /// The names those fingerprints matched, by function index.
     recognised: std::collections::BTreeMap<u32, String>,
+    /// Whether every memory write reports itself to a watchpoint.
+    instrument: bool,
     /// Where each function ended up, for the index.
     located: Vec<(u32, String, String, usize)>,
 }
@@ -445,6 +485,7 @@ impl<'a> Generator<'a> {
             only: None,
             signatures: Signatures::new(),
             recognised: Default::default(),
+            instrument: false,
             located: Vec::new(),
         }
     }
@@ -527,9 +568,10 @@ impl<'a> Generator<'a> {
             };
             let calls = numbers(self.analysis.call_graph.calls_from(*index));
             let called_by = numbers(self.analysis.call_graph.callers_of(*index));
+            let sites = self.analysis.call_graph.sites_reaching(*index);
             let _ = writeln!(
                 out,
-                "    {{\"index\": {index}, \"name\": \"{name}\", \"file\": \"{file}\", \"line\": {line}, \"named_by\": \"{source}\", \"table_slots\": [{}], \"calls\": [{calls}], \"called_by\": [{called_by}]}}{}",
+                "    {{\"index\": {index}, \"name\": \"{name}\", \"file\": \"{file}\", \"line\": {line}, \"named_by\": \"{source}\", \"table_slots\": [{}], \"calls\": [{calls}], \"called_by\": [{called_by}], \"call_sites\": {sites}}}{}",
                 slots.join(", "),
                 if at + 1 == self.located.len() {
                     ""
@@ -1199,9 +1241,18 @@ impl<'a> Generator<'a> {
                     )
                 })
                 .collect();
+            // The site count, not just the caller count: one caller that
+            // calls this from a loop body is one caller and many sites, and
+            // instrumenting the body measures whichever site happened to run.
+            let sites = self.analysis.call_graph.sites_reaching(index);
+            let from_sites = if sites == callers.len() {
+                String::new()
+            } else {
+                format!(", from {sites} call sites")
+            };
             let _ = writeln!(
                 out,
-                "    ///\n    /// Called by {}: {}{}.",
+                "    ///\n    /// Called by {}: {}{}{from_sites}.",
                 callers.len(),
                 named.join(", "),
                 if callers.len() > NAMED { ", …" } else { "" }
@@ -1374,6 +1425,7 @@ impl<'a> Generator<'a> {
                     self.module,
                     &self.analysis,
                     &self.recognised,
+                    self.instrument,
                     func,
                     ty,
                     index,
@@ -1485,6 +1537,8 @@ struct Body<'a> {
     /// Names a signature catalogue recognised, so a call site spells the callee
     /// the same way its definition does.
     recognised: &'a std::collections::BTreeMap<u32, String>,
+    /// Whether writes report themselves to a watchpoint.
+    instrument: bool,
     /// This function's C stack frame, when it has one.
     frame: Option<&'a StackFrame>,
     func: &'a Func,
@@ -1509,6 +1563,7 @@ impl<'a> Body<'a> {
         module: &'a Module,
         analysis: &'a Analysis,
         recognised: &'a std::collections::BTreeMap<u32, String>,
+        instrument: bool,
         func: &'a Func,
         ty: &'a crate::module::FuncType,
         index: u32,
@@ -1517,6 +1572,7 @@ impl<'a> Body<'a> {
             module,
             analysis,
             recognised,
+            instrument,
             frame: analysis.frames.get(&index),
             func,
             ty,
@@ -1535,6 +1591,21 @@ impl<'a> Body<'a> {
 
     fn location(&self) -> String {
         format!("function #{}", self.index)
+    }
+
+    /// The opening of a call to a memory write: `store32(` normally, and
+    /// `store32_at(7, ` when the output is instrumented.
+    ///
+    /// The site is the function index, which is what `names.json` looks a
+    /// function up by. Every write goes through this, `memory.fill` included —
+    /// a `memset` is the usual answer to "who zeroed this address", and it is
+    /// not a store.
+    fn write_call(&self, method: &str) -> String {
+        if self.instrument {
+            format!("{method}_at({}, ", self.index)
+        } else {
+            format!("{method}(")
+        }
     }
 
     fn emit(mut self) -> Result<String> {
@@ -1994,8 +2065,9 @@ impl<'a> Body<'a> {
                 self.spill_operands(&mut values);
                 self.spill_stack();
                 let (method, cast) = store_method(*kind);
+                let call = self.write_call(method);
                 self.line(&format!(
-                    "self.memory.{method}({}, {}, {}{cast});",
+                    "self.memory.{call}{}, {}, {}{cast});",
                     values[0].code, mem.offset, values[1].code
                 ));
             }
@@ -2013,8 +2085,9 @@ impl<'a> Body<'a> {
                 let mut values = self.pop_n(3)?;
                 self.spill_operands(&mut values);
                 self.spill_stack();
+                let call = self.write_call("fill");
                 self.line(&format!(
-                    "self.memory.fill({}, {}, {});",
+                    "self.memory.{call}{}, {}, {});",
                     values[0].code, values[1].code, values[2].code
                 ));
             }
@@ -2022,8 +2095,9 @@ impl<'a> Body<'a> {
                 let mut values = self.pop_n(3)?;
                 self.spill_operands(&mut values);
                 self.spill_stack();
+                let call = self.write_call("copy");
                 self.line(&format!(
-                    "self.memory.copy({}, {}, {});",
+                    "self.memory.{call}{}, {}, {});",
                     values[0].code, values[1].code, values[2].code
                 ));
             }
@@ -2038,8 +2112,9 @@ impl<'a> Body<'a> {
                 self.line(&format!(
                     "let segment: &[u8] = if self.data_dropped[{segment}] {{ &[] }} else {{ DATA_{segment} }};"
                 ));
+                let call = self.write_call("init");
                 self.line(&format!(
-                    "self.memory.init({}, segment, {}, {});",
+                    "self.memory.{call}{}, segment, {}, {});",
                     values[0].code, values[1].code, values[2].code
                 ));
             }
@@ -2104,8 +2179,9 @@ impl<'a> Body<'a> {
                 let mut values = self.pop_n(2)?;
                 self.spill_operands(&mut values);
                 self.spill_stack();
+                let call = self.write_call("atomic_store");
                 self.line(&format!(
-                    "self.memory.atomic_store({}, {offset}, {width}, {}{cast_in});",
+                    "self.memory.{call}{}, {offset}, {width}, {}{cast_in});",
                     values[0].code, values[1].code
                 ));
             }
@@ -2113,9 +2189,10 @@ impl<'a> Body<'a> {
                 let mut values = self.pop_n(2)?;
                 self.spill_operands(&mut values);
                 self.spill_stack();
+                let call = self.write_call("atomic_rmw");
                 self.push_temp(
                     &format!(
-                        "self.memory.atomic_rmw({}, {offset}, {width}, rt::Rmw::{}, {}{cast_in}){cast_out}",
+                        "self.memory.{call}{}, {offset}, {width}, rt::Rmw::{}, {}{cast_in}){cast_out}",
                         values[0].code,
                         kind.rt_name(),
                         values[1].code
@@ -2127,9 +2204,10 @@ impl<'a> Body<'a> {
                 let mut values = self.pop_n(3)?;
                 self.spill_operands(&mut values);
                 self.spill_stack();
+                let call = self.write_call("atomic_cmpxchg");
                 self.push_temp(
                     &format!(
-                        "self.memory.atomic_cmpxchg({}, {offset}, {width}, {}{cast_in}, {}{cast_in}){cast_out}",
+                        "self.memory.{call}{}, {offset}, {width}, {}{cast_in}, {}{cast_in}){cast_out}",
                         values[0].code, values[1].code, values[2].code
                     ),
                     result,
@@ -2458,6 +2536,31 @@ fn frame_summary(frame: &StackFrame) -> String {
             "    /// The address leaves this function, so the slots below are only\n    /// the accesses this analysis could follow — not the whole frame."
         );
     }
+    let outside = frame.writes_outside();
+    if !outside.is_empty() {
+        // The one thing in this summary that is a finding rather than a
+        // description. A store past the end of the frame lands in the caller's,
+        // and nothing else in the output would say so.
+        let _ = writeln!(
+            out,
+            "    /// **Writes outside its own frame**: {}. A store at or past\n    /// {} bytes lands in the caller's frame.",
+            outside
+                .iter()
+                .map(|(offset, width)| format!("`frame + {offset}` ({width} bytes)"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            frame.size
+        );
+    }
+    if frame.computed_writes > 0 {
+        let _ = writeln!(
+            out,
+            "    /// {} write{} go through an address computed from the frame at run\n    /// time — an indexed array. Whether they stay inside {} bytes is not\n    /// something this can say.",
+            frame.computed_writes,
+            if frame.computed_writes == 1 { "" } else { "s" },
+            frame.size
+        );
+    }
     if frame.slots.is_empty() {
         let _ = writeln!(out, "    /// No slot accesses were resolved.");
         return out;
@@ -2771,6 +2874,7 @@ mod tests {
             slots: std::collections::BTreeMap::new(),
             escapes: true,
             publishes: true,
+            computed_writes: 0,
         });
         assert!(
             summary.contains("No slot accesses were resolved"),

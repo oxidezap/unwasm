@@ -4,6 +4,7 @@
 //! has two verbs, and a decompiler that takes ten seconds to rebuild is a
 //! decompiler nobody runs twice.
 
+use std::fmt::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -18,6 +19,7 @@ usage:
   unwasm table     <module.wasm> [--type <signature>]
   unwasm calls     <module.wasm> <index>
   unwasm signatures <module.wasm> [-o <sigs.txt>]
+  unwasm frames    <module.wasm> [--outside]
   unwasm inspect   <module.wasm>
 
   -o <out>       a path ending in .rs writes one file; any other path is a
@@ -27,7 +29,10 @@ usage:
                  directory. Without it, a directory gets the layout the
                  module's size calls for.
   --signatures <file>  name library code using a catalogue from `signatures`.
-  --only <list>  decompile only these function indices, comma-separated. The
+  --only <list>  decompile only these function indices
+  --with-callees  and everything they call directly
+  --instrument-stores  route every memory write through the watchpoint runtime,
+                 so `instance.memory.watch(addr, len)` reports who wrote it, comma-separated. The
                  rest keep their signatures and become `unimplemented!()`, so
                  the result still compiles - for reading three functions out of
                  thirteen thousand without producing 365 MB.
@@ -48,6 +53,10 @@ things that move between builds left out. It matches ~91% across builds of the
 same toolchain and only a handful across different emscripten versions, so it
 is worth generating from a build of your own rather than expecting it to
 recognise someone else's.
+
+`frames --outside` lists the functions whose stores land past the end of their
+own stack frame — an overrun of a local array writes into the caller's frame,
+and this is the short list of suspects when an address is being corrupted.
 
 `calls` answers the question a call site cannot: what reaches this function.
 The module says what each function calls; nothing in it says what calls a given
@@ -90,6 +99,7 @@ fn run(arguments: &[String]) -> Result<String, String> {
         Some("table") => table(&arguments[1..]),
         Some("calls") => calls(&arguments[1..]),
         Some("signatures") => signatures(&arguments[1..]),
+        Some("frames") => frames(&arguments[1..]),
         Some("inspect") => inspect(&arguments[1..]),
         Some("-h" | "--help" | "help") | None => Ok(USAGE.to_string()),
         Some(other) => Err(format!("unknown command `{other}`\n\n{USAGE}")),
@@ -102,6 +112,8 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
     let mut split = None;
     let mut only: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let mut catalogue: Option<codegen::Signatures> = None;
+    let mut with_callees = false;
+    let mut instrument = false;
     let mut rest = arguments[1..].iter();
     while let Some(argument) = rest.next() {
         match argument.as_str() {
@@ -120,6 +132,8 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
                 let value = rest.next().ok_or("--signatures needs a path")?;
                 catalogue = Some(read_signatures(value)?);
             }
+            "--with-callees" => with_callees = true,
+            "--instrument-stores" => instrument = true,
             "--only" => {
                 let value = rest.next().ok_or("--only needs a list of indices")?;
                 for part in value.split(',').filter(|part| !part.is_empty()) {
@@ -138,18 +152,39 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
     }
 
     let module = read(path)?;
+    if with_callees {
+        if only.is_empty() {
+            return Err("--with-callees expands --only, so it needs one".to_string());
+        }
+        // One level, because that is the one you always want: reading a
+        // function and needing the next is the same minute; needing the whole
+        // transitive closure is the whole module again.
+        let analysis = unwasm_core::analysis::analyse(&module);
+        let import_count = module.func_imports.len() as u32;
+        let callees: Vec<u32> = only
+            .iter()
+            .flat_map(|index| analysis.call_graph.calls_from(*index).iter().copied())
+            // An import has no body to decompile; its thunk is emitted anyway.
+            .filter(|callee| *callee >= import_count)
+            .collect();
+        only.extend(callees);
+    }
+
     let Some(destination) = destination else {
         if split.is_some() {
             return Err("--split writes several files, so it needs -o <directory>".to_string());
         }
-        if only.is_empty() && catalogue.is_none() {
+        if only.is_empty() && catalogue.is_none() && !instrument {
             return codegen::generate(&module).map_err(|error| error.to_string());
         }
-        let files = codegen::generate_with(
+        let files = codegen::generate_options(
             &module,
-            codegen::Layout::Single,
-            (!only.is_empty()).then_some(&only),
-            catalogue.as_ref().unwrap_or(&codegen::Signatures::new()),
+            &codegen::Options {
+                layout: codegen::Layout::Single,
+                only: (!only.is_empty()).then(|| only.clone()),
+                signatures: catalogue.clone().unwrap_or_default(),
+                instrument_stores: instrument,
+            },
         )
         .map_err(|error| error.to_string())?;
         return Ok(files[0].contents.clone());
@@ -168,11 +203,14 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
         }
     };
 
-    let files = codegen::generate_with(
+    let files = codegen::generate_options(
         &module,
-        layout,
-        (!only.is_empty()).then_some(&only),
-        catalogue.as_ref().unwrap_or(&codegen::Signatures::new()),
+        &codegen::Options {
+            layout,
+            only: (!only.is_empty()).then(|| only.clone()),
+            signatures: catalogue.unwrap_or_default(),
+            instrument_stores: instrument,
+        },
     )
     .map_err(|error| error.to_string())?;
     let lines: usize = files.iter().map(|file| file.contents.lines().count()).sum();
@@ -230,6 +268,60 @@ fn host(arguments: &[String]) -> Result<String, String> {
         }
         None => Ok(skeleton),
     }
+}
+
+fn frames(arguments: &[String]) -> Result<String, String> {
+    let path = arguments.first().ok_or("frames needs a module path")?;
+    let mut only_outside = false;
+    for argument in &arguments[1..] {
+        match argument.as_str() {
+            "--outside" => only_outside = true,
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+    }
+
+    let module = read(path)?;
+    let analysis = unwasm_core::analysis::analyse(&module);
+    let mut out = String::new();
+    let mut shown = 0;
+    for (index, frame) in &analysis.frames {
+        let outside = frame.writes_outside();
+        if only_outside && outside.is_empty() && frame.computed_writes == 0 {
+            continue;
+        }
+        shown += 1;
+        let name = codegen::function_ident(*index, &analysis);
+        let _ = writeln!(
+            out,
+            "{name:<28} {:>6} bytes  {} slots{}",
+            frame.size,
+            frame.slots.len(),
+            if frame.escapes {
+                "  (address escapes)"
+            } else {
+                ""
+            }
+        );
+        for (offset, width) in outside {
+            let _ = writeln!(out, "    writes frame + {offset} ({width} bytes) — outside");
+        }
+        if frame.computed_writes > 0 {
+            let _ = writeln!(
+                out,
+                "    {} writes through a computed frame address — offset unknown",
+                frame.computed_writes
+            );
+        }
+    }
+    let of = analysis.frames.len();
+    Ok(format!(
+        "{out}\n{shown} of {of} frames{}\n",
+        if only_outside {
+            " write outside themselves or through a computed address"
+        } else {
+            ""
+        }
+    ))
 }
 
 fn signatures(arguments: &[String]) -> Result<String, String> {
@@ -350,7 +442,12 @@ fn calls(arguments: &[String]) -> Result<String, String> {
         out.push_str(&format!("exported as: {}\n", export.name));
     }
 
-    out.push_str(&format!("\ncalled by {}:\n", callers.len()));
+    // Sites, not callers: patching a body measures whichever site ran.
+    let sites = analysis.call_graph.sites_reaching(index);
+    out.push_str(&format!(
+        "\ncalled by {} from {sites} call sites:\n",
+        callers.len()
+    ));
     for caller in callers {
         out.push_str(&describe(*caller));
     }

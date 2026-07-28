@@ -82,6 +82,40 @@ pub struct Frame {
     /// runs. A function that *does* publish is one that expects to call
     /// something — which is a fact about the function worth having.
     pub publishes: bool,
+    /// Stores through an address computed from the frame at run time.
+    ///
+    /// `frame + i * 4` with `i` unknown: an array in the frame, indexed. The
+    /// offset cannot be checked against the frame size, so this counts the
+    /// writes that *could* leave it and that no static check will ever catch.
+    /// Anyone hunting a corrupted address wants this list before the constant
+    /// one — a constant store past the end is a bug a compiler would have to
+    /// have emitted on purpose.
+    pub computed_writes: usize,
+}
+
+impl Frame {
+    /// The writes that land outside this frame, as `(offset, width)`.
+    ///
+    /// A store at `frame + 1168` in a function whose prologue reserved 1168
+    /// bytes is writing into its *caller's* frame — an overrun of a local
+    /// array, or an index one past the end. It is the shape of the bug that
+    /// otherwise costs a day of bisection, and the analysis already has every
+    /// number needed to spot it: the prologue said how big the frame is, and
+    /// the walk recorded where each store went.
+    ///
+    /// Reads are not reported. Reading past the end is how a compiler spells
+    /// "my caller left arguments up there" in some ABIs, and a list that
+    /// includes it stops being short enough to act on.
+    #[must_use]
+    pub fn writes_outside(&self) -> Vec<(i32, u32)> {
+        self.slots
+            .iter()
+            .filter(|(offset, slot)| {
+                slot.writes > 0 && (**offset < 0 || **offset + slot.width as i32 > self.size)
+            })
+            .map(|(offset, slot)| (*offset, slot.width))
+            .collect()
+    }
 }
 
 /// An `invoke_*` import that can be generated instead of asked of the host.
@@ -226,6 +260,15 @@ pub struct CallGraph {
     /// the two apart is the difference between "calls this" and "could call
     /// anything with this shape".
     pub calls_indirectly: std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>>,
+    /// For each function, how many call *sites* reach it.
+    ///
+    /// Not the same number as `called_by.len()`, and the difference is what
+    /// makes it worth keeping: one caller that calls a function in a loop body
+    /// forty times is one entry in `called_by` and forty sites. Instrumenting
+    /// a shared function's body measures whichever site happened to run, so
+    /// the count is the warning that a body patch will answer the wrong
+    /// question.
+    pub call_sites: std::collections::BTreeMap<u32, usize>,
 }
 
 impl CallGraph {
@@ -235,6 +278,12 @@ impl CallGraph {
         static EMPTY: std::sync::LazyLock<std::collections::BTreeSet<u32>> =
             std::sync::LazyLock::new(Default::default);
         self.calls.get(&func).unwrap_or(&EMPTY)
+    }
+
+    /// How many call sites reach this function.
+    #[must_use]
+    pub fn sites_reaching(&self, func: u32) -> usize {
+        self.call_sites.get(&func).copied().unwrap_or_default()
     }
 
     /// The functions that call this one directly.
@@ -375,6 +424,7 @@ fn read_call_graph(module: &Module) -> CallGraph {
                 Op::Call(callee) => {
                     graph.calls.entry(caller).or_default().insert(*callee);
                     graph.called_by.entry(*callee).or_default().insert(caller);
+                    *graph.call_sites.entry(*callee).or_default() += 1;
                 }
                 Op::CallIndirect { type_index } => {
                     graph
@@ -1043,6 +1093,14 @@ fn find_frames(
 enum Tracked {
     /// The frame base plus a constant.
     Frame(i32),
+    /// The frame base plus something that is not a constant — an index into an
+    /// array that lives in the frame, computed at run time.
+    ///
+    /// The offset is unknown, so nothing can be said about whether it stays
+    /// inside the frame. Keeping it apart from `Other` is what lets a store
+    /// through it be counted: that is the write that overruns an array, and it
+    /// is invisible to a check that only knows constant offsets.
+    Derived,
     /// A constant.
     Const(i32),
     /// Anything else.
@@ -1066,6 +1124,7 @@ fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame>
         slots: std::collections::BTreeMap::new(),
         escapes: false,
         publishes: prologue.publishes,
+        computed_writes: 0,
     };
 
     let mut stack: Vec<Tracked> = Vec::new();
@@ -1098,10 +1157,15 @@ fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame>
                     | (Tracked::Const(k), Tracked::Frame(at)) => Tracked::Frame(at + k),
                     (Tracked::Const(a), Tracked::Const(b)) => Tracked::Const(a.wrapping_add(b)),
                     (left, right) => {
-                        if matches!(left, Tracked::Frame(_)) || matches!(right, Tracked::Frame(_)) {
+                        if matches!(left, Tracked::Frame(_) | Tracked::Derived)
+                            || matches!(right, Tracked::Frame(_) | Tracked::Derived)
+                        {
+                            // Still the frame, at an offset nobody knows.
                             frame.escapes = true;
+                            Tracked::Derived
+                        } else {
+                            Tracked::Other
                         }
-                        Tracked::Other
                     }
                 };
                 stack.push(sum);
@@ -1130,6 +1194,9 @@ fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame>
                     let slot = frame.slots.entry(offset).or_default();
                     slot.width = slot.width.max(width_of_store(*kind));
                     slot.writes += 1;
+                }
+                if matches!(address, Tracked::Derived) {
+                    frame.computed_writes += 1;
                 }
             }
 
@@ -1787,6 +1854,78 @@ mod tests {
         assert_eq!(frame.base_local, 1);
         assert!(!frame.escapes);
         assert!(frame.slots.is_empty());
+    }
+
+    #[test]
+    fn a_store_past_the_end_of_the_frame_is_reported() {
+        let mut body = frame_prologue(32, 0);
+        // frame[28] is the last word inside a 32-byte frame; frame[32] is the
+        // first one in the caller's.
+        body.extend([Op::LocalGet(0), Op::I32Const(1), store(28)]);
+        body.extend([Op::LocalGet(0), Op::I32Const(1), store(32)]);
+        let frame = frame_of(body);
+        assert_eq!(frame.writes_outside(), vec![(32, 4)]);
+    }
+
+    #[test]
+    fn a_store_straddling_the_end_of_the_frame_is_reported() {
+        // The off-by-one a comparison of the start address alone would miss:
+        // the last byte of this store is outside.
+        let mut body = frame_prologue(32, 0);
+        body.extend([Op::LocalGet(0), Op::I32Const(1), store(30)]);
+        assert_eq!(frame_of(body).writes_outside(), vec![(30, 4)]);
+    }
+
+    #[test]
+    fn reading_past_the_end_of_the_frame_is_not_reported() {
+        // Some ABIs put the caller's arguments up there, so a list that
+        // included reads would not be short enough to act on.
+        let mut body = frame_prologue(32, 0);
+        body.extend([Op::LocalGet(0), load(48), Op::Drop]);
+        let frame = frame_of(body);
+        assert!(frame.writes_outside().is_empty());
+        assert!(frame.slots.contains_key(&48), "it is still a slot");
+    }
+
+    #[test]
+    fn a_store_inside_the_frame_is_not_reported() {
+        let mut body = frame_prologue(32, 0);
+        body.extend([Op::LocalGet(0), Op::I32Const(1), store(28)]);
+        assert!(frame_of(body).writes_outside().is_empty());
+    }
+
+    #[test]
+    fn a_store_through_a_computed_frame_address_is_counted_separately() {
+        // `frame + n` with `n` unknown: an indexed array in the frame. The
+        // offset cannot be checked, and this is the count that says so.
+        let mut body = frame_prologue(32, 0);
+        body.extend([
+            Op::LocalGet(0),
+            Op::LocalGet(1),
+            Op::Num(NumOp::I32Add),
+            Op::I32Const(1),
+            store(0),
+        ]);
+        let frame = frame_of(body);
+        assert_eq!(frame.computed_writes, 1);
+        assert!(frame.escapes, "an offset nobody knows is still an escape");
+        assert!(
+            frame.writes_outside().is_empty(),
+            "and it is not claimed to be outside, because nobody knows"
+        );
+    }
+
+    #[test]
+    fn arithmetic_that_never_touched_the_frame_is_not_a_computed_write() {
+        let mut body = frame_prologue(32, 0);
+        body.extend([
+            Op::LocalGet(1),
+            Op::LocalGet(2),
+            Op::Num(NumOp::I32Add),
+            Op::I32Const(1),
+            store(0),
+        ]);
+        assert_eq!(frame_of(body).computed_writes, 0);
     }
 
     #[test]

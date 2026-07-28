@@ -26,6 +26,53 @@ pub fn trap(message: &str) -> ! {
 /// Bytes in a wasm page.
 pub const PAGE_SIZE: usize = 65536;
 
+/// One write to a watched address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hit {
+    /// The function that did it, by index.
+    pub site: u32,
+    /// The address written, after the static offset was added.
+    pub address: i32,
+    /// How many bytes it wrote.
+    pub bytes: u32,
+    /// Which write it was: `memory.fill` and a plain store look alike in a
+    /// hit list otherwise, and a `memset` is the usual answer to "who zeroed
+    /// this".
+    pub kind: WriteKind,
+}
+
+/// What kind of write a [`Hit`] records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteKind {
+    /// An `i32.store`, `f64.store`, and so on.
+    Store,
+    /// `memory.fill` — what a `memset` compiles to.
+    Fill,
+    /// `memory.copy` — a `memcpy` or `memmove`.
+    Copy,
+    /// `memory.init`, placing a data segment.
+    Init,
+    /// An atomic store or read-modify-write.
+    Atomic,
+}
+
+/// Addresses to report writes to.
+///
+/// A decompiled module *runs*, which makes "who writes to 0x24bed0?" a question
+/// the machine can answer instead of one answered by patching bytecode and
+/// re-running. Set a range, run, and every write to it is recorded with the
+/// function that did it; set `stop` and the first one panics, so the backtrace
+/// is the guest's own call chain.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Watchpoints {
+    /// Half-open `[from, to)` ranges, compared as unsigned addresses.
+    pub ranges: Vec<(u32, u32)>,
+    /// Every write that landed in one, in the order they happened.
+    pub hits: Vec<Hit>,
+    /// Panic on the first hit rather than recording and carrying on.
+    pub stop: bool,
+}
+
 /// A wasm linear memory: a byte vector, bounds-checked on every access.
 ///
 /// No `unsafe`, no raw pointers. A decompiler that needs them to model a
@@ -37,6 +84,10 @@ pub struct Memory {
     pub data: Vec<u8>,
     /// Page limit from the module's memory type, if it declared one.
     pub max_pages: Option<u32>,
+    /// Where writes are being watched. Empty unless a host asks, and every
+    /// `*_at` method is a no-op then, which is why instrumented output can be
+    /// run without paying for it.
+    pub watch: Watchpoints,
 }
 
 impl Memory {
@@ -46,7 +97,149 @@ impl Memory {
         Self {
             data: vec![0; min_pages as usize * PAGE_SIZE],
             max_pages,
+            watch: Watchpoints::default(),
         }
+    }
+
+    /// Watches `bytes` bytes from `address`.
+    ///
+    /// Only output generated with store instrumentation reports anything: the
+    /// plain output calls `store32` rather than `store32_at`, and there is
+    /// nowhere for a hit to come from.
+    pub fn watch(&mut self, address: i32, bytes: i32) {
+        let from = address as u32;
+        self.watch
+            .ranges
+            .push((from, from.wrapping_add(bytes as u32)));
+    }
+
+    /// The writes to watched addresses so far.
+    #[must_use]
+    pub fn hits(&self) -> &[Hit] {
+        &self.watch.hits
+    }
+
+    /// Records a write that has already happened, if anyone is watching it.
+    ///
+    /// After rather than before, so a store that trapped is not reported as a
+    /// write that never landed.
+    ///
+    /// # Panics
+    ///
+    /// If `watch.stop` is set and the write is watched. That is the point: the
+    /// panic carries the site and the address, and the backtrace carries the
+    /// call chain that reached it.
+    fn note(&mut self, site: u32, addr: i32, offset: u64, bytes: u64, kind: WriteKind) {
+        if self.watch.ranges.is_empty() {
+            return;
+        }
+        let start = u64::from(addr as u32) + offset;
+        let end = start + bytes;
+        let watched = self
+            .watch
+            .ranges
+            .iter()
+            .any(|(from, to)| start < u64::from(*to) && end > u64::from(*from));
+        if !watched {
+            return;
+        }
+        let hit = Hit {
+            site,
+            address: start as u32 as i32,
+            bytes: bytes as u32,
+            kind,
+        };
+        self.watch.hits.push(hit);
+        if self.watch.stop {
+            panic!(
+                "watchpoint: function #{site} wrote {bytes} bytes at {:#x} ({:?})",
+                start, kind
+            );
+        }
+    }
+
+    /// `i32.store8` / `i64.store8`, reporting to any watchpoint.
+    pub fn store8_at(&mut self, site: u32, addr: i32, offset: u64, value: i64) {
+        self.store8(addr, offset, value);
+        self.note(site, addr, offset, 1, WriteKind::Store);
+    }
+    /// `i32.store16` / `i64.store16`, reporting to any watchpoint.
+    pub fn store16_at(&mut self, site: u32, addr: i32, offset: u64, value: i64) {
+        self.store16(addr, offset, value);
+        self.note(site, addr, offset, 2, WriteKind::Store);
+    }
+    /// `i32.store` / `i64.store32`, reporting to any watchpoint.
+    pub fn store32_at(&mut self, site: u32, addr: i32, offset: u64, value: i64) {
+        self.store32(addr, offset, value);
+        self.note(site, addr, offset, 4, WriteKind::Store);
+    }
+    /// `i64.store`, reporting to any watchpoint.
+    pub fn store64_at(&mut self, site: u32, addr: i32, offset: u64, value: i64) {
+        self.store64(addr, offset, value);
+        self.note(site, addr, offset, 8, WriteKind::Store);
+    }
+    /// `f32.store`, reporting to any watchpoint.
+    pub fn store_f32_at(&mut self, site: u32, addr: i32, offset: u64, value: f32) {
+        self.store_f32(addr, offset, value);
+        self.note(site, addr, offset, 4, WriteKind::Store);
+    }
+    /// `f64.store`, reporting to any watchpoint.
+    pub fn store_f64_at(&mut self, site: u32, addr: i32, offset: u64, value: f64) {
+        self.store_f64(addr, offset, value);
+        self.note(site, addr, offset, 8, WriteKind::Store);
+    }
+    /// `memory.fill`, reporting to any watchpoint. This is the one that
+    /// answers "who zeroed it": a `memset` is a fill, not a store.
+    pub fn fill_at(&mut self, site: u32, addr: i32, value: i32, len: i32) {
+        self.fill(addr, value, len);
+        self.note(site, addr, 0, u64::from(len as u32), WriteKind::Fill);
+    }
+    /// `memory.copy`, reporting to any watchpoint on the destination.
+    pub fn copy_at(&mut self, site: u32, dst: i32, src: i32, len: i32) {
+        self.copy(dst, src, len);
+        self.note(site, dst, 0, u64::from(len as u32), WriteKind::Copy);
+    }
+    /// `memory.init`, reporting to any watchpoint on the destination.
+    pub fn init_at(&mut self, site: u32, dst: i32, segment: &[u8], src: i32, len: i32) {
+        self.init(dst, segment, src, len);
+        self.note(site, dst, 0, u64::from(len as u32), WriteKind::Init);
+    }
+    /// An atomic store, reporting to any watchpoint.
+    pub fn atomic_store_at(&mut self, site: u32, addr: i32, offset: u64, bytes: u32, value: i64) {
+        self.atomic_store(addr, offset, bytes, value);
+        self.note(site, addr, offset, u64::from(bytes), WriteKind::Atomic);
+    }
+    /// An atomic read-modify-write, reporting to any watchpoint.
+    pub fn atomic_rmw_at(
+        &mut self,
+        site: u32,
+        addr: i32,
+        offset: u64,
+        bytes: u32,
+        op: Rmw,
+        value: i64,
+    ) -> i64 {
+        let old = self.atomic_rmw(addr, offset, bytes, op, value);
+        self.note(site, addr, offset, u64::from(bytes), WriteKind::Atomic);
+        old
+    }
+    /// An atomic compare-and-exchange, reporting to any watchpoint.
+    ///
+    /// Reported whether or not the exchange happened: "something looked at
+    /// this address and might have written it" is the useful signal, and a
+    /// comparison that failed is exactly the case a reader wants to see.
+    pub fn atomic_cmpxchg_at(
+        &mut self,
+        site: u32,
+        addr: i32,
+        offset: u64,
+        bytes: u32,
+        expected: i64,
+        replacement: i64,
+    ) -> i64 {
+        let old = self.atomic_cmpxchg(addr, offset, bytes, expected, replacement);
+        self.note(site, addr, offset, u64::from(bytes), WriteKind::Atomic);
+        old
     }
 
     /// `memory.size`: the current size in pages.
@@ -694,6 +887,108 @@ mod tests {
             memory: &mut memory,
         };
         let _ = caller.cstring(0);
+    }
+
+    #[test]
+    fn nothing_is_watched_until_a_host_asks() {
+        let mut memory = Memory::new(1, None);
+        memory.store32_at(7, 0, 0, 1);
+        memory.fill_at(7, 0, 0, 4);
+        assert!(memory.hits().is_empty());
+    }
+
+    #[test]
+    fn a_watched_write_records_who_did_it_and_what_kind_it_was() {
+        let mut memory = Memory::new(1, None);
+        memory.watch(0x100, 4);
+        memory.store32_at(11, 0x100, 0, 42);
+        memory.store8_at(12, 0x102, 0, 1);
+        memory.store16_at(13, 0x102, 0, 1);
+        memory.store64_at(14, 0x0FC, 0, 1);
+        memory.store_f32_at(15, 0x100, 0, 1.0);
+        memory.store_f64_at(16, 0x100, 0, 1.0);
+        memory.fill_at(17, 0x100, 0, 4);
+        memory.copy_at(18, 0x100, 0, 4);
+        memory.init_at(19, 0x100, b"abcd", 0, 4);
+        assert_eq!(
+            memory
+                .hits()
+                .iter()
+                .map(|hit| (hit.site, hit.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (11, WriteKind::Store),
+                (12, WriteKind::Store),
+                (13, WriteKind::Store),
+                (14, WriteKind::Store),
+                (15, WriteKind::Store),
+                (16, WriteKind::Store),
+                (17, WriteKind::Fill),
+                (18, WriteKind::Copy),
+                (19, WriteKind::Init),
+            ]
+        );
+        assert_eq!(memory.hits()[0].address, 0x100);
+        assert_eq!(memory.hits()[0].bytes, 4);
+        // The i64 store starts below the range and runs into it, which is the
+        // case a check comparing only the start address misses. A store that
+        // *ends* exactly at 0x100 is not a hit, which is why this one is at
+        // 0xFC rather than 0xF8.
+        assert_eq!(memory.hits()[3].address, 0x0FC);
+    }
+
+    #[test]
+    fn a_write_beside_the_range_is_not_a_hit() {
+        let mut memory = Memory::new(1, None);
+        memory.watch(0x100, 4);
+        memory.store32_at(1, 0x0FC, 0, 1);
+        memory.store32_at(2, 0x104, 0, 1);
+        // The static offset counts towards the address, or an instrumented
+        // `store offset=4` would be attributed to the wrong place.
+        memory.store32_at(3, 0x0FC, 4, 1);
+        assert_eq!(
+            memory.hits().iter().map(|hit| hit.site).collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(memory.hits()[0].address, 0x100);
+    }
+
+    #[test]
+    fn an_atomic_write_is_reported_and_says_it_was_atomic() {
+        let mut memory = Memory::new(1, None);
+        memory.watch(0x200, 4);
+        memory.atomic_store_at(1, 0x200, 0, 4, 7);
+        assert_eq!(memory.atomic_rmw_at(2, 0x200, 0, 4, Rmw::Add, 1), 7);
+        // Reported even though the comparison fails and nothing is written:
+        // "something looked at this and might have written it" is the signal.
+        assert_eq!(memory.atomic_cmpxchg_at(3, 0x200, 0, 4, 99, 1), 8);
+        assert_eq!(memory.load32(0x200, 0), 8);
+        assert_eq!(memory.hits().len(), 3);
+        assert!(
+            memory
+                .hits()
+                .iter()
+                .all(|hit| hit.kind == WriteKind::Atomic)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "watchpoint: function #5 wrote 4 bytes at 0x100")]
+    fn stopping_on_a_hit_panics_where_the_write_happened() {
+        let mut memory = Memory::new(1, None);
+        memory.watch(0x100, 4);
+        memory.watch.stop = true;
+        memory.store32_at(5, 0x100, 0, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds memory access")]
+    fn a_store_that_traps_is_not_reported_as_a_write() {
+        // Noted after the write, not before, so nothing that did not happen is
+        // ever in the list.
+        let mut memory = Memory::new(1, None);
+        memory.watch(0, 4);
+        memory.store32_at(1, (PAGE_SIZE - 2) as i32, 0, 1);
     }
 
     #[test]

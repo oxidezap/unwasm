@@ -312,3 +312,104 @@ fn the_index_carries_the_call_graph() {
     assert!(json.contains(r#""called_by": [1]"#), "{json}");
     common::assert_valid_json(json);
 }
+
+// ---- what the doc comment warns about ----
+
+#[test]
+fn a_shared_function_says_how_many_sites_call_it_not_just_how_many_callers() {
+    // The difference is the whole point: patching or instrumenting a shared
+    // body measures whichever site happened to run, and a caller that calls in
+    // a loop body is one caller and many sites.
+    let wasm = common::assemble(
+        "sites",
+        r#"(module
+            (func $shared (param i32) (result i32) local.get 0)
+            (func (export "caller") (param i32) (result i32)
+                local.get 0 call $shared
+                call $shared
+                call $shared))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let graph = analysis::analyse(&module).call_graph;
+    assert_eq!(graph.callers_of(0).len(), 1);
+    assert_eq!(graph.sites_reaching(0), 3);
+    assert_eq!(graph.sites_reaching(1), 0, "nothing calls the caller");
+
+    let code = common::decompile(&wasm);
+    assert!(code.contains("from 3 call sites"), "{code}");
+
+    let files = codegen::generate_files(&module, codegen::Layout::Single).expect("generates");
+    let json = &files
+        .iter()
+        .find(|file| file.name == "names.json")
+        .expect("present")
+        .contents;
+    assert!(json.contains(r#""call_sites": 3"#), "{json}");
+    common::assert_valid_json(json);
+}
+
+#[test]
+fn one_caller_calling_once_does_not_say_the_same_thing_twice() {
+    let wasm = common::assemble(
+        "sites-once",
+        r#"(module
+            (func $once (result i32) i32.const 1)
+            (func (export "caller") (result i32) call $once))"#,
+    );
+    let code = common::decompile(&wasm);
+    assert!(code.contains("Called by 1: `f1`."), "{code}");
+    assert!(!code.contains("call sites"), "{code}");
+}
+
+/// A function whose prologue reserves 32 bytes and that writes 32 bytes in.
+const OVERRUN: &str = r#"(module
+    (memory (export "memory") 1)
+    (global $sp (export "__stack_pointer") (mut i32) (i32.const 65536))
+    (func (export "overrun") (local i32)
+        global.get $sp i32.const 32 i32.sub local.tee 0 global.set $sp
+        ;; inside
+        local.get 0 i32.const 1 i32.store offset=28
+        ;; and one word past the end, which is the caller's frame
+        local.get 0 i32.const 1 i32.store offset=32
+        local.get 0 i32.const 32 i32.add global.set $sp))"#;
+
+#[test]
+fn a_write_past_the_end_of_the_frame_is_called_out_in_the_output() {
+    let wasm = common::assemble("overrun", OVERRUN);
+    let module = Module::parse(&wasm).expect("valid");
+    let frame = &analysis::analyse(&module).frames[&0];
+    assert_eq!(frame.writes_outside(), vec![(32, 4)]);
+
+    let code = common::decompile(&wasm);
+    assert!(code.contains("Writes outside its own frame"), "{code}");
+    assert!(code.contains("`frame + 32` (4 bytes)"), "{code}");
+    assert!(
+        code.contains("lands in the caller's frame"),
+        "and says why that matters:\n{code}"
+    );
+}
+
+#[test]
+fn a_write_through_a_computed_frame_address_says_it_cannot_be_checked() {
+    let wasm = common::assemble(
+        "computed",
+        r#"(module
+            (memory (export "memory") 1)
+            (global $sp (export "__stack_pointer") (mut i32) (i32.const 65536))
+            (func (export "indexed") (param i32) (local i32)
+                global.get $sp i32.const 32 i32.sub local.tee 1 global.set $sp
+                ;; frame + i: an array in the frame, indexed at run time
+                local.get 1 local.get 0 i32.add
+                i32.const 7 i32.store
+                local.get 1 i32.const 32 i32.add global.set $sp))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    assert_eq!(analysis::analyse(&module).frames[&0].computed_writes, 1);
+
+    let code = common::decompile(&wasm);
+    assert!(code.contains("computed from the frame at run"), "{code}");
+    assert!(
+        code.contains("not\n    /// something this can say"),
+        "{code}"
+    );
+}

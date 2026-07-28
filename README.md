@@ -376,6 +376,54 @@ Each function carries the same in its doc comment, and a function nothing calls
 says which kind of nothing: exported, reached only through the table, or
 neither — an entry point or dead code.
 
+The *sites* are counted as well as the callers, and the difference is the point:
+one caller that calls from a loop body is one caller and many sites. A function
+reached from 58 sites is one whose body must not be instrumented to answer a
+question about one of them — the measurement would be of whichever site ran.
+
+**`--instrument-stores`** turns "who wrote this address?" from a day into a
+run. The output executes, so the question is one the machine can answer:
+
+```console
+$ unwasm decompile voip.wasm -o out/ --instrument-stores
+```
+
+```rust
+instance.memory.watch(0x24bed0, 4);
+instance.memory.watch.stop = true;   // or leave it off and read memory.hits()
+instance.start();
+// panicked at 'watchpoint: function #10284 wrote 4 bytes at 0x24bed0 (Fill)'
+```
+
+Every write goes through the check — including `memory.fill` and
+`memory.copy`, since a `memset` is the usual answer to "who zeroed it" and it
+is not a store. A hit records the function that did it, the address, the width
+and which kind of write it was; `stop` panics at the write instead, so the
+backtrace is the guest's own call chain. Nothing is watched until a host asks,
+and the plain output does not route through the check at all.
+
+**`unwasm frames --outside`** is the static half of the same question. The
+prologue says how big the frame is and the walk records where each store went,
+so a store at or past the end — an overrun into the caller's frame — is a
+finding the analysis already has the numbers for:
+
+```console
+$ unwasm frames voip.wasm --outside
+f10284                          1168 bytes  47 slots  (address escapes)
+    1 writes through a computed frame address — offset unknown
+…
+226 of 4375 frames write outside themselves or through a computed address
+```
+
+Constant overruns are rare — zero in the VoIP module, since a compiler would
+have to emit one on purpose. What the list is really for is the second line:
+an indexed write into a frame array, whose offset is not knowable statically.
+226 of 4375 is a short enough list to read.
+
+**`--only … --with-callees`** brings the functions a function calls along with
+it. One level, not the transitive closure: reading a function and needing the
+next is the same minute, and needing the whole closure is the whole module.
+
 **`unwasm table`** answers the question a call site cannot: `call_indirect`
 takes a *table* index, not a function index.
 
