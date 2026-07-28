@@ -135,6 +135,12 @@ a module, decompiles it, builds the result with rustc, and runs both sides:
 - **C fixtures at every optimisation level** (`tests/differential.rs`), `-O0`
   through `-Oz`, since `-O0` keeps everything in the shadow stack and `-Oz`
   restructures the control flow.
+- **Emscripten modules** (`tests/emscripten.rs`), built by the toolchain the
+  captured modules were built with. These run its real libc — `malloc`, `free`,
+  `memcpy`, `strlen` — its libm, and C++ virtual dispatch, where the vtable
+  lands in an element segment and the call goes through `call_indirect`. Tens of
+  thousands of instructions the fixtures never reach, and they agreed on the
+  first run.
 - **Modules that decode but do not add up** (`tests/malformed.rs`), built byte
   by byte, to pin that each one is refused by name.
 
@@ -160,6 +166,7 @@ those are compared as `nan`, not as bits.
 ```sh
 cargo test --workspace                                  # 178 tests, ~15s
 cargo test --test captured -- --ignored --nocapture     # the real modules
+cargo test --test emscripten -- --ignored --nocapture   # the real toolchain
 cargo clippy --workspace --all-targets -- -D warnings
 cargo llvm-cov --workspace --summary-only
 ```
@@ -168,6 +175,12 @@ The harness needs `node` (the reference engine), `clang` (wasm32 fixtures),
 `wasm-tools` (wat assembly) and `rustc`. A missing tool **fails** the tests
 rather than skipping them: a run that compared nothing must not report the same
 green as a run that compared everything.
+
+`emcc` is needed only by the `#[ignore]`d Emscripten tests. On Arch the
+`emscripten` package provides it — note that it replaces `binaryen`, which it
+also provides, and puts `emcc` in `/usr/lib/emscripten`; the harness looks
+there as well as on `PATH`, since the packaged `profile.d` entry only reaches
+shells started afterwards.
 
 ### Coverage
 

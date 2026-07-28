@@ -11,10 +11,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo llvm-cov --workspace --summary-only
 cargo test --test captured -- --ignored --nocapture   # the real modules
+cargo test --test emscripten -- --ignored --nocapture # the real toolchain
 ```
 
 The harness shells out to `node`, `clang`, `wasm-tools` and `rustc`. All four
 are required; a missing one fails the tests rather than skipping them.
+
+`emcc` is needed only by `tests/emscripten.rs`. It is found on `PATH` or at
+`/usr/lib/emscripten/emcc`, because the Arch package's `profile.d` entry only
+reaches shells started after the install — a `cargo test` in an older shell
+would otherwise miss it.
 
 ## Ground rules
 
@@ -72,6 +78,8 @@ are required; a missing one fails the tests rather than skipping them.
 - `rt.rs` — the semantics, embedded in every output
 - `error.rs` — the three ways this can fail, all of them named
 - `tests/common/mod.rs` — the differential harness
+- `tests/emscripten.rs` — the toolchain the captured modules were built with:
+  its libc, its libm, its C++ vtables
 
 ## The two rules the value stack lives by
 

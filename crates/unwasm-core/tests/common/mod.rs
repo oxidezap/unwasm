@@ -118,6 +118,55 @@ pub fn assemble(name: &str, wat: &str) -> Vec<u8> {
     std::fs::read(&binary).expect("reading the assembled module")
 }
 
+/// Locates `emcc`.
+///
+/// The Arch package puts it in `/usr/lib/emscripten` and adds that to `PATH`
+/// through `/etc/profile.d`, which only applies to shells started afterwards —
+/// so a `cargo test` in an older shell would not find it. Looking in the known
+/// location as well means the tests do not depend on which shell ran them.
+fn emcc() -> Option<PathBuf> {
+    if Command::new("emcc").arg("--version").output().is_ok() {
+        return Some(PathBuf::from("emcc"));
+    }
+    let packaged = PathBuf::from("/usr/lib/emscripten/emcc");
+    packaged.exists().then_some(packaged)
+}
+
+/// Compiles a C or C++ fixture with Emscripten.
+///
+/// `-sSTANDALONE_WASM` keeps the module runnable without the JavaScript glue,
+/// which is what lets the differential harness call into it. The code inside is
+/// the real thing regardless: Emscripten's libc, its `malloc`, its vtables and
+/// its shadow stack.
+///
+/// # Panics
+///
+/// Panics if `emcc` is not installed. Every caller is `#[ignore]`d for that
+/// reason — but once it runs, a missing toolchain must fail rather than pass
+/// having compiled nothing.
+pub fn compile_emscripten(name: &str, source: &str, extension: &str, flags: &[&str]) -> Vec<u8> {
+    let scratch = workspace_scratch(name);
+    let file = scratch.join(format!("fixture.{extension}"));
+    let output_js = scratch.join("fixture.js");
+    std::fs::write(&file, source).expect("writing the fixture");
+
+    let emcc = emcc().expect("emcc is required by this test; install the `emscripten` package");
+    let output = Command::new(emcc)
+        .arg(&file)
+        .args(["-sSTANDALONE_WASM", "--no-entry"])
+        .args(flags)
+        .arg("-o")
+        .arg(&output_js)
+        .output()
+        .expect("running emcc");
+    assert!(
+        output.status.success(),
+        "emcc rejected the fixture:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::read(scratch.join("fixture.wasm")).expect("reading the compiled module")
+}
+
 /// Compiles a C fixture to wasm with clang.
 ///
 /// clang's wasm32 target is the same LLVM backend Emscripten drives, so the
