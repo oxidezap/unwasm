@@ -534,6 +534,114 @@ impl Wasi {
         }
     }
 
+    /// Writes a `struct stat` at `buf` for something of `size` bytes.
+    ///
+    /// The offsets are not guessed. They are Emscripten's own, from the
+    /// `struct_info_generated.json` its JavaScript glue is built against — the
+    /// 96-byte layout with `st_size` at 24 as an i64 and `st_ino` at 88. This
+    /// is the one place in this file that depends on a *layout* rather than on
+    /// something the wasm itself says, and it is toolchain-specific: a build
+    /// whose libc laid the struct out differently would be read wrong here and
+    /// nowhere else.
+    ///
+    /// Times are all zero. A filesystem that lives in this struct has no
+    /// history, and inventing one would be inventing evidence.
+    pub fn write_stat<M: rt::Access>(
+        &self,
+        caller: &mut rt::Caller<'_, M>,
+        buf: i32,
+        size: usize,
+        directory: bool,
+        inode: i64,
+    ) -> i32 {
+        // 96 zero bytes first, so every field this does not set reads as zero
+        // rather than as whatever the guest left there.
+        caller.write(buf, &[0u8; 96]);
+        let mode = if directory {
+            0o040_755 // S_IFDIR | rwxr-xr-x
+        } else {
+            0o100_644 // S_IFREG | rw-r--r--
+        };
+        caller.write_i32(buf, 1); // st_dev
+        caller.write_i32(buf + 4, mode);
+        caller.write_i32(buf + 8, 1); // st_nlink
+        caller.write_i64(buf + 24, size as i64);
+        caller.write_i32(buf + 32, 4096); // st_blksize
+        caller.write_i32(buf + 36, size.div_ceil(512) as i32);
+        caller.write_i64(buf + 88, inode);
+        errno::SUCCESS
+    }
+
+    /// `__syscall_stat64` and `__syscall_lstat64`: no symbolic links live in
+    /// this filesystem, so the two are the same answer.
+    ///
+    /// Returns 0, or the negative errno a Linux syscall returns.
+    pub fn stat_path<M: rt::Access>(
+        &self,
+        caller: &mut rt::Caller<'_, M>,
+        path: i32,
+        buf: i32,
+    ) -> i32 {
+        let path = String::from_utf8_lossy(&caller.cstring(path)).into_owned();
+        match self.files.get(&path) {
+            Some(contents) => {
+                let size = contents.len();
+                let inode = self.inode_of(&path);
+                self.write_stat(caller, buf, size, false, inode)
+            }
+            // A directory exists if anything lives under it: this filesystem
+            // has no directory entries of its own, and saying "not found" for
+            // a prefix every path shares would be the wrong answer.
+            None if self.is_directory(&path) => self.write_stat(caller, buf, 0, true, 1),
+            None => -errno::NOENT,
+        }
+    }
+
+    /// `__syscall_fstat64`, for something already open.
+    pub fn stat_fd<M: rt::Access>(&self, caller: &mut rt::Caller<'_, M>, fd: i32, buf: i32) -> i32 {
+        match self.open.get(&fd) {
+            Some(Descriptor::File(open)) => match self.files.get(&open.path) {
+                Some(contents) => {
+                    let (size, inode) = (contents.len(), self.inode_of(&open.path));
+                    self.write_stat(caller, buf, size, false, inode)
+                }
+                None => -errno::NOENT,
+            },
+            Some(Descriptor::Directory(_)) => self.write_stat(caller, buf, 0, true, 1),
+            // A standard stream is a character device, and reporting it as a
+            // regular file of length zero is what makes a `isatty` answer
+            // wrong. Zero size, and the mode says what it is.
+            Some(Descriptor::Standard(_)) => {
+                let written = self.write_stat(caller, buf, 0, false, 0);
+                caller.write_i32(buf + 4, 0o020_620); // S_IFCHR | rw--w----
+                written
+            }
+            None => -errno::BADF,
+        }
+    }
+
+    /// Whether anything in the filesystem lives under `path`.
+    #[must_use]
+    pub fn is_directory(&self, path: &str) -> bool {
+        let prefix = if path.ends_with('/') {
+            path.to_string()
+        } else {
+            format!("{path}/")
+        };
+        path == "/" || self.files.keys().any(|name| name.starts_with(&prefix))
+    }
+
+    /// A stable inode for a path: its position in the map.
+    ///
+    /// Stable within a run, which is what a program comparing two `stat`
+    /// results needs, and not stable across runs, which nothing needs.
+    fn inode_of(&self, path: &str) -> i64 {
+        self.files
+            .keys()
+            .position(|name| name == path)
+            .map_or(0, |at| at as i64 + 2)
+    }
+
     /// The size of what a descriptor refers to, for `fstat`.
     #[must_use]
     pub fn size_of(&self, fd: i32) -> Option<usize> {
@@ -611,11 +719,13 @@ impl Cxx {
         self.thrown.len() as i32
     }
 
-    /// `__cxa_find_matching_catch_N` and `__cxa_get_exception_ptr`.
+    /// The exception currently in flight, or 0.
     ///
-    /// The type ids the module passes are not compared: the glue does not
-    /// either, and a host that guessed at C++ type matching would be inventing
-    /// an answer the module then acts on.
+    /// Not enough to answer `__cxa_find_matching_catch_N`, which is why the
+    /// generated host leaves that one to you: matching a throw against a catch
+    /// clause means comparing the thrown type against each requested one —
+    /// through the module's own `__cxa_can_catch` — and adjusting the pointer
+    /// for a base class. This is the exception, not the decision.
     #[must_use]
     pub fn in_flight(&self) -> i32 {
         self.caught
@@ -1369,6 +1479,101 @@ mod tests {
 
         assert_eq!(wasi.unlinkat(&caller, 64), 0);
         assert_eq!(wasi.unlinkat(&caller, 64), -errno::NOENT);
+    }
+
+    #[test]
+    fn a_stat_writes_the_layout_emscriptens_own_glue_writes() {
+        let mut wasi = Wasi::default();
+        wasi.add_file("/data/file", b"0123456789");
+        let mut memory = memory();
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
+        caller.write(64, b"/data/file\0");
+        // Something recognisable in the buffer first, so a field left unset is
+        // visible as a field left unset.
+        caller.write(256, &[0xEE; 96]);
+
+        assert_eq!(wasi.stat_path(&mut caller, 64, 256), errno::SUCCESS);
+        assert_eq!(caller.read_i32(256 + 4), 0o100_644, "S_IFREG and its mode");
+        assert_eq!(caller.read_i32(256 + 8), 1, "st_nlink");
+        assert_eq!(caller.read_i32(256 + 24), 10, "st_size, low half");
+        assert_eq!(caller.read_i32(256 + 28), 0, "and its high half");
+        assert_eq!(caller.read_i32(256 + 32), 4096, "st_blksize");
+        assert_eq!(caller.read_i32(256 + 36), 1, "st_blocks, rounded up");
+        assert!(caller.read_i32(256 + 88) > 0, "st_ino");
+        assert_eq!(caller.read_i32(256 + 40), 0, "and no invented timestamps");
+        // Every one of the 96 bytes was written, so nothing of the guest's
+        // remains: 0xEE anywhere would be a field this does not know about.
+        let written = caller.bytes(256, 96);
+        assert!(written.iter().all(|byte| *byte != 0xEE), "{written:02x?}");
+    }
+
+    #[test]
+    fn a_directory_is_anything_with_something_under_it() {
+        let mut wasi = Wasi::default();
+        wasi.add_file("/data/file", b"x");
+        let mut memory = memory();
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
+        caller.write(64, b"/data\0");
+        assert_eq!(wasi.stat_path(&mut caller, 64, 256), errno::SUCCESS);
+        assert_eq!(caller.read_i32(256 + 4), 0o040_755, "S_IFDIR");
+        assert!(wasi.is_directory("/"));
+        assert!(wasi.is_directory("/data/"));
+        assert!(!wasi.is_directory("/dat"));
+
+        caller.write(64, b"/missing\0");
+        assert_eq!(wasi.stat_path(&mut caller, 64, 256), -errno::NOENT);
+    }
+
+    #[test]
+    fn stat_by_descriptor_answers_for_each_kind() {
+        let mut wasi = Wasi::default();
+        wasi.add_file("/f", b"abc");
+        let fd = wasi.openat("/f", false, false);
+        let mut memory = memory();
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
+
+        assert_eq!(wasi.stat_fd(&mut caller, fd, 256), errno::SUCCESS);
+        assert_eq!(caller.read_i32(256 + 24), 3);
+
+        // A standard stream is a character device, and calling it a regular
+        // file is what makes an `isatty` come back wrong.
+        assert_eq!(wasi.stat_fd(&mut caller, 1, 256), errno::SUCCESS);
+        assert_eq!(caller.read_i32(256 + 4), 0o020_620);
+
+        assert_eq!(wasi.stat_fd(&mut caller, 3, 256), errno::SUCCESS);
+        assert_eq!(caller.read_i32(256 + 4), 0o040_755, "the preopened root");
+
+        assert_eq!(wasi.stat_fd(&mut caller, 99, 256), -errno::BADF);
+
+        // A file that went away underneath an open descriptor.
+        wasi.files.remove("/f");
+        assert_eq!(wasi.stat_fd(&mut caller, fd, 256), -errno::NOENT);
+    }
+
+    #[test]
+    fn two_files_have_two_inodes_and_the_same_file_has_one() {
+        let mut wasi = Wasi::default();
+        wasi.add_file("/a", b"x");
+        wasi.add_file("/b", b"y");
+        let mut memory = memory();
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
+        caller.write(64, b"/a\0");
+        caller.write(96, b"/b\0");
+        wasi.stat_path(&mut caller, 64, 256);
+        let first = caller.read_i32(256 + 88);
+        wasi.stat_path(&mut caller, 96, 256);
+        let second = caller.read_i32(256 + 88);
+        assert_ne!(first, second, "two files are not one file");
+        wasi.stat_path(&mut caller, 64, 256);
+        assert_eq!(caller.read_i32(256 + 88), first, "and one file is one file");
     }
 
     #[test]

@@ -350,7 +350,7 @@ pub struct Analysis {
 /// So a match here is strong evidence and a miss is no evidence. This names
 /// functions; it never marks one as unrecognised.
 #[must_use]
-pub fn fingerprint(func: &crate::module::Func) -> u64 {
+pub fn fingerprint(module: &Module, func: &crate::module::Func) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut write = |text: &str| {
         for byte in text.bytes() {
@@ -358,6 +358,17 @@ pub fn fingerprint(func: &crate::module::Func) -> u64 {
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
     };
+    // The signature first. Two bodies of the same shape that take different
+    // arguments are not the same function, and leaving the type out let a
+    // catalogue name one of them after the other.
+    if let Some(ty) = module.types.get(func.type_index as usize) {
+        for param in &ty.params {
+            write(&format!("p{param:?}"));
+        }
+        for result in &ty.results {
+            write(&format!("r{result:?}"));
+        }
+    }
     for op in &func.body {
         match op {
             // The things that differ between builds of the same source.
@@ -1621,6 +1632,35 @@ mod tests {
     use super::*;
     use crate::module::{DataSegment, Func, FuncType, GlobalDef, ValType};
     use crate::ops::NumOp;
+
+    #[test]
+    fn a_function_whose_type_is_missing_still_fingerprints() {
+        // A module can name a type index that is not there. The fingerprint
+        // has to come out regardless — refusing here would mean a catalogue
+        // could not be built from a module the decoder accepted.
+        let module = Module {
+            funcs: vec![Func {
+                type_index: 9,
+                locals: Vec::new(),
+                body: vec![Op::I32Const(1), Op::Drop],
+                offsets: Vec::new(),
+            }],
+            ..Module::default()
+        };
+        let without = fingerprint(&module, &module.funcs[0]);
+
+        let mut typed = module.clone();
+        typed.types = vec![FuncType {
+            params: vec![ValType::I32],
+            results: Vec::new(),
+        }];
+        typed.funcs[0].type_index = 0;
+        assert_ne!(
+            without,
+            fingerprint(&typed, &typed.funcs[0]),
+            "and a known signature is part of it"
+        );
+    }
 
     fn module_with_globals(count: usize, mutable: bool) -> Module {
         Module {

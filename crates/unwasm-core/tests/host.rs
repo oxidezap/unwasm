@@ -433,6 +433,10 @@ fn the_whole_mechanical_set_is_answered_with_the_real_signatures() {
             (import "env" "__syscall_openat" (func (param i32 i32 i32 i32) (result i32)))
             (import "env" "__syscall_unlinkat" (func (param i32 i32 i32) (result i32)))
             (import "env" "__syscall_ioctl" (func (param i32 i32 i32) (result i32)))
+            (import "env" "__syscall_stat64" (func (param i32 i32) (result i32)))
+            (import "env" "__syscall_lstat64" (func (param i32 i32) (result i32)))
+            (import "env" "__syscall_fstat64" (func (param i32 i32) (result i32)))
+            (import "env" "__syscall_newfstatat" (func (param i32 i32 i32 i32) (result i32)))
             (import "env" "_emval_decref" (func (param i32)))
             (import "env" "_emval_take_value" (func (param i32 i32) (result i32)))
             (import "env" "on_frame" (func (param f32 f64)))
@@ -442,9 +446,20 @@ fn the_whole_mechanical_set_is_answered_with_the_real_signatures() {
     let skeleton = codegen::generate_host(&module).expect("generates");
     let body = trait_body(&skeleton).to_string();
 
-    // Exactly one is left, and it is the application's.
-    assert_eq!(body.matches("todo!(\"").count(), 1, "{body}");
+    // The application's own is left, and so are the four C++ catch-matching
+    // imports: matching a throw against a catch clause is not mechanical, and
+    // answering it with the exception in flight selects the wrong handler for
+    // `throw Derived; catch (Base&)`.
+    assert_eq!(body.matches("todo!(\"").count(), 5, "{body}");
     assert!(body.contains(r#"todo!("env::on_frame")"#), "{body}");
+    assert!(
+        body.contains(r#"todo!("env::__cxa_find_matching_catch_2")"#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"todo!("env::__cxa_get_exception_ptr")"#),
+        "{body}"
+    );
     for expected in [
         "self.wasi.fd_read(caller, p0, p1, p2, p3)",
         "self.wasi.fd_pread(caller, p0, p1, p2, p3, p4)",
@@ -461,7 +476,6 @@ fn the_whole_mechanical_set_is_answered_with_the_real_signatures() {
         "self.cxx.end_catch()",
         "self.cxx.rethrow()",
         "self.cxx.uncaught()",
-        "self.cxx.in_flight()",
         "runtime::Emscripten::heap_max(caller)",
         "self.wasi.now_milliseconds",
         "self.emscripten.cores",
@@ -472,6 +486,9 @@ fn the_whole_mechanical_set_is_answered_with_the_real_signatures() {
         "self.emscripten.scheduled.push((p0, p1, p2))",
         "self.emscripten.exited_with_live_runtime = true",
         "self.wasi.openat_at(caller, p1, p2)",
+        "self.wasi.stat_path(caller, p0, p1)",
+        "self.wasi.stat_fd(caller, p0, p1)",
+        "self.wasi.stat_path(caller, p1, p2)",
         "self.wasi.unlinkat(caller, p1)",
         "-runtime::errno::NOTTY",
         "self.embind.decref(p0)",

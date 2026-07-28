@@ -263,12 +263,13 @@ fn known_import(field: &str, ty: &crate::module::FuncType) -> Option<&'static st
         ("__cxa_rethrow", "->") => "self.cxx.rethrow()",
         ("__resumeException", "i->") => "self.cxx.rethrow()",
         ("__cxa_uncaught_exceptions", "->i") => "self.cxx.uncaught()",
-        // The type ids are not compared: the JavaScript glue does not compare
-        // them either, and the module's own personality code decides.
-        ("__cxa_get_exception_ptr", "i->i")
-        | ("__cxa_find_matching_catch_2", "->i")
-        | ("__cxa_find_matching_catch_3", "i->i")
-        | ("__cxa_find_matching_catch_4", "ii->i") => "self.cxx.in_flight()",
+        // `__cxa_find_matching_catch_*` and `__cxa_get_exception_ptr` are
+        // deliberately absent. They are not mechanical: the glue compares the
+        // thrown type against each requested catch type — through the module's
+        // own `__cxa_can_catch` — and returns an adjusted pointer for a base
+        // class. Answering with the exception unconditionally selects the
+        // wrong handler for `throw Derived; catch (Base&)` and hands the guest
+        // the wrong address, which is worse than saying it is not written.
         ("__assert_fail", "iiii->") => "runtime::assert_fail(caller, p0, p1, p2, p3)",
 
         // ---- Emscripten's runtime
@@ -296,9 +297,17 @@ fn known_import(field: &str, ty: &crate::module::FuncType) -> Option<&'static st
         ("__syscall_openat", "iiii->i") => "self.wasi.openat_at(caller, p1, p2)",
         ("__syscall_unlinkat", "iii->i") => "self.wasi.unlinkat(caller, p1)",
         // Nothing here is a terminal, and saying so is an answer rather than a
-        // guess. The rest of the syscalls stay `todo!()`: `stat` would mean
-        // inventing a struct layout, and a wrong one is worse than none.
+        // guess.
         ("__syscall_ioctl", "iii->i") => "-runtime::errno::NOTTY",
+        // The struct layout is Emscripten's own rather than a guess — see
+        // `Wasi::write_stat` — which is what makes these answerable at all.
+        ("__syscall_stat64", "ii->i") | ("__syscall_lstat64", "ii->i") => {
+            "self.wasi.stat_path(caller, p0, p1)"
+        }
+        ("__syscall_fstat64", "ii->i") => "self.wasi.stat_fd(caller, p0, p1)",
+        // `newfstatat(dirfd, path, buf, flags)`: every path here is absolute,
+        // so the directory descriptor decides nothing.
+        ("__syscall_newfstatat", "iiii->i") => "self.wasi.stat_path(caller, p1, p2)",
 
         // ---- embind and emval
         ("_emval_incref", "i->") => "self.embind.incref(p0)",
@@ -524,33 +533,11 @@ pub fn generate(module: &Module) -> Result<String> {
 ///
 /// As [`generate`].
 pub fn generate_files(module: &Module, layout: Layout) -> Result<Vec<GeneratedFile>> {
-    generate_with(module, layout, None, &Signatures::new())
-}
-
-/// Generates with both selections a caller can make: which functions to write
-/// out in full, and what to name the ones the module does not name.
-///
-/// The other four entry points are this one with one or both left out. They
-/// exist because most callers want one of the two, and combining them is
-/// otherwise four functions rather than one.
-///
-/// # Errors
-///
-/// As [`generate`].
-pub fn generate_with(
-    module: &Module,
-    layout: Layout,
-    only: Option<&std::collections::BTreeSet<u32>>,
-    signatures: &Signatures,
-) -> Result<Vec<GeneratedFile>> {
     generate_options(
         module,
         &Options {
             layout,
-            only: only.cloned(),
-            signatures: signatures.clone(),
-            instrument_stores: false,
-            map_offsets: false,
+            ..Options::default()
         },
     )
 }
@@ -606,7 +593,14 @@ pub fn generate_only(
     layout: Layout,
     only: &std::collections::BTreeSet<u32>,
 ) -> Result<Vec<GeneratedFile>> {
-    generate_with(module, layout, Some(only), &Signatures::new())
+    generate_options(
+        module,
+        &Options {
+            layout,
+            only: Some(only.clone()),
+            ..Options::default()
+        },
+    )
 }
 
 /// A catalogue of fingerprints to names, for recognising library code.
@@ -637,7 +631,7 @@ pub fn extract_signatures(module: &Module) -> Signatures {
         let Some(name) = module.func_name(import_count + at as u32) else {
             continue;
         };
-        let fingerprint = analysis::fingerprint(func);
+        let fingerprint = analysis::fingerprint(module, func);
         match signatures.get(&fingerprint) {
             Some(existing) if existing == name => {}
             Some(_) => {
@@ -663,7 +657,14 @@ pub fn generate_with_signatures(
     layout: Layout,
     signatures: &Signatures,
 ) -> Result<Vec<GeneratedFile>> {
-    generate_with(module, layout, None, signatures)
+    generate_options(
+        module,
+        &Options {
+            layout,
+            signatures: signatures.clone(),
+            ..Options::default()
+        },
+    )
 }
 
 struct Generator<'a> {
@@ -735,11 +736,25 @@ impl<'a> Generator<'a> {
     }
 
     /// Matches the module's functions against the signature catalogue.
+    ///
+    /// A fingerprint that occurs twice *in this module* names nothing, for the
+    /// same reason one that occurs twice in the catalogue does: the fingerprint
+    /// is a deliberately coarse equivalence class, and two functions in it are
+    /// two functions. Deduplicating only the catalogue would put one library
+    /// name on every member of the class.
     fn recognise(&mut self) {
         if self.signatures.is_empty() {
             return;
         }
         let import_count = self.module.func_imports.len() as u32;
+        let mut seen: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for func in &self.module.funcs {
+            if func.body.len() >= analysis::FINGERPRINT_FLOOR {
+                *seen
+                    .entry(analysis::fingerprint(self.module, func))
+                    .or_default() += 1;
+            }
+        }
         for (at, func) in self.module.funcs.iter().enumerate() {
             if func.body.len() < analysis::FINGERPRINT_FLOOR {
                 continue;
@@ -749,7 +764,11 @@ impl<'a> Generator<'a> {
             if self.module.func_name(index).is_some() {
                 continue;
             }
-            if let Some(name) = self.signatures.get(&analysis::fingerprint(func)) {
+            let fingerprint = analysis::fingerprint(self.module, func);
+            if seen.get(&fingerprint).copied().unwrap_or_default() > 1 {
+                continue;
+            }
+            if let Some(name) = self.signatures.get(&fingerprint) {
                 self.recognised.insert(index, name.clone());
             }
         }
@@ -2592,11 +2611,12 @@ impl<'a> Body<'a> {
             }
             Op::Atomic { op: atomic, mem } => self.emit_atomic(*atomic, mem.offset)?,
             Op::AtomicFence => {
-                // A fence orders memory between threads. With one thread there
-                // is nothing to order — but it is recorded rather than dropped,
-                // because "the module asked for a fence here" is a fact about
-                // the module.
-                self.line("// atomic.fence: nothing to order on a single thread");
+                // Under one thread there is nothing to order and this compiles
+                // to nothing. Under several it is the instruction's whole
+                // point: the plain accesses either side of it are relaxed
+                // atomics on a shared memory, and dropping the fence lets a
+                // reader see them in an order the guest excluded.
+                self.line("rt::fence();");
             }
             Op::Num(num) => self.emit_num(*num)?,
         }
@@ -2681,10 +2701,13 @@ impl<'a> Body<'a> {
                 let mut values = self.pop_n(2)?;
                 self.spill_operands(&mut values);
                 self.spill_stack();
-                // The count of threads to wake is popped and unused: with one
-                // thread the answer is zero however many were asked for.
+                // The count decides the program: three threads on a lock and
+                // `notify(addr, 1)` means one of them proceeds.
                 self.push_temp(
-                    &format!("self.memory.atomic_notify({}, {offset})", values[0].code),
+                    &format!(
+                        "self.memory.atomic_notify_count({}, {offset}, {})",
+                        values[0].code, values[1].code
+                    ),
                     ValType::I32,
                 );
             }

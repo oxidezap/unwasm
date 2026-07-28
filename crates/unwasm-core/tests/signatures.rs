@@ -200,7 +200,10 @@ fn a_short_function_is_never_recognised() {
     let module = Module::parse(&anonymous).expect("valid");
     // Even given a catalogue that does contain its fingerprint, it is not used.
     let mut forced = codegen::Signatures::new();
-    forced.insert(analysis::fingerprint(&module.funcs[0]), "tiny".to_string());
+    forced.insert(
+        analysis::fingerprint(&module, &module.funcs[0]),
+        "tiny".to_string(),
+    );
     let files = codegen::generate_with_signatures(&module, codegen::Layout::Single, &forced)
         .expect("generates");
     assert!(!files[0].contents.contains("f0_tiny"), "below the floor");
@@ -237,8 +240,8 @@ fn constants_and_offsets_do_not_enter_the_fingerprint() {
     let one = Module::parse(&one).expect("valid");
     let two = Module::parse(&two).expect("valid");
     assert_eq!(
-        analysis::fingerprint(&one.funcs[0]),
-        analysis::fingerprint(&two.funcs[0])
+        analysis::fingerprint(&one, &one.funcs[0]),
+        analysis::fingerprint(&two, &two.funcs[0])
     );
 }
 
@@ -257,8 +260,8 @@ fn the_kind_of_access_does_enter_it() {
     let one = Module::parse(&one).expect("valid");
     let two = Module::parse(&two).expect("valid");
     assert_ne!(
-        analysis::fingerprint(&one.funcs[0]),
-        analysis::fingerprint(&two.funcs[0])
+        analysis::fingerprint(&one, &one.funcs[0]),
+        analysis::fingerprint(&two, &two.funcs[0])
     );
 }
 
@@ -282,8 +285,15 @@ fn a_catalogue_names_the_functions_that_were_left_out_too() {
     // the one function being read says which library function it calls.
     let module = Module::parse(&stripped()).expect("valid");
     let only = [1u32].into_iter().collect();
-    let files = codegen::generate_with(&module, codegen::Layout::Single, Some(&only), &catalogue())
-        .expect("generates");
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            only: Some(only),
+            signatures: catalogue(),
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
     let code = &files[0].contents;
     assert!(code.contains("fn f0_wibble_copy"), "{code}");
     assert!(
@@ -338,9 +348,59 @@ fn every_operand_that_moves_between_builds_is_dropped() {
     let one = Module::parse(&one).expect("valid");
     let two = Module::parse(&two).expect("valid");
     assert_eq!(
-        analysis::fingerprint(&one.funcs[2]),
-        analysis::fingerprint(&two.funcs[2])
+        analysis::fingerprint(&one, &one.funcs[2]),
+        analysis::fingerprint(&two, &two.funcs[2])
     );
     // And the body is long enough that this is a fingerprint anyone would use.
     assert!(one.funcs[2].body.len() >= analysis::FINGERPRINT_FLOOR);
+}
+
+#[test]
+fn a_shape_two_functions_in_the_target_share_names_neither() {
+    // The catalogue's own collisions are dropped, and so are the target's, for
+    // the same reason: a fingerprint is a deliberately coarse equivalence
+    // class, and two functions in it are two functions. Deduplicating only the
+    // catalogue would put one library name on every member of the class.
+    let wat = format!(
+        "(module (func (export \"a\") (param i32) (result i32){})\
+         (func (export \"b\") (param i32) (result i32){}))",
+        body("i32.add"),
+        body("i32.add")
+    );
+    let wasm = common::assemble("signatures-target-collision", &wat);
+    let module = Module::parse(&wasm).expect("valid");
+    let files = codegen::generate_with_signatures(&module, codegen::Layout::Single, &catalogue())
+        .expect("generates");
+    assert!(
+        !files[0].contents.contains("wibble_copy"),
+        "two candidates, no name:\n{}",
+        files[0].contents
+    );
+}
+
+#[test]
+fn the_signature_is_part_of_the_fingerprint() {
+    // Two bodies of the same shape that take different arguments are not the
+    // same function, and leaving the type out let a catalogue name one after
+    // the other.
+    let one = common::assemble(
+        "fingerprint-type-one",
+        &format!(
+            "(module (func (export \"a\") (param i32) (result i32){}))",
+            body("i32.add")
+        ),
+    );
+    let two = common::assemble(
+        "fingerprint-type-two",
+        &format!(
+            "(module (func (export \"a\") (param i32 i32) (result i32){}))",
+            body("i32.add")
+        ),
+    );
+    let one = Module::parse(&one).expect("valid");
+    let two = Module::parse(&two).expect("valid");
+    assert_ne!(
+        analysis::fingerprint(&one, &one.funcs[0]),
+        analysis::fingerprint(&two, &two.funcs[0])
+    );
 }

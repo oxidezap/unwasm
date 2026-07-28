@@ -247,9 +247,10 @@ impl Memory {
     }
     /// An atomic compare-and-exchange, reporting to any watchpoint.
     ///
-    /// Reported whether or not the exchange happened: "something looked at
-    /// this address and might have written it" is the useful signal, and a
-    /// comparison that failed is exactly the case a reader wants to see.
+    /// Only when the exchange happened. A comparison that failed wrote
+    /// nothing, and reporting it would answer "who wrote this address" with a
+    /// function that did not — and with `stop` set, would stop the run before
+    /// the write being hunted ever happens.
     #[allow(clippy::too_many_arguments)]
     pub fn atomic_cmpxchg_at(
         &mut self,
@@ -262,7 +263,9 @@ impl Memory {
         replacement: i64,
     ) -> i64 {
         let old = self.atomic_cmpxchg(addr, offset, bytes, expected, replacement);
-        self.note(site, at, addr, offset, u64::from(bytes), WriteKind::Atomic);
+        if exchanged(old, expected, bytes) {
+            self.note(site, at, addr, offset, u64::from(bytes), WriteKind::Atomic);
+        }
         old
     }
 
@@ -592,13 +595,30 @@ pub struct SharedMemory {
     watch: std::sync::Arc<std::sync::Mutex<Watchpoints>>,
 }
 
-/// Threads parked on an address, and the generation that wakes them.
+/// Threads parked on addresses, each holding a ticket.
+///
+/// A ticket per waiter rather than a generation per address, because
+/// `memory.atomic.notify` takes a *count*: waking everybody and reporting how
+/// many were parked is a different program. The tickets are woken in the order
+/// they parked, which the spec does not require and which makes a test able to
+/// say what happened.
 #[derive(Debug, Default)]
 struct Waiters {
-    /// Address to `(generation, how many are parked)`.
-    parked: std::sync::Mutex<std::collections::BTreeMap<usize, (u64, usize)>>,
+    /// The tickets parked on each address, oldest first.
+    parked: std::sync::Mutex<Parked>,
     /// Signalled by every `notify`.
     wake: std::sync::Condvar,
+}
+
+/// The parking lot's contents.
+#[derive(Debug, Default)]
+struct Parked {
+    /// Address to the tickets waiting on it, oldest first.
+    queues: std::collections::BTreeMap<usize, std::collections::VecDeque<u64>>,
+    /// Tickets that have been notified and have not yet noticed.
+    woken: std::collections::BTreeSet<u64>,
+    /// The next ticket to hand out.
+    next_ticket: u64,
 }
 
 impl SharedMemory {
@@ -641,17 +661,31 @@ impl SharedMemory {
     }
 
     /// `memory.grow`, within the reservation.
+    ///
+    /// A compare-exchange loop rather than load-then-store: two threads growing
+    /// one page each must publish two pages and report different old sizes.
+    /// Reading and then storing lets both read the same size, both report it,
+    /// and one page appear — which a guest allocator turns into two allocations
+    /// at the same address.
     pub fn grow(&mut self, delta_pages: u32) -> i32 {
-        let old = self.pages.load(std::sync::atomic::Ordering::Acquire);
-        let new = u64::from(old) + u64::from(delta_pages);
-        if new > u64::from(self.max_pages.unwrap_or(65536))
-            || new > u64::from(self.reserved_pages())
-        {
-            return -1;
+        let ceiling =
+            u64::from(self.max_pages.unwrap_or(65536)).min(u64::from(self.reserved_pages()));
+        let mut old = self.pages.load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            let new = u64::from(old) + u64::from(delta_pages);
+            if new > ceiling {
+                return -1;
+            }
+            match self.pages.compare_exchange_weak(
+                old,
+                new as u32,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => return old as i32,
+                Err(current) => old = current,
+            }
         }
-        self.pages
-            .store(new as u32, std::sync::atomic::Ordering::Release);
-        old as i32
     }
 
     /// The committed bytes, copied out. For comparing one run against another.
@@ -889,28 +923,42 @@ impl SharedMemory {
         old as i64
     }
 
-    /// `memory.atomic.notify`: wakes up to `count` threads parked here.
+    /// `memory.atomic.notify`: wakes up to `count` threads parked here, and
+    /// returns how many it woke.
     ///
-    /// Returns how many were parked, which with real threads is a real number
-    /// rather than the zero a single-threaded model has to report.
+    /// The count is the instruction's, and it decides the program: three
+    /// threads parked on a lock and `notify(addr, 1)` means one of them
+    /// proceeds. Waking all three and reporting three is a different program.
     pub fn atomic_notify_count(&self, addr: i32, offset: u64, count: i32) -> i32 {
         let at = self.atomic_at(addr, offset, 4);
+        let wanted = if count < 0 {
+            usize::MAX
+        } else {
+            count as usize
+        };
         let mut parked = self
             .waiters
             .parked
             .lock()
             .unwrap_or_else(|held| held.into_inner());
-        let woken = match parked.get_mut(&at) {
-            Some((generation, waiting)) => {
-                *generation += 1;
-                let woken = (*waiting).min(count.max(0) as usize);
-                woken as i32
-            }
-            None => 0,
-        };
+        let mut woken = 0;
+        while woken < wanted {
+            let Some(queue) = parked.queues.get_mut(&at) else {
+                break;
+            };
+            let Some(ticket) = queue.pop_front() else {
+                parked.queues.remove(&at);
+                break;
+            };
+            parked.woken.insert(ticket);
+            woken += 1;
+        }
         drop(parked);
+        // Every waiter shares one condvar, so each wakes and checks its own
+        // ticket. Waking a thread that goes back to sleep costs a context
+        // switch; waking the wrong number of them costs a different program.
         self.waiters.wake.notify_all();
-        woken
+        woken as i32
     }
 
     /// `memory.atomic.notify` with no count, which wakes everybody.
@@ -954,22 +1002,21 @@ impl SharedMemory {
                  memory, so no other thread can notify it",
             );
         }
-        let generation = {
-            let entry = parked.entry(at).or_insert((0, 0));
-            entry.1 += 1;
-            entry.0
+        let ticket = {
+            parked.next_ticket += 1;
+            let ticket = parked.next_ticket;
+            parked.queues.entry(at).or_default().push_back(ticket);
+            ticket
         };
-        let deadline = if timeout < 0 {
-            None
-        } else {
-            Some(std::time::Duration::from_nanos(timeout as u64))
-        };
+        // An absolute deadline, computed once. Passing the whole timeout again
+        // after every wake-up lets unrelated notifications — every one of them
+        // wakes every waiter — restart it, and a bounded wait becomes an
+        // unbounded one.
+        let deadline = (timeout >= 0)
+            .then(|| std::time::Instant::now() + std::time::Duration::from_nanos(timeout as u64));
         let mut answer = 0;
         loop {
-            let woken = parked
-                .get(&at)
-                .is_some_and(|(current, _)| *current != generation);
-            if woken {
+            if parked.woken.remove(&ticket) {
                 break;
             }
             match deadline {
@@ -981,21 +1028,25 @@ impl SharedMemory {
                         .unwrap_or_else(|held| held.into_inner());
                 }
                 Some(deadline) => {
-                    let (next, timed_out) = self
-                        .waiters
-                        .wake
-                        .wait_timeout(parked, deadline)
-                        .unwrap_or_else(|held| held.into_inner());
-                    parked = next;
-                    if timed_out.timed_out() {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
                         answer = 2;
                         break;
                     }
+                    let (next, _) = self
+                        .waiters
+                        .wake
+                        .wait_timeout(parked, deadline - now)
+                        .unwrap_or_else(|held| held.into_inner());
+                    parked = next;
                 }
             }
         }
-        if let Some(entry) = parked.get_mut(&at) {
-            entry.1 = entry.1.saturating_sub(1);
+        // Leaving without being notified means the ticket is still queued.
+        if answer != 0
+            && let Some(queue) = parked.queues.get_mut(&at)
+        {
+            queue.retain(|queued| *queued != ticket);
         }
         answer
     }
@@ -1203,6 +1254,27 @@ pub struct GuestException {
     pub exception: i32,
     /// Its `std::type_info`, for a host that wants to match on the type.
     pub info: i32,
+}
+
+/// Whether a compare-and-exchange took: the old value, at the access width,
+/// against what the guest expected.
+fn exchanged(old: i64, expected: i64, bytes: u32) -> bool {
+    let mask = if bytes >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (8 * bytes)) - 1
+    };
+    old as u64 == expected as u64 & mask
+}
+
+/// `atomic.fence`, which orders this thread's accesses against the others.
+///
+/// Under one thread there is nothing to order and this is free. Under several
+/// it is the instruction's whole point: the plain accesses either side of it
+/// are relaxed atomics, and without the fence a reader can see them in an
+/// order the guest excluded.
+pub fn fence() {
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Throws a guest exception. What a host's `__cxa_throw` calls.
@@ -1778,10 +1850,169 @@ mod tests {
     }
 
     #[test]
+    fn notify_wakes_the_number_it_was_asked_for_and_no_more() {
+        // The count is the instruction's, and it decides the program: three
+        // threads on a lock and `notify(addr, 1)` means one proceeds.
+        let memory = SharedMemory::new(1, None, 1);
+        let waiters: Vec<_> = (0..3)
+            .map(|_| {
+                let waiting = memory.clone();
+                std::thread::spawn(move || waiting.atomic_wait(0, 0, 4, 0, -1))
+            })
+            .collect();
+
+        // Park all three before waking any: `notify` reports what it woke, so
+        // this loop is also the proof they are parked.
+        let mut parked = 0;
+        let mut woken_first = 0;
+        while parked < 3 {
+            std::thread::yield_now();
+            let woke = memory.atomic_notify_count(0, 0, 1);
+            parked += woke;
+            woken_first += woke;
+            if woken_first > 0 && parked < 3 {
+                // One is awake; the others are still arriving. Keep going with
+                // a count of one so nothing extra is woken by accident.
+                continue;
+            }
+        }
+        assert_eq!(woken_first, 3, "one at a time, three times");
+        for waiter in waiters {
+            assert_eq!(waiter.join().expect("returns"), 0);
+        }
+        // Nobody is left, so a further notify wakes nothing.
+        assert_eq!(memory.atomic_notify_count(0, 0, 10), 0);
+    }
+
+    #[test]
+    fn notifying_zero_threads_wakes_none_of_them() {
+        let memory = SharedMemory::new(1, None, 1);
+        let waiting = memory.clone();
+        let waiter = std::thread::spawn(move || waiting.atomic_wait(0, 0, 4, 0, -1));
+        // A count of zero must not wake anybody, however many are parked.
+        for _ in 0..50 {
+            assert_eq!(memory.atomic_notify_count(0, 0, 0), 0);
+            std::thread::yield_now();
+        }
+        let mut woken = 0;
+        while woken == 0 {
+            std::thread::yield_now();
+            woken = memory.atomic_notify_count(0, 0, 1);
+        }
+        assert_eq!(waiter.join().expect("returns"), 0);
+    }
+
+    #[test]
+    fn a_finite_wait_expires_however_much_unrelated_traffic_there_is() {
+        // Every notify wakes every waiter, whatever address it was for. A
+        // timeout re-armed on each wake-up would never expire.
+        let memory = SharedMemory::new(1, None, 1);
+        let waiting = memory.clone();
+        let waiter = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let answer = waiting.atomic_wait(0, 0, 4, 0, 200_000_000);
+            (answer, started.elapsed())
+        });
+        let noise = memory.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = stop.clone();
+        let noisy = std::thread::spawn(move || {
+            while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                // A different address, so it never wakes the waiter's ticket.
+                noise.atomic_notify(64, 0);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        let (answer, elapsed) = waiter.join().expect("the waiter returns");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        noisy.join().expect("the noise stops");
+        assert_eq!(answer, 2, "timed out");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "and within its own bound rather than being restarted: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn two_threads_growing_at_once_both_get_their_pages() {
+        // Load-then-store lets both read the same size, both report it, and
+        // one page appear — which a guest allocator turns into two allocations
+        // at one address.
+        const THREADS: usize = 8;
+        const EACH: usize = 16;
+        let memory = SharedMemory::new(1, None, (THREADS * EACH) as u32 + 1);
+        let start = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let growers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let mut growing = memory.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    // Sixteen each, in a tight loop, so the compare-exchange
+                    // actually contends rather than happening to be serialised.
+                    (0..EACH).map(|_| growing.grow(1)).collect::<Vec<i32>>()
+                })
+            })
+            .collect();
+        let mut reported: Vec<i32> = growers
+            .into_iter()
+            .flat_map(|grower| grower.join().expect("returns"))
+            .collect();
+        reported.sort_unstable();
+        let expected: Vec<i32> = (1..=(THREADS * EACH) as i32).collect();
+        assert_eq!(reported, expected, "each grow got its own old size");
+        assert_eq!(
+            memory.size(),
+            (THREADS * EACH) as i32 + 1,
+            "and every page was published"
+        );
+    }
+
+    #[test]
+    fn a_fence_is_emitted_rather_than_assumed_away() {
+        // Nothing to assert about its effect from one thread; what matters is
+        // that it exists and is callable, since the emitter now lowers a guest
+        // `atomic.fence` to it.
+        fence();
+    }
+
+    #[test]
     fn notifying_an_address_nobody_waits_on_wakes_nothing() {
         let memory = SharedMemory::new(1, None, 1);
         assert_eq!(memory.atomic_notify(0, 0), 0);
         assert_eq!(memory.atomic_notify_count(0, 0, 0), 0);
+        // A negative count is "everybody", which is how `-1` reaches here from
+        // a guest that spelled the count as `i32.const -1`.
+        assert_eq!(memory.atomic_notify_count(0, 0, -1), 0);
+    }
+
+    #[test]
+    fn a_negative_count_wakes_everybody() {
+        let memory = SharedMemory::new(1, None, 1);
+        let waiters: Vec<_> = (0..3)
+            .map(|_| {
+                let waiting = memory.clone();
+                std::thread::spawn(move || waiting.atomic_wait(0, 0, 4, 0, -1))
+            })
+            .collect();
+        let mut woken = 0;
+        while woken < 3 {
+            std::thread::yield_now();
+            woken += memory.atomic_notify_count(0, 0, -1);
+        }
+        for waiter in waiters {
+            assert_eq!(waiter.join().expect("returns"), 0);
+        }
+    }
+
+    #[test]
+    fn an_eight_byte_exchange_that_takes_is_reported() {
+        let mut memory = Memory::new(1, None);
+        memory.watch(0x100, 8);
+        memory.atomic_store(0x100, 0, 8, -1);
+        assert_eq!(memory.atomic_cmpxchg_at(1, 10, 0x100, 0, 8, -1, 7), -1);
+        assert_eq!(memory.load64(0x100, 0), 7);
+        assert_eq!(memory.hits().len(), 1, "the whole 64-bit value matched");
     }
 
     #[test]
@@ -2104,11 +2335,16 @@ mod tests {
         memory.watch(0x200, 4);
         memory.atomic_store_at(1, 14, 0x200, 0, 4, 7);
         assert_eq!(memory.atomic_rmw_at(2, 24, 0x200, 0, 4, Rmw::Add, 1), 7);
-        // Reported even though the comparison fails and nothing is written:
-        // "something looked at this and might have written it" is the signal.
+        // A comparison that fails wrote nothing, and reporting it would answer
+        // "who wrote this address" with a function that did not.
         assert_eq!(memory.atomic_cmpxchg_at(3, 34, 0x200, 0, 4, 99, 1), 8);
         assert_eq!(memory.load32(0x200, 0), 8);
+        assert_eq!(memory.hits().len(), 2);
+        // One that succeeds is a write, and is reported.
+        assert_eq!(memory.atomic_cmpxchg_at(4, 44, 0x200, 0, 4, 8, 12), 8);
+        assert_eq!(memory.load32(0x200, 0), 12);
         assert_eq!(memory.hits().len(), 3);
+        assert_eq!(memory.hits()[2].site, 4);
         assert!(
             memory
                 .hits()

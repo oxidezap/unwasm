@@ -275,6 +275,22 @@ Four of them, and all four came from someone actually reading a 9 MiB module:
 They share a shape worth keeping: each replaces a measurement someone was
 making by hand with one the machine already has the numbers for.
 
+## What a threaded run gets right, and the one thing it does not
+
+A `notify` wakes exactly the count it was given, in parking order; a finite
+wait uses an absolute deadline, because every notify wakes every waiter and a
+timeout re-armed on each wake-up never expires; `grow` is a compare-exchange
+loop, because load-then-store lets two threads report the same old size and
+publish one page; and `atomic.fence` lowers to a real fence, which under one
+thread was correctly nothing and under several is the instruction's whole
+point. Each of those was wrong first and has a test that fails without it.
+
+The divergence that remains, stated as one: **an unsatisfiable wait traps.**
+The spec says block forever. Trapping when no other instance holds the memory
+is a deliberate choice — a hung test is unkillable and a hung decompilation
+tells the reader nothing — and it is checkable rather than assumed, but it is
+not what an engine does.
+
 ## A thread is another instance over the same memory
 
 `SharedMemory` is `Arc<[AtomicU8]>`; `Instance::spawn` gives a new instance the
@@ -287,6 +303,12 @@ easy to get wrong:
 - **The wait trap is now a fact, not an assumption.** `strong_count == 1` means
   nobody can ever notify, so the wait is unsatisfiable rather than slow. That is
   what lets a threaded module run on one thread without hanging.
+- **A catch clause is not mechanical.** `__cxa_find_matching_catch_*` and
+  `__cxa_get_exception_ptr` are left to the reader on purpose: matching a throw
+  against a clause means comparing types through the module's own
+  `__cxa_can_catch` and adjusting the pointer for a base class. Answering with
+  the exception in flight picks the wrong handler for `throw Derived; catch
+  (Base&)`, which is worse than saying it is not written.
 - **The table is copied, and it does not matter.** There is no `table.set`,
   `table.grow`, `table.fill` or `table.copy` in this decompiler, and an
   unmodelled opcode is refused rather than dropped — so a table cannot change
