@@ -1,0 +1,17 @@
+[package]
+name = "unwasm-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "unwasm"
+path = "src/main.rs"
+
+[dependencies]
+unwasm-core.workspace = true
+
+[lints]
+workspace = true

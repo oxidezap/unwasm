@@ -1,0 +1,16 @@
+[package]
+name = "unwasm-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The only dependency. Decoding is the one part of this that is not the point of
+# the project, and wasmparser is the reference decoder — writing another one
+# would spend the iteration budget on bytes we already know how to read.
+wasmparser = { version = "0.254", default-features = false, features = ["std", "validate"] }
+
+[lints]
+workspace = true
