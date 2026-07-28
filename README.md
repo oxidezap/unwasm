@@ -150,6 +150,51 @@ On the mozjpeg capture that recovers 247 strings, including the Rust panic
 messages that name the failing function — which is how `wa-wasm-oracle` worked
 out that module's calling convention in the first place.
 
+### Names, where the module never wrote any
+
+The VoIP module is stripped: no name section, no mangled symbols, nothing. What
+it does have is its own log messages, and a function that logs
+`fill_relay_info Failed to copy uuid` is very probably `fill_relay_info`:
+
+```rust
+/// Function #458. The module names nothing; this one references
+/// "fill_user_info_from_participant Missing participant jid…", a message no
+/// other function references — so it is probably `fill_user_info_from_participant`.
+pub(crate) fn f458_fill_user_info_from_participant(&mut self, ..)
+```
+
+**2654 of its 13347 functions get a name this way.** Two rules keep it from
+inventing them:
+
+- **The message must belong to one function.** A message in fifty functions
+  distinguishes none of them — `index out of bounds` is in most of a Rust
+  module. Uniqueness is what makes the guess worth making.
+- **The identifier must look like one.** A lowercase token with an underscore,
+  at the start of the message. Anything looser turns `error while parsing` into
+  a function called `error`.
+
+The index stays in the name, which is what makes the guess safe: a reader
+tracing `call 4213` finds `f4213_parse_xmpp_offer` either way, and a wrong guess
+costs a misleading suffix rather than a lost thread.
+
+It is not a general technique, and the numbers say so plainly: 2654 names in the
+VoIP module, 25 in the next one, and 0 in two others. It works where code logs
+with a function prefix — which the WhatsApp code does and mozjpeg does not.
+
+#### Reaching the strings at all
+
+None of that was possible until the segments could be read. A module built for
+threads places its data with `memory.init` rather than at static offsets: **all
+125 of the VoIP module's segments are passive**, carrying no address, so every
+string in it was unreachable. The addresses are in the code, as three constants
+before the `memory.init`, and resolving them turned 0 quoted strings into
+105222.
+
+Placements are recorded only in that plainest form. Per-thread storage is placed
+at a computed `base + offset`, and a segment placed at two different constant
+addresses is dropped rather than picked between — both are true, so neither can
+resolve an address back to text.
+
 ### The shadow stack
 
 A C function's locals do not all fit in wasm locals: anything whose address is

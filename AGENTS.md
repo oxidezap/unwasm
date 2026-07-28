@@ -183,14 +183,22 @@ pointer, an exported `setThrew`, and a declared type for what the table holds.
 Missing any of them, the import stays the host's — `analysis.rs` decides, and
 the tests cover each refusal.
 
+## Fixtures are named by their content
+
+`assemble` and `compile_c` name their files after a digest of the source and
+write through a temporary, because cargo runs test binaries in parallel *and*
+tests within one binary as threads. Naming a fixture after the test lets one
+test read a file another is still writing, and the failure that produces —
+"unexpected end-of-file" on a module that is fine — reads as a decoder bug. It
+happened twice before this was fixed properly.
+
 ## Open work
 
-1. **Name functions from the strings they reference.** The VoIP module is
-   stripped — no name section, no mangled symbols — but its data segments are
-   full of specific log messages (`parse_xmpp_offer: invalid call-creator jid`).
-   A function that references one almost certainly is that function. For a
-   binary with no names at all this is the largest legibility win available, and
-   it is cheap.
+1. **Host the VoIP module.** 102 imports remain: 7 WASI, 20 Emscripten runtime,
+   20 C++ runtime and syscalls, 16 embind/emval, and 40 WhatsApp callbacks.
+   `wa-wasm-oracle` implements most of the first four groups already.
+2. **Promote frame slots to variables**, with the caveat recorded above about
+   byte-exactness.
 2. **Level 1 proper**: turn shadow-stack slots into named locals, now that the
    stack pointer is identified. The frame size is in the prologue; what is
    missing is tracking which offsets from it are distinct variables.

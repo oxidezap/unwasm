@@ -97,17 +97,58 @@ fn tool(name: &str) -> Command {
     Command::new(name)
 }
 
+/// A short stable digest of some text, for naming files by their content.
+///
+/// Two tests can legitimately assemble the same fixture — and cargo runs test
+/// binaries in parallel, so naming the file after the test alone means one test
+/// can read a file another is still writing. That is a flaky failure that looks
+/// like a decoder bug: "unexpected end-of-file" on a module that is fine.
+/// Content-addressing removes the class rather than the instance.
+fn digest(text: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// A name no other writer in this process is using.
+///
+/// The process id is not enough: cargo runs the tests in one process, as
+/// threads, so two of them share it.
+fn unique_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "tmp{}_{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Writes a file so that no reader can ever see it half-written.
+fn write_atomically(path: &Path, bytes: &[u8]) {
+    let temporary = path.with_extension(unique_suffix());
+    std::fs::write(&temporary, bytes).expect("writing the temporary file");
+    std::fs::rename(&temporary, path).expect("renaming into place");
+}
+
 /// Assembles a `.wat` source into a module, via wasm-tools.
 pub fn assemble(name: &str, wat: &str) -> Vec<u8> {
     let scratch = workspace_scratch(name);
-    let source = scratch.join("module.wat");
-    let binary = scratch.join("module.wasm");
-    std::fs::write(&source, wat).expect("writing the wat source");
+    let stem = digest(wat);
+    let source = scratch.join(format!("{stem}.wat"));
+    let binary = scratch.join(format!("{stem}.wasm"));
+    write_atomically(&source, wat.as_bytes());
+    // Straight to a temporary of its own, then into place: wasm-tools writing
+    // the destination directly is the same race one step further along.
+    let temporary = scratch.join(format!("{stem}.wasm.{}", unique_suffix()));
     let output = tool("wasm-tools")
         .arg("parse")
         .arg(&source)
         .arg("-o")
-        .arg(&binary)
+        .arg(&temporary)
         .output()
         .expect("running wasm-tools");
     assert!(
@@ -115,6 +156,7 @@ pub fn assemble(name: &str, wat: &str) -> Vec<u8> {
         "wasm-tools rejected the fixture:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    std::fs::rename(&temporary, &binary).expect("renaming the module into place");
     std::fs::read(&binary).expect("reading the assembled module")
 }
 
@@ -175,9 +217,10 @@ pub fn compile_emscripten(name: &str, source: &str, extension: &str, flags: &[&s
 /// emsdk install for every iteration.
 pub fn compile_c(name: &str, source: &str, optimisation: &str) -> Vec<u8> {
     let scratch = workspace_scratch(name);
-    let file = scratch.join("fixture.c");
-    let binary = scratch.join("fixture.wasm");
-    std::fs::write(&file, source).expect("writing the C fixture");
+    let stem = digest(&format!("{source}{optimisation}"));
+    let file = scratch.join(format!("{stem}.c"));
+    let binary = scratch.join(format!("{stem}.wasm"));
+    write_atomically(&file, source.as_bytes());
     let output = tool("clang")
         .args(["--target=wasm32", "-nostdlib", optimisation])
         // `--export-all` rather than per-function attributes: the fixtures stay

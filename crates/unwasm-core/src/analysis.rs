@@ -112,6 +112,45 @@ pub struct Invoke {
     pub callee_type: u32,
 }
 
+/// Where a passive data segment ends up in memory.
+///
+/// A module built for threads places its data with `memory.init` rather than
+/// with static offsets — the main thread copies it once, and the segments
+/// themselves carry no address. The VoIP module's 125 segments are all like
+/// this, which is why nothing was readable in it until the placements were
+/// resolved: every string in the module is in a segment that says nothing
+/// about where it lives.
+///
+/// The address is in the code, though, as three constants before the
+/// `memory.init`. Anything less definite than that is not recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placement {
+    /// Where the copy lands.
+    pub address: i32,
+    /// Where in the segment it starts.
+    pub offset: u32,
+    /// How many bytes.
+    pub length: u32,
+}
+
+/// A name guessed for a function from a string it references.
+///
+/// A stripped module has no name section and no mangled symbols — the VoIP
+/// module has neither — but its data segments are full of messages that name
+/// the code that logs them: `parse_xmpp_offer: invalid call-creator jid`. A
+/// function referencing one is very probably that function.
+///
+/// "Very probably" is the whole point, and it is why this carries its evidence
+/// and why the index stays in the emitted name. It is a hypothesis with a
+/// reason attached, not a symbol table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedName {
+    /// The identifier taken out of the message.
+    pub name: String,
+    /// The message it came from, in full.
+    pub evidence: String,
+}
+
 /// What could be read out of a module.
 #[derive(Debug, Clone, Default)]
 pub struct Analysis {
@@ -124,6 +163,12 @@ pub struct Analysis {
     /// The module's exported `setThrew`, which a trampoline needs to report a
     /// caught exception back to the guest.
     pub set_threw: Option<u32>,
+    /// Where each passive data segment is placed, by segment index, when the
+    /// module places it at a constant address.
+    pub placements: std::collections::BTreeMap<u32, Placement>,
+    /// Names guessed from the strings a function references, by function index.
+    /// Only for functions the module did not name itself.
+    pub derived_names: std::collections::BTreeMap<u32, DerivedName>,
 }
 
 /// Reads a module for the things worth naming.
@@ -139,6 +184,7 @@ pub fn analyse(module: &Module) -> Analysis {
     } else {
         Vec::new()
     };
+    let placements = find_placements(module);
     Analysis {
         frames: stack_pointer
             .map(|sp| find_frames(module, sp))
@@ -146,7 +192,154 @@ pub fn analyse(module: &Module) -> Analysis {
         stack_pointer,
         invokes,
         set_threw,
+        placements: placements.clone(),
+        derived_names: derive_names(module, &placements),
     }
+}
+
+/// Guesses names for unnamed functions from the messages they log.
+///
+/// Two rules keep this from inventing things:
+///
+/// - **The string must belong to one function.** A message in fifty functions
+///   distinguishes none of them, and `index out of bounds` is in most of a Rust
+///   module. Uniqueness is what makes the guess worth making.
+/// - **The identifier must look like one.** A lowercase token with an
+///   underscore in it, at the start of the message, followed by `:` or a space
+///   — which is how a C or Rust log line names its function. Anything looser
+///   would turn `error while parsing` into a function called `error`.
+fn derive_names(
+    module: &Module,
+    placements: &std::collections::BTreeMap<u32, Placement>,
+) -> std::collections::BTreeMap<u32, DerivedName> {
+    let import_count = module.func_imports.len() as u32;
+
+    // Which functions reference each candidate message.
+    let mut owners: std::collections::BTreeMap<String, Vec<u32>> = Default::default();
+    for (at, func) in module.funcs.iter().enumerate() {
+        let index = import_count + at as u32;
+        let mut seen: std::collections::BTreeSet<String> = Default::default();
+        for (position, op) in func.body.iter().enumerate() {
+            let Op::I32Const(address) = op else { continue };
+            // The address a `memory.init` copies *to* is not a reference to the
+            // text — it is the placement itself. Counting it would make every
+            // string at the start of a segment look like it belonged to the
+            // initialiser as well as to its real user, and a string in two
+            // functions names neither.
+            if matches!(func.body.get(position + 3), Some(Op::MemoryInit(_))) {
+                continue;
+            }
+            let length = match func.body.get(position + 1) {
+                Some(Op::I32Const(length)) if *length > 0 => Some(*length as u32),
+                _ => None,
+            };
+            let text = length
+                .and_then(|length| placed_text(module, placements, *address, Some(length)))
+                .or_else(|| placed_text(module, placements, *address, None));
+            let Some(text) = text else { continue };
+            if identifier_in(&text).is_some() {
+                seen.insert(text);
+            }
+        }
+        for text in seen {
+            owners.entry(text).or_default().push(index);
+        }
+    }
+
+    let mut names: std::collections::BTreeMap<u32, DerivedName> = Default::default();
+    for (text, functions) in owners {
+        // Shared by two functions is not evidence about either of them.
+        let [function] = functions[..] else { continue };
+        if module.func_name(function).is_some() {
+            continue;
+        }
+        let Some(name) = identifier_in(&text) else {
+            continue;
+        };
+        // A function referencing several unique messages keeps the first by
+        // address order, which is stable across runs; a longer identifier is
+        // preferred when they differ, being the more specific of the two.
+        let candidate = DerivedName {
+            name: name.to_string(),
+            evidence: text,
+        };
+        match names.get(&function) {
+            Some(existing) if existing.name.len() >= candidate.name.len() => {}
+            _ => {
+                names.insert(function, candidate);
+            }
+        }
+    }
+    names
+}
+
+/// The function name a log message starts with, if it starts with one.
+fn identifier_in(text: &str) -> Option<&str> {
+    let first = text.split([':', ' ', '(', ',']).next()?;
+    let long_enough = first.len() >= 6 && first.len() <= 60;
+    let shaped_like_an_identifier = first.contains('_')
+        && first
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+        && first.starts_with(|ch: char| ch.is_ascii_lowercase());
+    (long_enough && shaped_like_an_identifier).then_some(first)
+}
+
+/// Finds where the module places its passive data segments.
+///
+/// Only the plainest form counts: three constants and a `memory.init`, which is
+/// what `__wasm_init_memory` emits for the main thread. A module can also place
+/// a segment at a computed address — per-thread storage does, at `base + 32` —
+/// and where the address is computed, this records nothing rather than guess at
+/// one of them.
+///
+/// A segment placed at two different constant addresses is dropped for the same
+/// reason: both are true, so neither can be used to resolve an address back to
+/// text.
+fn find_placements(module: &Module) -> std::collections::BTreeMap<u32, Placement> {
+    let mut placements: std::collections::BTreeMap<u32, Placement> = Default::default();
+    let mut ambiguous: std::collections::BTreeSet<u32> = Default::default();
+
+    for func in &module.funcs {
+        for (at, op) in func.body.iter().enumerate() {
+            let Op::MemoryInit(segment) = op else {
+                continue;
+            };
+            // The three operands, immediately before and all constant.
+            let (
+                Some(Op::I32Const(address)),
+                Some(Op::I32Const(offset)),
+                Some(Op::I32Const(length)),
+            ) = (
+                at.checked_sub(3).and_then(|index| func.body.get(index)),
+                at.checked_sub(2).and_then(|index| func.body.get(index)),
+                at.checked_sub(1).and_then(|index| func.body.get(index)),
+            )
+            else {
+                continue;
+            };
+            if *offset < 0 || *length <= 0 {
+                continue;
+            }
+            let placement = Placement {
+                address: *address,
+                offset: *offset as u32,
+                length: *length as u32,
+            };
+            match placements.get(segment) {
+                Some(existing) if *existing != placement => {
+                    ambiguous.insert(*segment);
+                }
+                _ => {
+                    placements.insert(*segment, placement);
+                }
+            }
+        }
+    }
+    for segment in ambiguous {
+        placements.remove(&segment);
+    }
+    placements
 }
 
 fn find_export(module: &Module, names: &[&str]) -> Option<u32> {
@@ -618,19 +811,49 @@ pub fn static_text_of_length(module: &Module, address: i32, length: u32) -> Opti
 }
 
 fn static_text_inner(module: &Module, address: i32, length: Option<usize>) -> Option<String> {
+    static_text_placed(module, &Default::default(), address, length)
+}
+
+/// The text at an address, including in segments the module places itself.
+///
+/// A threaded module's segments are passive and carry no address, so their
+/// contents are unreachable until the placements are resolved — and *every*
+/// string in the VoIP module is in one.
+#[must_use]
+pub fn placed_text(
+    module: &Module,
+    placements: &std::collections::BTreeMap<u32, Placement>,
+    address: i32,
+    length: Option<u32>,
+) -> Option<String> {
+    static_text_placed(module, placements, address, length.map(|len| len as usize))
+}
+
+fn static_text_placed(
+    module: &Module,
+    placements: &std::collections::BTreeMap<u32, Placement>,
+    address: i32,
+    length: Option<usize>,
+) -> Option<String> {
     const SHORTEST: usize = 4;
     const LONGEST: usize = 120;
 
     let address = address as u32;
-    for segment in &module.datas {
-        let Some(ConstExpr::I32(base)) = segment.offset else {
-            continue;
+    for (index, segment) in module.datas.iter().enumerate() {
+        // An active segment says where it goes; a passive one is wherever the
+        // module put it, if it did so at a constant address.
+        let (base, within) = match segment.offset {
+            Some(ConstExpr::I32(base)) => (base as u32, 0usize),
+            Some(_) => continue,
+            None => match placements.get(&(index as u32)) {
+                Some(placement) => (placement.address as u32, placement.offset as usize),
+                None => continue,
+            },
         };
-        let base = base as u32;
         if address < base {
             continue;
         }
-        let at = (address - base) as usize;
+        let at = (address - base) as usize + within;
         if at >= segment.bytes.len() {
             continue;
         }

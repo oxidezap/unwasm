@@ -424,7 +424,11 @@ impl<'a> Generator<'a> {
         }
 
         if let Some(start) = self.module.start {
-            let _ = writeln!(self.out, "        instance.f{start}();");
+            let _ = writeln!(
+                self.out,
+                "        instance.{}();",
+                function_ident(start, &self.analysis)
+            );
         }
         self.out.push_str("        instance\n    }\n\n");
 
@@ -552,11 +556,11 @@ impl<'a> Generator<'a> {
             let args: Vec<String> = (0..ty.params.len()).map(|at| format!("p{at}")).collect();
             let _ = writeln!(
                 self.out,
-                "    /// Exported as `{}`.\n    pub fn {name}(&mut self{}) {} {{\n        self.f{}({})\n    }}\n",
+                "    /// Exported as `{}`.\n    pub fn {name}(&mut self{}) {} {{\n        self.{}({})\n    }}\n",
                 escape_doc(&export.name),
                 signature_of(ty),
                 return_type(ty),
-                export.index,
+                function_ident(export.index, &self.analysis),
                 args.join(", ")
             );
         }
@@ -647,15 +651,17 @@ impl<'a> Generator<'a> {
                 .global,
             &self.analysis,
         );
-        let set_threw = self
-            .analysis
-            .set_threw
-            .expect("a trampoline is only generated with one");
+        let set_threw_ident = function_ident(
+            self.analysis
+                .set_threw
+                .expect("a trampoline is only generated with one"),
+            &self.analysis,
+        );
         let zero = ty.results.first().map_or("", |result| result.zero());
 
         let _ = writeln!(
             self.out,
-            "    /// `env::{field}` — generated, not delegated.\n    ///\n    /// Emscripten's exception trampoline: call through the table, and if the\n    /// callee throws, restore the stack pointer and tell the module through\n    /// its own `setThrew`. A trap is not an exception and is re-raised.\n    fn f{index}(&mut self{}) {} {{\n        let saved = self.{stack_pointer};\n        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{\n            self.call_indirect_{}(p0{}{})\n        }}));\n        match outcome {{\n            Ok(value) => value,\n            Err(payload) => {{\n                if payload.is::<rt::GuestException>() {{\n                    self.{stack_pointer} = saved;\n                    self.f{set_threw}(1, 0);\n                    {zero}\n                }} else {{\n                    std::panic::resume_unwind(payload)\n                }}\n            }}\n        }}\n    }}\n",
+            "    /// `env::{field}` — generated, not delegated.\n    ///\n    /// Emscripten's exception trampoline: call through the table, and if the\n    /// callee throws, restore the stack pointer and tell the module through\n    /// its own `setThrew`. A trap is not an exception and is re-raised.\n    fn f{index}(&mut self{}) {} {{\n        let saved = self.{stack_pointer};\n        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{\n            self.call_indirect_{}(p0{}{})\n        }}));\n        match outcome {{\n            Ok(value) => value,\n            Err(payload) => {{\n                if payload.is::<rt::GuestException>() {{\n                    self.{stack_pointer} = saved;\n                    self.{set_threw_ident}(1, 0);\n                    {zero}\n                }} else {{\n                    std::panic::resume_unwind(payload)\n                }}\n            }}\n        }}\n    }}\n",
             signature_of(ty),
             return_type(ty),
             invoke.callee_type,
@@ -701,7 +707,8 @@ impl<'a> Generator<'a> {
                 let index = import_count + at as u32;
                 let _ = writeln!(
                     self.out,
-                    "            Some({index}) => self.f{index}({}),",
+                    "            Some({index}) => self.{}({}),",
+                    function_ident(index, &self.analysis),
                     args.join(", ")
                 );
             }
@@ -749,6 +756,16 @@ impl<'a> Generator<'a> {
         let mut out = String::new();
         if let Some(name) = self.module.func_name(index) {
             let _ = writeln!(out, "    /// `{}`", escape_doc(name));
+        } else if let Some(derived) = self.analysis.derived_names.get(&index) {
+            // The name is a guess, so the reason travels with it. Without the
+            // evidence a reader has to take `parse_xmpp_offer` on trust, and
+            // there is nothing else in a stripped module to check it against.
+            let _ = writeln!(
+                out,
+                "    /// Function #{index}. The module names nothing; this one references\n    /// {}, a message no other function\n    /// references — so it is probably `{}`.",
+                escape_comment(&derived.evidence),
+                escape_doc(&derived.name)
+            );
         } else {
             let _ = writeln!(out, "    /// Function #{index}, unnamed in the module.");
         }
@@ -761,7 +778,8 @@ impl<'a> Generator<'a> {
         // in the one it was defined in.
         let _ = writeln!(
             out,
-            "    pub(crate) fn f{index}(&mut self{}) {} {{",
+            "    pub(crate) fn {}(&mut self{}) {} {{",
+            function_ident(index, &self.analysis),
             signature_of(ty),
             return_type(ty)
         );
@@ -1232,15 +1250,18 @@ impl<'a> Body<'a> {
                 // On a minified module these are often the only readable thing
                 // left, and they cost nothing to carry: the comment travels
                 // with the expression into whatever consumes it.
+                let placements = &self.analysis.placements;
                 let text = match self.next_op {
                     // `ptr, len`: the pair a `&str` is passed as. Trying the
                     // length first is what keeps Rust's unterminated strings
                     // from running into each other.
-                    Some(Op::I32Const(length)) if length > 0 => {
-                        analysis::static_text_of_length(self.module, *value, length as u32)
-                            .or_else(|| analysis::static_text(self.module, *value))
+                    Some(Op::I32Const(length)) if length > 0 && length <= 512 => {
+                        analysis::placed_text(self.module, placements, *value, Some(length as u32))
+                            .or_else(|| {
+                                analysis::placed_text(self.module, placements, *value, None)
+                            })
                     }
-                    _ => analysis::static_text(self.module, *value),
+                    _ => analysis::placed_text(self.module, placements, *value, None),
                 };
                 let code = match text {
                     Some(text) => format!("{} /* {} */", format_i32(*value), escape_comment(&text)),
@@ -1460,7 +1481,8 @@ impl<'a> Body<'a> {
         self.spill_operands(&mut arguments);
         self.spill_stack();
         let call = format!(
-            "self.f{index}({})",
+            "self.{}({})",
+            function_ident(index, self.analysis),
             arguments
                 .iter()
                 .map(|value| value.code.clone())
@@ -1642,6 +1664,21 @@ fn store_method(kind: StoreKind) -> (&'static str, &'static str) {
         StoreKind::I64Store8 => ("store8", ""),
         StoreKind::I64Store16 => ("store16", ""),
         StoreKind::I64Store32 => ("store32", ""),
+    }
+}
+
+/// The Rust name of a function.
+///
+/// The index always leads: `f4213`, and `f4213_parse_xmpp_offer` when a name
+/// could be guessed from the module's own log messages. Keeping the index is
+/// what makes the guess safe to make — a reader tracing `call 4213` in the
+/// bytes finds it either way, and a wrong guess costs a misleading suffix
+/// rather than a lost thread.
+#[must_use]
+pub fn function_ident(index: u32, analysis: &Analysis) -> String {
+    match analysis.derived_names.get(&index) {
+        Some(derived) => format!("f{index}_{}", sanitize(&derived.name)),
+        None => format!("f{index}"),
     }
 }
 
