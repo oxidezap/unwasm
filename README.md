@@ -738,6 +738,38 @@ import stays the host's to implement.
 - **Level 0 only.** Linear memory is bytes; a C local that lived in the shadow
   stack is still an address, and a struct is still an offset.
 
+### Threads
+
+A module built with pthreads declares a `shared` memory, and its threads are
+instances of the same module over it — each with its own globals, its own
+`__stack_pointer` above all. That is what the output models:
+
+```rust
+let mut main_thread = generated::Instance::new();
+let mut worker = main_thread.spawn(host::Host::default());
+worker.set_stack(0x20000);                       // its own, not the main one's
+std::thread::spawn(move || worker.thread_entry(arg));
+```
+
+The memory is an `Arc<[AtomicU8]>` every instance holds a handle to — no
+`unsafe`, and a plain wasm access on a shared memory *is* a relaxed atomic, so
+that is the faithful model rather than a conservative one. `memory.atomic.wait`
+and `notify` are real: a wait blocks until another thread notifies it, and
+traps only when no other instance holds the memory, which is a fact about the
+handles rather than an assumption about the model.
+
+Its size is reserved at construction, because a shared memory cannot be
+reallocated while other threads hold handles to it. The default is 64 MiB;
+`with_host_and_reservation` says otherwise, and growing past it returns `-1`,
+which the spec allows and which says exactly what happened.
+
+The table is copied into each thread rather than shared, and that is not the
+divergence it looks like: this decompiler has no `table.set`, `table.grow`,
+`table.fill` or `table.copy`, and an opcode it does not model is refused by
+name rather than dropped — so a module that mutated its table would not have
+decompiled at all. None of the six captured modules contains one, and the VoIP
+module's table is declared `9291 9291`, which cannot grow.
+
 ## Where it goes
 
 - **Level 1 — structured.** Recover the shadow stack (the `__stack_pointer`

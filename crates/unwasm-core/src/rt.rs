@@ -242,6 +242,15 @@ impl Memory {
         old
     }
 
+    /// The bytes, copied out.
+    ///
+    /// The same method a [`SharedMemory`] has, so a driver that dumps a memory
+    /// does not have to know which kind it got.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.data.clone()
+    }
+
     /// `memory.size`: the current size in pages.
     #[must_use]
     pub fn size(&self) -> i32 {
@@ -910,6 +919,17 @@ impl SharedMemory {
         if timeout == 0 {
             return 2;
         }
+        // Nobody else holds this memory, so nobody can ever notify: the wait is
+        // not slow, it is unsatisfiable. The single-threaded runtime traps here
+        // for the same reason, on an assumption; this decides it on a fact, and
+        // it is what lets a threaded module be run on one thread without
+        // hanging.
+        if timeout < 0 && std::sync::Arc::strong_count(&self.cells) == 1 {
+            trap(
+                "memory.atomic.wait would block forever: no other instance shares this \
+                 memory, so no other thread can notify it",
+            );
+        }
         let generation = {
             let entry = parked.entry(at).or_insert((0, 0));
             entry.1 += 1;
@@ -1111,6 +1131,15 @@ impl Access for SharedMemory {
     fn byte_len(&self) -> usize {
         self.pages.load(std::sync::atomic::Ordering::Acquire) as usize * PAGE_SIZE
     }
+    fn grow_pages(&mut self, delta_pages: u32) -> i32 {
+        self.grow(delta_pages)
+    }
+    fn declared_max_pages(&self) -> Option<u32> {
+        // The reservation is a ceiling as real as the declared maximum, and
+        // reporting the larger of the two would promise memory that cannot be
+        // allocated once other threads hold this one.
+        Some(self.max_pages.unwrap_or(65536).min(self.reserved_pages()))
+    }
 }
 
 impl PartialEq for SharedMemory {
@@ -1163,6 +1192,11 @@ pub trait Access {
     fn set_byte_at(&mut self, at: usize, value: u8);
     /// How many bytes there are.
     fn byte_len(&self) -> usize;
+    /// `memory.grow`, so a host can answer `emscripten_resize_heap` without
+    /// knowing which memory it is holding.
+    fn grow_pages(&mut self, delta_pages: u32) -> i32;
+    /// The maximum the memory type declared, if it declared one.
+    fn declared_max_pages(&self) -> Option<u32>;
 }
 
 impl Access for Memory {
@@ -1180,6 +1214,12 @@ impl Access for Memory {
     }
     fn byte_len(&self) -> usize {
         self.data.len()
+    }
+    fn grow_pages(&mut self, delta_pages: u32) -> i32 {
+        self.grow(delta_pages)
+    }
+    fn declared_max_pages(&self) -> Option<u32> {
+        self.max_pages
     }
 }
 
@@ -1786,6 +1826,175 @@ mod tests {
         assert_ne!(one, two);
         two.store32(0, 0, 1);
         assert_eq!(one, two);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds memory access")]
+    fn a_shared_init_past_the_end_of_the_segment_traps() {
+        let mut memory = SharedMemory::new(1, None, 1);
+        memory.init(0, b"ab", 1, 4);
+    }
+
+    #[test]
+    fn a_timed_wait_that_is_notified_reports_being_woken() {
+        // The other side of the timeout loop: woken before the deadline, which
+        // returns 0 rather than 2 and is what a lock handoff looks like.
+        let memory = SharedMemory::new(1, None, 1);
+        let waiting = memory.clone();
+        let waiter = std::thread::spawn(move || waiting.atomic_wait(0, 0, 4, 0, 30_000_000_000));
+        let mut woken = 0;
+        while woken == 0 {
+            std::thread::yield_now();
+            woken = memory.atomic_notify(0, 0);
+        }
+        assert_eq!(waiter.join().expect("the waiter returns"), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds memory access")]
+    fn a_shared_byte_read_past_the_end_traps() {
+        let memory = SharedMemory::new(1, None, 4);
+        let _ = memory.byte_at(PAGE_SIZE);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds memory access")]
+    fn a_shared_byte_write_past_the_end_traps() {
+        let mut memory = SharedMemory::new(1, None, 4);
+        memory.set_byte_at(PAGE_SIZE, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds memory access")]
+    fn a_plain_byte_read_past_the_end_traps() {
+        let memory = Memory::new(1, None);
+        let _ = memory.byte_at(PAGE_SIZE);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds memory access")]
+    fn a_plain_byte_write_past_the_end_traps() {
+        let mut memory = Memory::new(1, None);
+        memory.set_byte_at(PAGE_SIZE, 1);
+    }
+
+    #[test]
+    fn growing_through_the_trait_answers_for_either_memory() {
+        // What a host calls to answer `emscripten_resize_heap`, without
+        // knowing which memory the module declared.
+        let mut plain = Memory::new(1, Some(4));
+        assert_eq!(plain.grow_pages(1), 1);
+        assert_eq!(plain.declared_max_pages(), Some(4));
+
+        let mut shared = SharedMemory::new(1, Some(8), 3);
+        assert_eq!(shared.grow_pages(1), 1);
+        // The reservation is a ceiling as real as the declared maximum, so the
+        // smaller of the two is what a host is told.
+        assert_eq!(shared.declared_max_pages(), Some(3));
+        let undeclared = SharedMemory::new(1, None, 2);
+        assert_eq!(undeclared.declared_max_pages(), Some(2));
+    }
+
+    #[test]
+    fn a_snapshot_is_the_bytes_either_kind_of_memory_holds() {
+        let mut plain = Memory::new(1, None);
+        plain.store32(0, 0, 7);
+        assert_eq!(plain.snapshot().len(), PAGE_SIZE);
+        assert_eq!(plain.snapshot()[0], 7);
+
+        let mut shared = SharedMemory::new(1, None, 2);
+        shared.store32(0, 0, 7);
+        assert_eq!(shared.snapshot(), plain.snapshot());
+    }
+
+    #[test]
+    fn a_caller_over_a_shared_memory_reads_and_writes_the_same_way() {
+        // The host code is generic over which memory it got, and this is the
+        // implementation that makes the shared one usable from one.
+        let mut memory = SharedMemory::new(1, None, 1);
+        let mut caller = Caller {
+            memory: &mut memory,
+        };
+        caller.write(32, b"shared\0");
+        assert_eq!(caller.cstring(32), b"shared");
+        assert_eq!(caller.bytes(32, 6), b"shared");
+        caller.write_i32(64, -2);
+        assert_eq!(caller.read_i32(64), -2);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds memory access")]
+    fn a_caller_over_a_shared_memory_still_traps_past_the_end() {
+        let mut memory = SharedMemory::new(1, None, 4);
+        let mut caller = Caller {
+            memory: &mut memory,
+        };
+        // Inside the reservation, past what the module grew into.
+        caller.write(PAGE_SIZE as i32, b"x");
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds memory access")]
+    fn reading_a_shared_byte_past_the_end_traps() {
+        let mut memory = SharedMemory::new(1, None, 4);
+        let caller = Caller {
+            memory: &mut memory,
+        };
+        let _ = caller.bytes(PAGE_SIZE as i32, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds memory access")]
+    fn a_caller_over_a_plain_memory_traps_on_a_byte_past_the_end() {
+        let mut memory = Memory::new(1, None);
+        let caller = Caller {
+            memory: &mut memory,
+        };
+        let _ = caller.bytes(PAGE_SIZE as i32, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds memory access")]
+    fn writing_a_byte_past_the_end_of_a_plain_memory_traps() {
+        let mut memory = Memory::new(1, None);
+        let mut caller = Caller {
+            memory: &mut memory,
+        };
+        caller.write(PAGE_SIZE as i32, b"x");
+    }
+
+    #[test]
+    #[should_panic(expected = "no other instance shares this memory")]
+    fn a_wait_nobody_can_answer_traps_rather_than_hanging() {
+        // One handle means no other thread can ever notify, so this wait is
+        // not slow — it is unsatisfiable, and saying so is the only honest
+        // answer. It is also what lets a threaded module run on one thread.
+        let memory = SharedMemory::new(1, None, 1);
+        let _ = memory.atomic_wait(0, 0, 4, 0, -1);
+    }
+
+    #[test]
+    fn a_shared_cmpxchg_at_eight_bytes_compares_the_whole_value() {
+        let mut memory = SharedMemory::new(1, None, 1);
+        memory.atomic_store(0, 0, 8, -1);
+        assert_eq!(memory.atomic_cmpxchg(0, 0, 8, -1, 5), -1);
+        assert_eq!(memory.atomic_load(0, 0, 8), 5);
+    }
+
+    #[test]
+    fn a_shared_write_reports_nothing_when_nothing_is_watched() {
+        let mut memory = SharedMemory::new(1, None, 1);
+        memory.store32_at(1, 0, 0, 1);
+        assert!(memory.hits().is_empty());
+    }
+
+    #[test]
+    fn a_shared_watchpoint_ignores_a_write_beside_the_range() {
+        let mut memory = SharedMemory::new(1, None, 1);
+        memory.watch(0x100, 4);
+        memory.store32_at(1, 0x0FC, 0, 1);
+        memory.store32_at(2, 0x104, 0, 1);
+        assert!(memory.hits().is_empty());
     }
 
     #[test]

@@ -275,12 +275,31 @@ Four of them, and all four came from someone actually reading a 9 MiB module:
 They share a shape worth keeping: each replaces a measurement someone was
 making by hand with one the machine already has the numbers for.
 
+## A thread is another instance over the same memory
+
+`SharedMemory` is `Arc<[AtomicU8]>`; `Instance::spawn` gives a new instance the
+same memory and its own globals. The three things that make it work and are
+easy to get wrong:
+
+- **The data segments are not placed again.** An engine does not re-run them
+  for a new thread, and doing it would overwrite whatever the program has
+  already written.
+- **The wait trap is now a fact, not an assumption.** `strong_count == 1` means
+  nobody can ever notify, so the wait is unsatisfiable rather than slow. That is
+  what lets a threaded module run on one thread without hanging.
+- **The table is copied, and it does not matter.** There is no `table.set`,
+  `table.grow`, `table.fill` or `table.copy` in this decompiler, and an
+  unmodelled opcode is refused rather than dropped — so a table cannot change
+  after instantiation, and a copy of something immutable is the original. This
+  was worth measuring rather than assuming: all six captured modules have zero
+  table-mutation opcodes, and the VoIP module's table is declared `9291 9291`.
+
 ## Open work
 
-1. **Host the VoIP module.** `unwasm host` writes the skeleton; what is left is
-   filling it. 67 of the 102 are mechanical (WASI, the C++ runtime, Emscripten's
-   runtime, embind/emval) and `wa-wasm-oracle` implements most of them already.
-   35 are WhatsApp's own callbacks and only the application can answer those.
+1. **Drive the VoIP module.** `unwasm host` now implements 51 of its 102
+   imports; the rest are WhatsApp's own callbacks, `stat` (a struct layout
+   nobody should guess at), `asm_const` (JavaScript the module carries) and the
+   pthread glue, which needs a way back into the instance from an import.
 2. **Level 1 proper**: turn shadow-stack slots into named locals, now that the
    stack pointer is identified. The frame size is in the prologue; what is
    missing is tracking which offsets from it are distinct variables — with the

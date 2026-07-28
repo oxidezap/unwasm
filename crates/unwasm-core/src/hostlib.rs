@@ -673,14 +673,14 @@ impl Emscripten {
     ///
     /// Returns 1 on success and 0 on refusal, which is the opposite of
     /// `memory.grow`'s convention and is what the module checks.
-    pub fn resize_heap(caller: &mut rt::Caller<'_, rt::Memory>, bytes: i32) -> i32 {
+    pub fn resize_heap<M: rt::Access>(caller: &mut rt::Caller<'_, M>, bytes: i32) -> i32 {
         let wanted = u64::from(bytes as u32);
-        let have = caller.memory.data.len() as u64;
+        let have = caller.memory.byte_len() as u64;
         if wanted <= have {
             return 1;
         }
         let pages = wanted.div_ceil(rt::PAGE_SIZE as u64) - have / rt::PAGE_SIZE as u64;
-        i32::from(caller.memory.grow(pages as u32) >= 0)
+        i32::from(caller.memory.grow_pages(pages as u32) >= 0)
     }
 
     /// `emscripten_get_heap_max`: the ceiling the memory type declared, or the
@@ -691,8 +691,8 @@ impl Emscripten {
     /// `u32::MAX`, because the module divides it by the page size and a value
     /// that is not a multiple of one is a number no memory can ever have.
     #[must_use]
-    pub fn heap_max(caller: &rt::Caller<'_, rt::Memory>) -> i32 {
-        let pages = u64::from(caller.memory.max_pages.unwrap_or(65536));
+    pub fn heap_max<M: rt::Access>(caller: &rt::Caller<'_, M>) -> i32 {
+        let pages = u64::from(caller.memory.declared_max_pages().unwrap_or(65536));
         let bytes = pages * rt::PAGE_SIZE as u64;
         bytes.min(0xFFFF_0000) as u32 as i32
     }

@@ -18,6 +18,7 @@
 mod common;
 
 use common::{Arg::I32, Arg::I64, assert_agrees, call};
+use unwasm_core::{Module, codegen};
 
 /// A module with a shared memory the harness supplies, as the VoIP module's
 /// host does.
@@ -222,8 +223,9 @@ fn main() {
         "a wait with no possible notifier must say so rather than time out: {output}"
     );
     assert!(
-        output.contains("single thread"),
-        "and must say why: {output}"
+        output.contains("no other instance shares this memory"),
+        "and must say why — which is now a fact about the handles on this \
+         memory rather than an assumption about the model: {output}"
     );
 }
 
@@ -376,4 +378,218 @@ fn the_whole_atomic_table_agrees() {
         .map(|at| call(&format!("probe{at}"), &[I32(0)]))
         .collect();
     assert_agrees("atomic-sweep", &wasm, &calls);
+}
+
+// ---- threads ----
+
+/// The model, end to end: two instances of one module over one memory.
+///
+/// This is what an Emscripten pthread is, and until there was a shared memory
+/// here it could not be run at all — which is why a threaded module could be
+/// read but never executed, and why "who wrote this address?" could not be
+/// answered by running it.
+#[test]
+fn two_instances_over_one_memory_are_two_threads() {
+    let wat = format!(
+        r#"{HEADER}
+    (global $sp (export "__stack_pointer") (mut i32) (i32.const 65536))
+    (func (export "bump") (param i32) (result i32)
+        local.get 0 i32.const 1 i32.atomic.rmw.add)
+    (func (export "read") (param i32) (result i32)
+        local.get 0 i32.atomic.load)
+    (func (export "set_stack") (param i32) local.get 0 global.set $sp)
+    (func (export "stack") (result i32) global.get $sp)
+)"#
+    );
+    let wasm = common::assemble("threads-shared", &wat);
+    let code = common::decompile(&wasm);
+    assert!(
+        code.contains("pub memory: rt::SharedMemory"),
+        "a shared memory becomes a shared memory:\n{code}"
+    );
+    assert!(code.contains("pub fn spawn<G: Imports>"), "{code}");
+
+    const DRIVER: &str = r#"
+mod generated;
+fn main() {
+    let mut main_thread = generated::Instance::new();
+    // Each thread gets its own stack pointer, which is the whole reason a
+    // thread is a separate instance rather than a second entry point.
+    main_thread.set_stack(0x10000);
+    let workers: Vec<_> = (0..4)
+        .map(|index| {
+            let mut worker = main_thread.spawn(generated::NoImports);
+            worker.set_stack(0x20000 + index * 0x1000);
+            std::thread::spawn(move || {
+                for _ in 0..1000 {
+                    worker.bump(64);
+                }
+                worker.stack()
+            })
+        })
+        .collect();
+    let stacks: Vec<i32> = workers.into_iter().map(|w| w.join().expect("joins")).collect();
+    println!("{}", main_thread.read(64));
+    println!("{}", main_thread.stack());
+    println!("{stacks:?}");
+}
+"#;
+    let output = common::run_with_driver("threads-shared", &wasm, DRIVER);
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(
+        lines[0], "4000",
+        "four threads, a thousand atomic increments each, nothing lost"
+    );
+    assert_eq!(
+        lines[1], "65536",
+        "and the main thread's stack pointer is its own"
+    );
+    assert_eq!(lines[2], "[131072, 135168, 139264, 143360]");
+}
+
+#[test]
+fn a_thread_joins_the_memory_rather_than_reinitialising_it() {
+    // An engine does not place the data segments again for a new thread: the
+    // bytes are already there, and placing them twice would undo whatever the
+    // running program has done to them.
+    let wat = format!(
+        r#"{HEADER}
+    (data (i32.const 128) "original")
+    (func (export "overwrite") i32.const 128 i32.const 88 i32.const 8 memory.fill)
+    (func (export "first") (result i32) i32.const 128 i32.load8_u)
+)"#
+    );
+    let wasm = common::assemble("threads-data", &wat);
+
+    const DRIVER: &str = r#"
+mod generated;
+fn main() {
+    let mut instance = generated::Instance::new();
+    println!("{}", instance.first());
+    instance.overwrite();
+    let worker = instance.spawn(generated::NoImports);
+    println!("{}", instance.first());
+    println!("{}", worker.data_dropped.len());
+}
+"#;
+    let output = common::run_with_driver("threads-data", &wasm, DRIVER);
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines[0], "111", "`o` of \"original\"");
+    assert_eq!(
+        lines[1], "88",
+        "spawning must not put the segment back over what the program wrote"
+    );
+    assert_eq!(lines[2], "1", "and the drop state travels with it");
+}
+
+#[test]
+fn waiting_and_notifying_work_between_two_real_threads() {
+    let wat = format!(
+        r#"{HEADER}
+    (func (export "wait") (param i32) (result i32)
+        local.get 0 i32.const 0 i64.const -1 memory.atomic.wait32)
+    (func (export "store_and_notify") (param i32) (param i32) (result i32)
+        local.get 0 local.get 1 i32.atomic.store
+        local.get 0 i32.const -1 memory.atomic.notify)
+)"#
+    );
+    let wasm = common::assemble("threads-wait", &wat);
+
+    const DRIVER: &str = r#"
+mod generated;
+fn main() {
+    let main_thread = generated::Instance::new();
+    let mut waiter = main_thread.spawn(generated::NoImports);
+    let parked = std::thread::spawn(move || waiter.wait(0));
+    // Store and notify until the waiter is actually parked. A notify that
+    // arrives first is not lost — the value is compared under the parking
+    // lock, so the waiter sees the change and returns 1 instead.
+    let mut notifier = main_thread.spawn(generated::NoImports);
+    let mut woken = 0;
+    while woken == 0 {
+        std::thread::yield_now();
+        woken = notifier.store_and_notify(0, 0);
+    }
+    println!("{}", parked.join().expect("the waiter returns"));
+}
+"#;
+    let output = common::run_with_driver("threads-wait", &wasm, DRIVER);
+    assert_eq!(
+        output.trim(),
+        "0",
+        "0 is woken-by-notify, which no single-threaded model can produce"
+    );
+}
+
+#[test]
+fn a_watchpoint_sees_the_thread_that_wrote() {
+    // The question this whole model exists to answer: an address is cleared,
+    // and nothing in the code says who did it. With threads over one memory
+    // the watchpoint answers it from a run.
+    let wat = format!(
+        r#"{HEADER}
+    (func (export "clear") i32.const 256 i32.const 0 i32.const 4 memory.fill)
+    (func (export "poke") i32.const 512 i32.const 1 i32.store)
+)"#
+    );
+    let wasm = common::assemble("threads-watch", &wat);
+    let module = Module::parse(&wasm).expect("valid");
+    let code = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            instrument_stores: true,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates")[0]
+        .contents
+        .clone();
+
+    const DRIVER: &str = r#"
+mod generated;
+fn main() {
+    let mut instance = generated::Instance::new();
+    instance.memory.watch(256, 4);
+    let mut worker = instance.spawn(generated::NoImports);
+    // The write happens on another thread entirely, and the hit still lands
+    // in the one list.
+    std::thread::spawn(move || worker.clear()).join().expect("joins");
+    instance.poke();
+    for hit in instance.memory.hits() {
+        println!("{} {:?}", hit.site, hit.kind);
+    }
+}
+"#;
+    let output = common::run_with_generated("threads-watch", &code, DRIVER);
+    assert_eq!(
+        output.trim(),
+        "0 Fill",
+        "the memset on the other thread, and not the unwatched store"
+    );
+}
+
+#[test]
+fn a_threaded_module_hands_its_imports_the_shared_memory() {
+    // The host's methods take whichever memory the module declared, so a host
+    // written against `Caller` compiles either way — but the type it gets has
+    // to be the right one, or nothing it reads is the memory the guest uses.
+    let wat = format!(
+        r#"{HEADER}
+    (import "env" "log" (func (param i32)))
+    (func (export "go") i32.const 1 call 0)
+)"#
+    );
+    let wasm = common::assemble("threads-imports", &wat);
+    let code = common::decompile(&wasm);
+    assert!(
+        code.contains(
+            "fn env_log(&mut self, caller: &mut rt::Caller<'_, rt::SharedMemory>, p0: i32)"
+        ),
+        "{code}"
+    );
+    let host = codegen::generate_host(&Module::parse(&wasm).expect("valid")).expect("generates");
+    assert!(
+        host.contains("rt::Caller<'_, rt::SharedMemory>"),
+        "and the skeleton agrees with it:\n{host}"
+    );
 }

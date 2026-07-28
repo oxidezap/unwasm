@@ -411,7 +411,7 @@ fn run_in_rust_with_layout(
             .as_ref()
             .is_some_and(|memory| memory.imported.is_some());
     if exports_memory {
-        main.push_str("    println!(\"memory {}\", checksum(&instance.memory.data));\n}\n");
+        main.push_str("    println!(\"memory {}\", checksum(&instance.memory.snapshot()));\n}\n");
     } else {
         main.push_str("    println!(\"memory none\");\n}\n");
     }
