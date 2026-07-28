@@ -298,3 +298,34 @@ fn inspect_says_when_it_could_not_identify_a_stack_pointer() {
     assert!(stdout.contains("stack pointer: not identified"), "{stdout}");
     assert!(!stdout.contains("frames:"), "{stdout}");
 }
+
+#[test]
+fn inspect_reports_an_imported_shared_memory_as_both() {
+    // What the VoIP module looks like: the host owns the memory, and it is
+    // shared because the module was built for threads.
+    let path = fixture(
+        "sample-shared",
+        r#"(module
+            (import "env" "memory" (memory 160 32768 shared))
+            (func (export "f") (result i32) i32.const 1))"#,
+    );
+    let (ok, stdout, stderr) = run(&["inspect", path.to_str().expect("utf-8 path")]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains(
+            "memory: 160 pages initial, 32768 maximum, shared, imported from env::memory"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn inspect_reports_a_plain_declared_memory_plainly() {
+    let path = fixture(
+        "sample-plainmem",
+        "(module (memory 2) (func (export \"f\") (result i32) i32.const 1))",
+    );
+    let (ok, stdout, _) = run(&["inspect", path.to_str().expect("utf-8 path")]);
+    assert!(ok);
+    assert!(stdout.contains("memory: 2 pages initial\n"), "{stdout}");
+}

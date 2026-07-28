@@ -382,3 +382,23 @@ fn a_declared_element_segment_places_nothing() {
     assert_eq!(module.elems.len(), 1);
     assert_eq!(module.elems[0].offset, None);
 }
+
+#[test]
+fn a_module_with_both_an_imported_and_a_declared_memory_is_refused() {
+    // Legal only under the multi-memory proposal, and there is no single
+    // `self.memory` for it to mean.
+    let message = unsupported(
+        "both-memories",
+        "(module (import \"env\" \"memory\" (memory 1)) (memory 1))",
+    );
+    assert!(message.contains("multiple memories"), "{message}");
+}
+
+#[test]
+fn an_imported_sixty_four_bit_memory_is_refused_like_a_declared_one() {
+    let message = unsupported(
+        "import-mem64",
+        "(module (import \"env\" \"memory\" (memory i64 1)))",
+    );
+    assert!(message.contains("64-bit memory"), "{message}");
+}
