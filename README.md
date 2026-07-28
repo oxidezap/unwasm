@@ -464,6 +464,23 @@ operands folded into it are inside the span rather than missing from the map.
 `unwasm bytes` answers the other half: what is actually there, and whether the
 sequence is unique — which is what decides if a pattern patch is safe.
 
+**`unwasm constants`** finds every site that pushes a value — all of them,
+which is the point. An error code that turns up 481 times is not the nine sites
+a `grep` of the decompiled output finds, and an account built on the nine is
+guessing:
+
+```console
+$ unwasm constants voip.wasm 70008
+f11198_make_and_cache_offer  i32.const at 5095372 + 4 bytes
+…
+482 sites push 70008, and its four bytes appear 1 more time inside the data segments
+```
+
+Each site comes with its offset and its encoded length, which is what a
+same-length replacement needs: give all 482 a distinct value, run, and the
+engine's own log says which one fired. The data count is separate on purpose —
+counting the bytes of a number is not counting the sites that push it.
+
 **`--only … --with-callees`** brings the functions a function calls along with
 it. One level, not the transitive closure: reading a function and needing the
 next is the same minute, and needing the whole closure is the whole module.

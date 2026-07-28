@@ -1101,3 +1101,52 @@ fn bytes_prints_what_is_there_and_whether_it_is_unique() {
     assert!(!ok);
     assert!(stderr.contains("reading /nonexistent.wasm"), "{stderr}");
 }
+
+#[test]
+fn constants_finds_every_site_that_pushes_a_value() {
+    // The measurement this exists for: give each site a distinct value, run,
+    // and see which one comes back. A hand-counted subset answers the wrong
+    // question, and an error code that is also a data constant makes counting
+    // its bytes the wrong method too.
+    let path = fixture(
+        "constants-cli",
+        r#"(module
+            (memory 1)
+            (data (i32.const 0) "\78\11\01\00")
+            (func (export "one") (result i32) i32.const 70008)
+            (func (export "two") (result i32)
+                i32.const 70008 drop
+                i32.const 70009)
+            (func (export "wide") (result i64) i64.const 70008))"#,
+    );
+    let (ok, stdout, stderr) = run(&["constants", path.to_str().expect("utf-8 path"), "70008"]);
+    assert!(ok, "{stderr}");
+    assert_eq!(stdout.matches("i32.const at ").count(), 2, "{stdout}");
+    assert!(stdout.contains("i64.const at "), "{stdout}");
+    assert!(stdout.contains("3 sites push 70008"), "{stdout}");
+    assert!(
+        stdout.contains("four bytes appear 1 more time inside the data segments"),
+        "counting bytes is not counting sites: {stdout}"
+    );
+    // Every site says where it is and how long it is, which is what a
+    // same-length replacement needs.
+    assert!(stdout.contains(" + 4 bytes"), "{stdout}");
+
+    let (ok, stdout, _) = run(&["constants", path.to_str().expect("utf-8 path"), "12345"]);
+    assert!(ok);
+    assert!(stdout.contains("0 sites push 12345"), "{stdout}");
+    assert!(!stdout.contains("data segments"), "{stdout}");
+
+    let (ok, _, stderr) = run(&["constants", path.to_str().expect("utf-8 path")]);
+    assert!(!ok);
+    assert!(stderr.contains("needs a value"), "{stderr}");
+    let (ok, _, stderr) = run(&["constants", path.to_str().expect("utf-8 path"), "x"]);
+    assert!(!ok);
+    assert!(stderr.contains("value must be a number"), "{stderr}");
+    let (ok, _, stderr) = run(&["constants"]);
+    assert!(!ok);
+    assert!(stderr.contains("needs a module path"), "{stderr}");
+    let (ok, _, stderr) = run(&["constants", path.to_str().expect("utf-8 path"), "1", "2"]);
+    assert!(!ok);
+    assert!(stderr.contains("unexpected argument `2`"), "{stderr}");
+}

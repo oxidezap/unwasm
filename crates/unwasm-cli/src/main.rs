@@ -21,6 +21,7 @@ usage:
   unwasm signatures <module.wasm> [-o <sigs.txt>]
   unwasm frames    <module.wasm> [--outside]
   unwasm bytes     <module.wasm> <offset> <length>
+  unwasm constants <module.wasm> <value>
   unwasm inspect   <module.wasm>
 
   -o <out>       a path ending in .rs writes one file; any other path is a
@@ -55,6 +56,11 @@ things that move between builds left out. It matches ~91% across builds of the
 same toolchain and only a handful across different emscripten versions, so it
 is worth generating from a build of your own rather than expecting it to
 recognise someone else's.
+
+`constants` finds every site that pushes a value, with the file offset and the
+encoded length of each — all of them, which a hand-counted subset is not. An
+error code that occurs 481 times is not nine sites, and an account built on the
+nine is guessing.
 
 `frames --outside` lists the functions whose stores land past the end of their
 own stack frame — an overrun of a local array writes into the caller's frame,
@@ -103,6 +109,7 @@ fn run(arguments: &[String]) -> Result<String, String> {
         Some("signatures") => signatures(&arguments[1..]),
         Some("frames") => frames(&arguments[1..]),
         Some("bytes") => bytes(&arguments[1..]),
+        Some("constants") => constants(&arguments[1..]),
         Some("inspect") => inspect(&arguments[1..]),
         Some("-h" | "--help" | "help") | None => Ok(USAGE.to_string()),
         Some(other) => Err(format!("unknown command `{other}`\n\n{USAGE}")),
@@ -287,6 +294,80 @@ fn host(arguments: &[String]) -> Result<String, String> {
         }
         None => Ok(skeleton),
     }
+}
+
+/// Every site that pushes a constant, and every data segment that contains it.
+///
+/// The question this answers is "which of these is the one that ran". Giving
+/// each site a distinct value is how that gets measured, and doing it needs
+/// the offset of each and the number of bytes it occupies — a replacement of
+/// the same encoded length moves nothing else in the module.
+fn constants(arguments: &[String]) -> Result<String, String> {
+    let path = arguments.first().ok_or("constants needs a module path")?;
+    let value: i64 = arguments
+        .get(1)
+        .ok_or("constants needs a value")?
+        .parse()
+        .map_err(|_| "the value must be a number".to_string())?;
+    if let Some(extra) = arguments.get(2) {
+        return Err(format!("unexpected argument `{extra}`"));
+    }
+
+    let module = read(path)?;
+    let analysis = unwasm_core::analysis::analyse(&module);
+    let import_count = module.func_imports.len() as u32;
+    let mut out = String::new();
+    let mut sites = 0;
+    for (at, func) in module.funcs.iter().enumerate() {
+        let index = import_count + at as u32;
+        for (position, op) in func.body.iter().enumerate() {
+            let width = match op {
+                unwasm_core::module::Op::I32Const(found) if i64::from(*found) == value => "i32",
+                unwasm_core::module::Op::I64Const(found) if *found == value => "i64",
+                _ => continue,
+            };
+            sites += 1;
+            let name = codegen::function_ident(index, &analysis);
+            // The decoder fills one span per operator, so the fallback is
+            // never taken; it is here because printing a wrong offset would be
+            // worse than printing none, and a patch computed from one would
+            // land in the middle of another instruction.
+            let place = func.offsets.get(position).map_or(
+                "at an offset the decoder did not record".to_string(),
+                |(offset, length)| format!("at {offset} + {length} bytes"),
+            );
+            let _ = writeln!(out, "{name:<28} {width}.const {place}");
+        }
+    }
+
+    // The same number can sit in the data as well, which is why counting
+    // occurrences of its bytes is not the same as counting the sites that
+    // push it.
+    let bytes = (value as i32).to_le_bytes();
+    let in_data: usize = module
+        .datas
+        .iter()
+        .map(|segment| {
+            segment
+                .bytes
+                .windows(4)
+                .filter(|window| *window == bytes)
+                .count()
+        })
+        .sum();
+
+    Ok(format!(
+        "{out}\n{sites} site{} push {value}{}\n",
+        if sites == 1 { "" } else { "s" },
+        if in_data > 0 {
+            format!(
+                ", and its four bytes appear {in_data} more time{} inside the data segments",
+                if in_data == 1 { "" } else { "s" }
+            )
+        } else {
+            String::new()
+        }
+    ))
 }
 
 /// Prints the bytes at an offset, and says whether they are unique.
