@@ -413,3 +413,149 @@ fn a_write_through_a_computed_frame_address_says_it_cannot_be_checked() {
         "{code}"
     );
 }
+
+// ---- which bytes made this line ----
+
+/// A function whose every instruction is distinguishable in the binary.
+const PATCHABLE: &str = r#"(module
+    (memory (export "memory") 1)
+    (func $helper (result i32) i32.const 775533)
+    (func (export "work") (param i32) (result i32)
+        call $helper
+        drop
+        local.get 0
+        i32.const 4096
+        i32.store
+        local.get 0))"#;
+
+#[test]
+fn every_operator_carries_where_it_sits_in_the_file() {
+    let wasm = common::assemble("offsets-decode", PATCHABLE);
+    let module = Module::parse(&wasm).expect("valid");
+    for func in &module.funcs {
+        assert_eq!(
+            func.offsets.len(),
+            func.body.len(),
+            "one span per operator, and the trailing End dropped from both"
+        );
+        for (offset, length) in &func.offsets {
+            assert!(*length > 0, "an operator is at least its opcode byte");
+            assert!(
+                (*offset as usize) + (*length as usize) <= wasm.len(),
+                "and inside the file"
+            );
+        }
+    }
+    // The first operator of the first function is `i32.const 775533`, whose
+    // encoding is the opcode plus a four-byte SLEB.
+    let (offset, length) = module.funcs[0].offsets[0];
+    assert_eq!(length, 4, "0x41 then the three SLEB bytes ed aa 2f");
+    assert_eq!(wasm[offset as usize], 0x41);
+}
+
+#[test]
+fn the_sidecar_says_which_bytes_produced_a_line() {
+    let wasm = common::assemble("offsets-sidecar", PATCHABLE);
+    let module = Module::parse(&wasm).expect("valid");
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            map_offsets: true,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+
+    let sidecar = files
+        .iter()
+        .find(|file| file.name == "offsets.json")
+        .expect("written when asked for");
+    common::assert_valid_json(&sidecar.contents);
+
+    // Pick the line the store is on, look it up, and check the bytes behind it
+    // really are that store.
+    let code = &files[0].contents;
+    let line_number = code
+        .lines()
+        .position(|line| line.contains("self.memory.store32("))
+        .expect("the store is emitted")
+        + 1;
+    let needle = format!("[{line_number}, ");
+    let at = sidecar
+        .contents
+        .find(&needle)
+        .unwrap_or_else(|| panic!("line {line_number} is in the map:\n{}", sidecar.contents));
+    let entry = &sidecar.contents[at + 1..];
+    let entry = &entry[..entry.find(']').expect("closed")];
+    let numbers: Vec<usize> = entry
+        .split(", ")
+        .map(|number| number.parse().expect("a number"))
+        .collect();
+    let (offset, length) = (numbers[1], numbers[2]);
+    let span = &wasm[offset..offset + length];
+    assert_eq!(
+        &span[span.len() - 3..],
+        &[0x36, 0x02, 0x00],
+        "the span ends with the i32.store and its memarg: {span:02x?}"
+    );
+    assert!(
+        span.contains(&0x41),
+        "and reaches back over the constant folded into it: {span:02x?}"
+    );
+}
+
+#[test]
+fn a_function_left_out_is_not_in_the_map() {
+    // `--only` and `--offsets` together: what was stubbed has no lines, and
+    // must not claim any.
+    let wasm = common::assemble("offsets-only", PATCHABLE);
+    let module = Module::parse(&wasm).expect("valid");
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            only: Some([1u32].into_iter().collect()),
+            map_offsets: true,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+    let sidecar = &files
+        .iter()
+        .find(|file| file.name == "offsets.json")
+        .expect("present")
+        .contents;
+    assert!(sidecar.contains(r#""index": 1"#), "{sidecar}");
+    assert!(!sidecar.contains(r#""index": 0"#), "{sidecar}");
+    common::assert_valid_json(sidecar);
+}
+
+#[test]
+fn without_the_flag_there_is_no_sidecar() {
+    let wasm = common::assemble("offsets-absent", PATCHABLE);
+    let module = Module::parse(&wasm).expect("valid");
+    let files = codegen::generate_files(&module, codegen::Layout::Single).expect("generates");
+    assert!(!files.iter().any(|file| file.name == "offsets.json"));
+}
+
+#[test]
+fn a_split_layout_records_the_file_each_line_is_in() {
+    let wasm = common::assemble("offsets-split", PATCHABLE);
+    let module = Module::parse(&wasm).expect("valid");
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            layout: codegen::Layout::Split { lines_per_file: 1 },
+            map_offsets: true,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+    let sidecar = &files
+        .iter()
+        .find(|file| file.name == "offsets.json")
+        .expect("present")
+        .contents;
+    assert!(sidecar.contains(r#""file": "part0.rs""#), "{sidecar}");
+    assert!(sidecar.contains(r#""file": "part1.rs""#), "{sidecar}");
+    common::assert_valid_json(sidecar);
+}

@@ -1016,3 +1016,85 @@ fn calls_reports_the_number_of_call_sites() {
     assert!(ok, "{stderr}");
     assert!(stdout.contains("called by 1 from 2 call sites"), "{stdout}");
 }
+
+#[test]
+fn offsets_writes_a_sidecar_beside_the_output() {
+    let path = fixture("offsets-cli", SAMPLE);
+    let directory = scratch().join("offsets-out");
+    let _ = std::fs::remove_dir_all(&directory);
+    let (ok, stdout, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "-o",
+        directory.to_str().expect("utf-8 path"),
+        "--offsets",
+    ]);
+    assert!(ok, "{stderr}{stdout}");
+    let sidecar = std::fs::read_to_string(directory.join("offsets.json")).expect("written");
+    assert!(sidecar.contains("\"lines\":"), "{sidecar}");
+
+    // It has nowhere to go without a directory, and says so rather than
+    // silently dropping it.
+    let (ok, _, stderr) = run(&["decompile", path.to_str().expect("utf-8 path"), "--offsets"]);
+    assert!(!ok);
+    assert!(stderr.contains("needs -o <directory>"), "{stderr}");
+}
+
+#[test]
+fn bytes_prints_what_is_there_and_whether_it_is_unique() {
+    let path = fixture("bytes-cli", SAMPLE);
+    let raw = std::fs::read(&path).expect("read");
+    // The magic number: unique, and at a known place.
+    let (ok, stdout, stderr) = run(&["bytes", path.to_str().expect("utf-8 path"), "0", "4"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("0 (0x0) + 4: 00 61 73 6d"), "{stdout}");
+    assert!(stdout.contains("1 occurrence"), "{stdout}");
+    assert!(
+        stdout.contains("unique, so a pattern patch is safe"),
+        "{stdout}"
+    );
+
+    // A single byte that occurs many times says the opposite.
+    let common_byte = raw.iter().filter(|byte| **byte == 0x00).count();
+    assert!(common_byte > 1, "the fixture has repeated zero bytes");
+    let (ok, stdout, _) = run(&["bytes", path.to_str().expect("utf-8 path"), "0", "1"]);
+    assert!(ok);
+    assert!(stdout.contains("would hit all of them"), "{stdout}");
+
+    // Nothing asked for is nothing found, rather than a claim of uniqueness.
+    let (ok, stdout, _) = run(&["bytes", path.to_str().expect("utf-8 path"), "0", "0"]);
+    assert!(ok);
+    assert!(stdout.contains("0 occurrences"), "{stdout}");
+
+    // Past the end, and the argument errors.
+    let (ok, _, stderr) = run(&["bytes", path.to_str().expect("utf-8 path"), "999999", "4"]);
+    assert!(!ok);
+    assert!(stderr.contains("is past the end of"), "{stderr}");
+    let (ok, _, stderr) = run(&["bytes", path.to_str().expect("utf-8 path"), "x", "4"]);
+    assert!(!ok);
+    assert!(stderr.contains("offset must be a number"), "{stderr}");
+    let (ok, _, stderr) = run(&["bytes", path.to_str().expect("utf-8 path"), "0", "y"]);
+    assert!(!ok);
+    assert!(stderr.contains("length must be a number"), "{stderr}");
+    let (ok, _, stderr) = run(&["bytes", path.to_str().expect("utf-8 path"), "0"]);
+    assert!(!ok);
+    assert!(stderr.contains("needs a length"), "{stderr}");
+    let (ok, _, stderr) = run(&["bytes", path.to_str().expect("utf-8 path")]);
+    assert!(!ok);
+    assert!(stderr.contains("needs an offset"), "{stderr}");
+    let (ok, _, stderr) = run(&["bytes"]);
+    assert!(!ok);
+    assert!(stderr.contains("needs a module path"), "{stderr}");
+    let (ok, _, stderr) = run(&[
+        "bytes",
+        path.to_str().expect("utf-8 path"),
+        "0",
+        "4",
+        "more",
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("unexpected argument `more`"), "{stderr}");
+    let (ok, _, stderr) = run(&["bytes", "/nonexistent.wasm", "0", "4"]);
+    assert!(!ok);
+    assert!(stderr.contains("reading /nonexistent.wasm"), "{stderr}");
+}

@@ -258,6 +258,23 @@ host needs (the table, the globals, a way back into an export) goes in it as a
 field. Adding a field costs nothing; adding a parameter changes every host that
 has ever been written against the trait.
 
+## Reading affordances answer a question that was costing hours
+
+Four of them, and all four came from someone actually reading a 9 MiB module:
+
+- `--instrument-stores` + `Memory::watch` — who wrote this address. Every
+  write, `fill` and `copy` included, since a memset is the usual answer.
+- `frames --outside` — the static half: stores past the frame, and stores
+  through an address computed *from* the frame, which is the indexed-array
+  write that actually overruns.
+- `--offsets` + `unwasm bytes` — which bytes made this line, and is that byte
+  sequence unique. Hand-computed LEB arithmetic was the error source.
+- call *sites*, not just callers, in the doc comment: instrumenting a body
+  shared by 58 sites measures whichever one ran.
+
+They share a shape worth keeping: each replaces a measurement someone was
+making by hand with one the machine already has the numbers for.
+
 ## Open work
 
 1. **Host the VoIP module.** `unwasm host` writes the skeleton; what is left is

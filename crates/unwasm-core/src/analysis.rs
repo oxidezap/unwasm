@@ -1649,6 +1649,7 @@ mod tests {
                 type_index: 0,
                 locals: Vec::new(),
                 body,
+                offsets: Vec::new(),
             })
             .collect();
         module

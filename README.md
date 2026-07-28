@@ -420,6 +420,24 @@ have to emit one on purpose. What the list is really for is the second line:
 an indexed write into a frame array, whose offset is not knowable statically.
 226 of 4375 is a short enough list to read.
 
+**`--offsets`** writes `offsets.json` beside the output: for each generated
+line, the offset and length of the wasm bytes that produced it. Patching a
+module by hand otherwise means computing an LEB encoding and counting bytes,
+and a slip there does not look like a slip — the pattern is simply not found,
+which reads as "the code changed" rather than "the arithmetic was wrong".
+
+```console
+$ unwasm decompile voip.wasm -o out/ --offsets
+$ unwasm bytes voip.wasm 390 7
+390 (0x186) + 7: 23 00 41 10 6b 22 09
+1 occurrence of that sequence in the module — unique, so a pattern patch is safe
+```
+
+A line's span covers every operator lowered since the previous line, so the
+operands folded into it are inside the span rather than missing from the map.
+`unwasm bytes` answers the other half: what is actually there, and whether the
+sequence is unique — which is what decides if a pattern patch is safe.
+
 **`--only … --with-callees`** brings the functions a function calls along with
 it. One level, not the transitive closure: reading a function and needing the
 next is the same minute, and needing the whole closure is the whole module.

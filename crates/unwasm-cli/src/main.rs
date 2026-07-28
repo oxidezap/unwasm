@@ -20,6 +20,7 @@ usage:
   unwasm calls     <module.wasm> <index>
   unwasm signatures <module.wasm> [-o <sigs.txt>]
   unwasm frames    <module.wasm> [--outside]
+  unwasm bytes     <module.wasm> <offset> <length>
   unwasm inspect   <module.wasm>
 
   -o <out>       a path ending in .rs writes one file; any other path is a
@@ -32,7 +33,8 @@ usage:
   --only <list>  decompile only these function indices
   --with-callees  and everything they call directly
   --instrument-stores  route every memory write through the watchpoint runtime,
-                 so `instance.memory.watch(addr, len)` reports who wrote it, comma-separated. The
+                 so `instance.memory.watch(addr, len)` reports who wrote it
+  --offsets      also write offsets.json: which wasm bytes made each line, comma-separated. The
                  rest keep their signatures and become `unimplemented!()`, so
                  the result still compiles - for reading three functions out of
                  thirteen thousand without producing 365 MB.
@@ -100,6 +102,7 @@ fn run(arguments: &[String]) -> Result<String, String> {
         Some("calls") => calls(&arguments[1..]),
         Some("signatures") => signatures(&arguments[1..]),
         Some("frames") => frames(&arguments[1..]),
+        Some("bytes") => bytes(&arguments[1..]),
         Some("inspect") => inspect(&arguments[1..]),
         Some("-h" | "--help" | "help") | None => Ok(USAGE.to_string()),
         Some(other) => Err(format!("unknown command `{other}`\n\n{USAGE}")),
@@ -114,6 +117,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
     let mut catalogue: Option<codegen::Signatures> = None;
     let mut with_callees = false;
     let mut instrument = false;
+    let mut map_offsets = false;
     let mut rest = arguments[1..].iter();
     while let Some(argument) = rest.next() {
         match argument.as_str() {
@@ -134,6 +138,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
             }
             "--with-callees" => with_callees = true,
             "--instrument-stores" => instrument = true,
+            "--offsets" => map_offsets = true,
             "--only" => {
                 let value = rest.next().ok_or("--only needs a list of indices")?;
                 for part in value.split(',').filter(|part| !part.is_empty()) {
@@ -174,6 +179,12 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
         if split.is_some() {
             return Err("--split writes several files, so it needs -o <directory>".to_string());
         }
+        if map_offsets {
+            return Err(
+                "--offsets writes offsets.json beside the output, so it needs -o <directory>"
+                    .to_string(),
+            );
+        }
         if only.is_empty() && catalogue.is_none() && !instrument {
             return codegen::generate(&module).map_err(|error| error.to_string());
         }
@@ -184,6 +195,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
                 only: (!only.is_empty()).then(|| only.clone()),
                 signatures: catalogue.clone().unwrap_or_default(),
                 instrument_stores: instrument,
+                map_offsets,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -210,6 +222,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
             only: (!only.is_empty()).then(|| only.clone()),
             signatures: catalogue.unwrap_or_default(),
             instrument_stores: instrument,
+            map_offsets,
         },
     )
     .map_err(|error| error.to_string())?;
@@ -268,6 +281,63 @@ fn host(arguments: &[String]) -> Result<String, String> {
         }
         None => Ok(skeleton),
     }
+}
+
+/// Prints the bytes at an offset, and says whether they are unique.
+///
+/// The two questions a hand-written patch asks, and the two that were being
+/// answered by computing LEB encodings by hand: what is actually there, and
+/// will the pattern I am about to search for match one place or forty.
+fn bytes(arguments: &[String]) -> Result<String, String> {
+    let path = arguments.first().ok_or("bytes needs a module path")?;
+    let offset: usize = arguments
+        .get(1)
+        .ok_or("bytes needs an offset")?
+        .parse()
+        .map_err(|_| "the offset must be a number".to_string())?;
+    let length: usize = arguments
+        .get(2)
+        .ok_or("bytes needs a length")?
+        .parse()
+        .map_err(|_| "the length must be a number".to_string())?;
+    if let Some(extra) = arguments.get(3) {
+        return Err(format!("unexpected argument `{extra}`"));
+    }
+
+    let raw = std::fs::read(path).map_err(|error| format!("reading {path}: {error}"))?;
+    let end = offset
+        .checked_add(length)
+        .filter(|end| *end <= raw.len())
+        .ok_or_else(|| {
+            format!(
+                "{offset}..{} is past the end of {path} ({} bytes)",
+                offset.saturating_add(length),
+                raw.len()
+            )
+        })?;
+    let wanted = &raw[offset..end];
+    let hex: Vec<String> = wanted.iter().map(|byte| format!("{byte:02x}")).collect();
+
+    // How many times this exact sequence appears anywhere in the file. One
+    // means a search-and-replace patch is safe; more means it is not.
+    let occurrences = if wanted.is_empty() {
+        0
+    } else {
+        raw.windows(wanted.len())
+            .filter(|window| *window == wanted)
+            .count()
+    };
+
+    Ok(format!(
+        "{offset} ({offset:#x}) + {length}: {}\n{occurrences} occurrence{} of that sequence in the module{}\n",
+        hex.join(" "),
+        if occurrences == 1 { "" } else { "s" },
+        if occurrences == 1 {
+            " — unique, so a pattern patch is safe"
+        } else {
+            " — a pattern patch would hit all of them"
+        }
+    ))
 }
 
 fn frames(arguments: &[String]) -> Result<String, String> {

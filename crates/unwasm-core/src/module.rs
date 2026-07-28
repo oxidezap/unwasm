@@ -279,6 +279,16 @@ pub struct Func {
     pub locals: Vec<ValType>,
     /// The body, without the implicit outer block.
     pub body: Vec<Op>,
+    /// Where each operator of [`Self::body`] sits in the wasm file, as
+    /// `(offset, length)`.
+    ///
+    /// Parallel to `body` and the same length. It exists because patching a
+    /// module by hand means computing LEB encodings and counting bytes, and an
+    /// arithmetic slip there looks exactly like "the code changed" — the
+    /// pattern simply is not found. The decoder already knows every one of
+    /// these numbers; carrying them costs eight bytes an instruction and
+    /// removes the whole class of mistake.
+    pub offsets: Vec<(u32, u32)>,
 }
 
 /// A function imported from the host.
@@ -727,20 +737,38 @@ fn lower_body(body: &wasmparser::FunctionBody<'_>, type_index: u32, index: usize
     }
 
     let mut ops = Vec::new();
-    for operator in body.get_operators_reader()? {
-        ops.push(lower_op(&operator?, &location)?);
+    let mut starts = Vec::new();
+    let reader = body.get_operators_reader()?;
+    let end_of_body = reader.get_binary_reader().range().end;
+    for entry in reader.into_iter_with_offsets() {
+        let (operator, at) = entry?;
+        ops.push(lower_op(&operator, &location)?);
+        starts.push(at as u32);
     }
+    // One operator ends where the next begins, and the last ends with the body.
+    let offsets: Vec<(u32, u32)> = starts
+        .iter()
+        .enumerate()
+        .map(|(at, start)| {
+            let end = starts.get(at + 1).copied().unwrap_or(end_of_body as u32);
+            (*start, end.saturating_sub(*start))
+        })
+        .collect();
+
     // The reader yields the body's final `End`; the backend supplies the
     // function's own return, so it is dropped here rather than special-cased
     // in three places later.
+    let mut offsets = offsets;
     if ops.last() == Some(&Op::End) {
         ops.pop();
+        offsets.pop();
     }
 
     Ok(Func {
         type_index,
         locals,
         body: ops,
+        offsets,
     })
 }
 

@@ -345,6 +345,7 @@ pub fn generate_with(
             only: only.cloned(),
             signatures: signatures.clone(),
             instrument_stores: false,
+            map_offsets: false,
         },
     )
 }
@@ -366,6 +367,9 @@ pub struct Options {
     /// host can ask which function wrote an address. Costs a comparison per
     /// write when nothing is watched, and nothing at all when it is not set.
     pub instrument_stores: bool,
+    /// Write `offsets.json` beside the output: which bytes of the wasm file
+    /// produced each generated line.
+    pub map_offsets: bool,
 }
 
 /// Generates with [`Options`].
@@ -378,6 +382,7 @@ pub fn generate_options(module: &Module, options: &Options) -> Result<Vec<Genera
     generator.only = options.only.clone();
     generator.signatures = options.signatures.clone();
     generator.instrument = options.instrument_stores;
+    generator.map_offsets = options.map_offsets;
     generator.run()
 }
 
@@ -470,6 +475,11 @@ struct Generator<'a> {
     recognised: std::collections::BTreeMap<u32, String>,
     /// Whether every memory write reports itself to a watchpoint.
     instrument: bool,
+    /// Whether to build the line-to-bytes map.
+    map_offsets: bool,
+    /// Per function: its index, how many lines of its chunk come before its
+    /// body, and the body's own line-to-bytes spans.
+    spans: Vec<FunctionSpans>,
     /// Where each function ended up, for the index.
     located: Vec<(u32, String, String, usize)>,
 }
@@ -486,6 +496,8 @@ impl<'a> Generator<'a> {
             signatures: Signatures::new(),
             recognised: Default::default(),
             instrument: false,
+            map_offsets: false,
+            spans: Vec::new(),
             located: Vec::new(),
         }
     }
@@ -522,6 +534,7 @@ impl<'a> Generator<'a> {
         self.instance_struct();
         self.instance_impl()?;
         let index = self.index_json();
+        let offsets = self.map_offsets.then(|| self.offsets_json());
         let mut files = vec![GeneratedFile {
             name: "mod.rs".to_string(),
             contents: self.out,
@@ -531,7 +544,65 @@ impl<'a> Generator<'a> {
             name: "names.json".to_string(),
             contents: index,
         });
+        if let Some(offsets) = offsets {
+            files.push(GeneratedFile {
+                name: "offsets.json".to_string(),
+                contents: offsets,
+            });
+        }
         Ok(files)
+    }
+
+    /// Which bytes of the wasm file produced each generated line.
+    ///
+    /// Patching a module by hand means computing an LEB encoding and counting
+    /// bytes to find the pattern to replace, and an arithmetic slip there does
+    /// not look like a slip — the pattern is simply not found, which reads as
+    /// "the code changed". This is the map that removes the step: the line you
+    /// are looking at, and the offset and length of the bytes behind it.
+    ///
+    /// A line covers every operator lowered since the previous one, so the
+    /// operands folded into it are inside its span rather than missing from
+    /// the map. Lines that are not lowered from an operator — a `let` for a
+    /// local, a closing brace — are not in it.
+    ///
+    /// The bytes themselves are not here: they would be most of the module
+    /// again, in hex. `unwasm bytes <module> <offset> <length>` prints them,
+    /// and says whether the sequence is unique — which is the other half of
+    /// the question a patch asks.
+    fn offsets_json(&self) -> String {
+        // Keyed by the located functions rather than by the spans, because a
+        // function left out by `--only` is placed but has no body to map.
+        let mapped: std::collections::BTreeMap<u32, (usize, &Vec<LineSpan>)> = self
+            .spans
+            .iter()
+            .map(|(index, before, spans)| (*index, (*before, spans)))
+            .collect();
+        let mut out = String::from("{\n  \"functions\": [\n");
+        let mut written = 0;
+        for (index, _, file, start) in &self.located {
+            let Some((before_body, spans)) = mapped.get(index) else {
+                continue;
+            };
+            if written > 0 {
+                out.push_str(",\n");
+            }
+            written += 1;
+            let _ = write!(
+                out,
+                "    {{\"index\": {index}, \"file\": \"{file}\", \"lines\": [",
+            );
+            for (at, (line, offset, length)) in spans.iter().enumerate() {
+                if at > 0 {
+                    out.push_str(", ");
+                }
+                let _ = write!(out, "[{}, {offset}, {length}]", start + before_body + line);
+            }
+            out.push(']');
+            out.push('}');
+        }
+        out.push_str("\n  ]\n}\n");
+        out
     }
 
     /// An index of every function: what it is called, and where it is.
@@ -1303,7 +1374,7 @@ impl<'a> Generator<'a> {
     ///
     /// Returned rather than written straight out, because under a split layout
     /// it belongs in a part file rather than in `mod.rs`.
-    fn function(&self, index: u32, func: &Func) -> Result<String> {
+    fn function(&mut self, index: u32, func: &Func) -> Result<String> {
         let ty = self
             .module
             .types
@@ -1420,18 +1491,20 @@ impl<'a> Generator<'a> {
 
         let asked_for = self.only.as_ref().is_none_or(|only| only.contains(&index));
         if asked_for {
-            out.push_str(
-                &Body::new(
-                    self.module,
-                    &self.analysis,
-                    &self.recognised,
-                    self.instrument,
-                    func,
-                    ty,
-                    index,
-                )
-                .emit()?,
-            );
+            // The body's lines start after everything written above.
+            let before_body = out.matches('\n').count();
+            let context = Context {
+                module: self.module,
+                analysis: &self.analysis,
+                recognised: &self.recognised,
+                instrument: self.instrument,
+                map_offsets: self.map_offsets,
+            };
+            let (body, spans) = Body::new(context, func, ty, index).emit()?;
+            out.push_str(&body);
+            if self.map_offsets {
+                self.spans.push((index, before_body, spans));
+            }
         } else {
             // Not decompiled, and saying so rather than looking decompiled. The
             // signature and the name stay, so callers still compile and the
@@ -1444,6 +1517,30 @@ impl<'a> Generator<'a> {
         out.push_str("    }\n\n");
         Ok(out)
     }
+}
+
+/// One generated line and the wasm bytes behind it: `(line, offset, length)`.
+///
+/// The line is relative to whatever produced it — a body on its own, until the
+/// generator places the function and makes it absolute.
+type LineSpan = (usize, u32, u32);
+
+/// A function's contribution to the offset map: its index, how many lines of
+/// its chunk come before its body, and the body's own spans.
+type FunctionSpans = (u32, usize, Vec<LineSpan>);
+
+/// What every function body is given and none of them changes.
+///
+/// A struct because there are five of them and they travel together; passing
+/// them one by one is how a constructor ends up with eight parameters in
+/// which two `bool`s sit next to each other waiting to be swapped.
+#[derive(Clone, Copy)]
+struct Context<'a> {
+    module: &'a Module,
+    analysis: &'a Analysis,
+    recognised: &'a std::collections::BTreeMap<u32, String>,
+    instrument: bool,
+    map_offsets: bool,
 }
 
 /// A value sitting on the operand stack, and how it may be used.
@@ -1539,6 +1636,17 @@ struct Body<'a> {
     recognised: &'a std::collections::BTreeMap<u32, String>,
     /// Whether writes report themselves to a watchpoint.
     instrument: bool,
+    /// For each emitted line that came from the body, the span of wasm bytes
+    /// that produced it: `(line index in this body, offset, length)`.
+    ///
+    /// Only collected when asked for. A line covers every operator lowered
+    /// since the previous line, so a folded operand is inside the span of the
+    /// line that consumed it rather than missing from the map.
+    spans: Vec<LineSpan>,
+    /// Whether to collect them at all.
+    map_offsets: bool,
+    /// The offset of the first operator not yet attributed to a line.
+    pending: Option<u32>,
     /// This function's C stack frame, when it has one.
     frame: Option<&'a StackFrame>,
     func: &'a Func,
@@ -1560,19 +1668,26 @@ struct Body<'a> {
 
 impl<'a> Body<'a> {
     fn new(
-        module: &'a Module,
-        analysis: &'a Analysis,
-        recognised: &'a std::collections::BTreeMap<u32, String>,
-        instrument: bool,
+        context: Context<'a>,
         func: &'a Func,
         ty: &'a crate::module::FuncType,
         index: u32,
     ) -> Self {
+        let Context {
+            module,
+            analysis,
+            recognised,
+            instrument,
+            map_offsets,
+        } = context;
         Self {
             module,
             analysis,
             recognised,
             instrument,
+            spans: Vec::new(),
+            map_offsets,
+            pending: None,
             frame: analysis.frames.get(&index),
             func,
             ty,
@@ -1608,7 +1723,8 @@ impl<'a> Body<'a> {
         }
     }
 
-    fn emit(mut self) -> Result<String> {
+    /// Emits the body, and the line-to-bytes map when one was asked for.
+    fn emit(mut self) -> Result<(String, Vec<LineSpan>)> {
         // Parameters arrive as `p0..`, locals are declared zeroed, and both are
         // rebound as `l0..` so that `local.set` on a parameter is the same
         // statement as `local.set` on a local.
@@ -1635,7 +1751,18 @@ impl<'a> Body<'a> {
             // string is `i32.const ptr; i32.const len`, and the length is what
             // stops the text from running into the next string.
             self.next_op = body.get(at + 1).cloned();
+            let before = self.emitted_lines();
+            let span = self.func.offsets.get(at).copied();
+            if self.map_offsets && self.pending.is_none() {
+                self.pending = span.map(|(offset, _)| offset);
+            }
             self.op(op)?;
+            if self.map_offsets && self.emitted_lines() > before {
+                if let (Some(start), Some((offset, length))) = (self.pending, span) {
+                    self.spans.push((before, start, offset + length - start));
+                }
+                self.pending = None;
+            }
         }
 
         // The function's own result. If control cannot reach here the module
@@ -1650,7 +1777,12 @@ impl<'a> Body<'a> {
             let value = self.pop()?;
             self.line(&value.code);
         }
-        Ok(self.out)
+        Ok((self.out, self.spans))
+    }
+
+    /// How many lines have been emitted so far.
+    fn emitted_lines(&self) -> usize {
+        self.out.matches('\n').count()
     }
 
     fn line(&mut self, text: &str) {
@@ -3000,6 +3132,7 @@ mod ir_tests {
                 type_index: 0,
                 locals: Vec::new(),
                 body,
+                offsets: Vec::new(),
             }],
             ..Module::default()
         }
