@@ -1260,9 +1260,6 @@ impl<'a> Body<'a> {
             if !value.code.contains("self.") {
                 continue;
             }
-            if value.code.starts_with('t') && value.code[1..].chars().all(|c| c.is_ascii_digit()) {
-                continue;
-            }
             let name = format!("t{}", self.temps);
             self.temps += 1;
             self.line(&format!(
@@ -2268,10 +2265,14 @@ mod tests {
         ] {
             assert!(is_atomic(atomic), "{atomic} was bracketed needlessly");
         }
-        // Anything with an operator outside brackets does.
+        // Anything with an operator outside brackets does. The templates all
+        // put spaces around theirs, but the answer must not depend on that.
         for compound in [
             "l0 as u32",
             "a + b",
+            "a+b",
+            "-x",
+            "l0>>2",
             "(a) + (b)",
             "l0 >> 2",
             "x as u32 as i64",

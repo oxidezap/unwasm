@@ -497,3 +497,60 @@ fn a_passive_element_segment_places_nothing_in_the_table() {
     // Nothing was written into the table, so no slot assignment appears.
     assert!(!code.contains("instance.table["), "{code}");
 }
+
+#[test]
+fn an_atomic_on_a_second_memory_is_refused() {
+    // The check that all sixty-six atomics share. Only reachable by hand: an
+    // assembler needs two memories to write it, and those are refused earlier.
+    let mut code = i32_const(0);
+    // i32.atomic.load. The alignment carries a flag saying a memory index
+    // follows, and the index comes before the offset.
+    code.extend_from_slice(&[0xFE, 0x10, 0x42, 0x01, 0x00]);
+    let bytes = module(&[
+        type_section(&[func_type(&[], &[I32])]),
+        function_section(&[0]),
+        section(5, &vector(&[vec![0x00, 0x01]])),
+        code_section(&[body(&code)]),
+    ]);
+    let message = rejected(&bytes);
+    assert!(
+        message.contains("memory other than 0") || message.contains("multiple memories"),
+        "{message}"
+    );
+}
+
+#[test]
+fn two_imported_memories_are_refused_at_the_second() {
+    let mut first = Vec::new();
+    leb_u32(3, &mut first);
+    first.extend_from_slice(b"env");
+    leb_u32(3, &mut first);
+    first.extend_from_slice(b"one");
+    first.extend_from_slice(&[0x02, 0x00, 0x01]); // memory, no maximum, min 1
+
+    let mut second = Vec::new();
+    leb_u32(3, &mut second);
+    second.extend_from_slice(b"env");
+    leb_u32(3, &mut second);
+    second.extend_from_slice(b"two");
+    second.extend_from_slice(&[0x02, 0x00, 0x01]);
+
+    let bytes = module(&[section(2, &vector(&[first, second]))]);
+    let message = rejected(&bytes);
+    assert!(message.contains("multiple memories"), "{message}");
+}
+
+#[test]
+fn a_code_section_with_no_function_section_has_bodies_belonging_to_nothing() {
+    // The function section is what says which type each body has. Without it,
+    // the first body has no declaration to pair with.
+    let bytes = module(&[
+        type_section(&[func_type(&[], &[])]),
+        code_section(&[body(&[])]),
+    ]);
+    // A third route by which the decoder guarantees the two sections agree —
+    // which is why the backstop in `Module::parse` cannot be reached from any
+    // input, and is kept anyway.
+    let message = rejected(&bytes);
+    assert!(message.contains("function section is absent"), "{message}");
+}

@@ -1236,3 +1236,31 @@ fn an_operand_that_reads_a_global_is_named_before_the_call_that_takes_it() {
         ],
     );
 }
+
+#[test]
+fn a_table_with_both_an_active_and_a_declared_segment_fills_only_the_active_one() {
+    let wasm = common::assemble(
+        "elem-mixed",
+        r#"(module
+            (type $unary (func (param i32) (result i32)))
+            (func $double (type $unary) local.get 0 i32.const 2 i32.mul)
+            (func $triple (type $unary) local.get 0 i32.const 3 i32.mul)
+            (table 4 funcref)
+            (elem (i32.const 0) $double)
+            (elem declare func $triple)
+            (func (export "through") (param i32) (param i32) (result i32)
+                local.get 1
+                local.get 0
+                call_indirect (type $unary)))"#,
+    );
+    common::assert_agrees(
+        "elem-mixed",
+        &wasm,
+        &[
+            // Slot 0 was filled by the active segment; the declared one filled
+            // nothing, so slot 1 is empty and traps.
+            common::call("through", &[common::Arg::I32(0), common::Arg::I32(21)]),
+            common::call("through", &[common::Arg::I32(1), common::Arg::I32(21)]),
+        ],
+    );
+}

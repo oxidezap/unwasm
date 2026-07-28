@@ -1019,6 +1019,21 @@ mod tests {
     }
 
     #[test]
+    fn a_full_width_compare_and_exchange_compares_every_bit() {
+        // Eight bytes: there is no mask, because there is nothing to mask off.
+        let mut memory = Memory::new(1, None);
+        memory.atomic_store(0, 0, 8, -1);
+        assert_eq!(
+            memory.atomic_cmpxchg(0, 0, 8, 0, 5),
+            -1,
+            "no match, no swap"
+        );
+        assert_eq!(memory.atomic_load(0, 0, 8), -1);
+        assert_eq!(memory.atomic_cmpxchg(0, 0, 8, -1, 5), -1);
+        assert_eq!(memory.atomic_load(0, 0, 8), 5);
+    }
+
+    #[test]
     fn a_narrow_compare_and_exchange_compares_at_its_own_width() {
         // The expected value arrives at the operand's width; only the low byte
         // can possibly match a one-byte access.

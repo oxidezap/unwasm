@@ -862,396 +862,144 @@ fn lower_op(operator: &wasmparser::Operator<'_>, location: &str) -> Result<Op> {
 fn lower_atomic(operator: &wasmparser::Operator<'_>, location: &str) -> Result<Option<Op>> {
     use wasmparser::Operator as W;
 
-    let op = match operator {
-        W::I32AtomicLoad { memarg } => {
-            atomic(*memarg, AtomicKind::Load, ValType::I32, 4, location)?
+    let (memarg, kind, ty, width) = match operator {
+        W::I32AtomicLoad { memarg } => (*memarg, AtomicKind::Load, ValType::I32, 4),
+        W::I32AtomicLoad8U { memarg } => (*memarg, AtomicKind::Load, ValType::I32, 1),
+        W::I32AtomicLoad16U { memarg } => (*memarg, AtomicKind::Load, ValType::I32, 2),
+        W::I64AtomicLoad { memarg } => (*memarg, AtomicKind::Load, ValType::I64, 8),
+        W::I64AtomicLoad8U { memarg } => (*memarg, AtomicKind::Load, ValType::I64, 1),
+        W::I64AtomicLoad16U { memarg } => (*memarg, AtomicKind::Load, ValType::I64, 2),
+        W::I64AtomicLoad32U { memarg } => (*memarg, AtomicKind::Load, ValType::I64, 4),
+        W::I32AtomicStore { memarg } => (*memarg, AtomicKind::Store, ValType::I32, 4),
+        W::I32AtomicStore8 { memarg } => (*memarg, AtomicKind::Store, ValType::I32, 1),
+        W::I32AtomicStore16 { memarg } => (*memarg, AtomicKind::Store, ValType::I32, 2),
+        W::I64AtomicStore { memarg } => (*memarg, AtomicKind::Store, ValType::I64, 8),
+        W::I64AtomicStore8 { memarg } => (*memarg, AtomicKind::Store, ValType::I64, 1),
+        W::I64AtomicStore16 { memarg } => (*memarg, AtomicKind::Store, ValType::I64, 2),
+        W::I64AtomicStore32 { memarg } => (*memarg, AtomicKind::Store, ValType::I64, 4),
+        W::I32AtomicRmwAdd { memarg } => (*memarg, AtomicKind::Rmw(RmwKind::Add), ValType::I32, 4),
+        W::I32AtomicRmwSub { memarg } => (*memarg, AtomicKind::Rmw(RmwKind::Sub), ValType::I32, 4),
+        W::I32AtomicRmwAnd { memarg } => (*memarg, AtomicKind::Rmw(RmwKind::And), ValType::I32, 4),
+        W::I32AtomicRmwOr { memarg } => (*memarg, AtomicKind::Rmw(RmwKind::Or), ValType::I32, 4),
+        W::I32AtomicRmwXor { memarg } => (*memarg, AtomicKind::Rmw(RmwKind::Xor), ValType::I32, 4),
+        W::I32AtomicRmwXchg { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Xchg), ValType::I32, 4)
         }
-        W::I32AtomicLoad8U { memarg } => {
-            atomic(*memarg, AtomicKind::Load, ValType::I32, 1, location)?
+        W::I32AtomicRmwCmpxchg { memarg } => (*memarg, AtomicKind::Cmpxchg, ValType::I32, 4),
+        W::I32AtomicRmw8AddU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Add), ValType::I32, 1)
         }
-        W::I32AtomicLoad16U { memarg } => {
-            atomic(*memarg, AtomicKind::Load, ValType::I32, 2, location)?
+        W::I32AtomicRmw8SubU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Sub), ValType::I32, 1)
         }
-        W::I64AtomicLoad { memarg } => {
-            atomic(*memarg, AtomicKind::Load, ValType::I64, 8, location)?
+        W::I32AtomicRmw8AndU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::And), ValType::I32, 1)
         }
-        W::I64AtomicLoad8U { memarg } => {
-            atomic(*memarg, AtomicKind::Load, ValType::I64, 1, location)?
+        W::I32AtomicRmw8OrU { memarg } => (*memarg, AtomicKind::Rmw(RmwKind::Or), ValType::I32, 1),
+        W::I32AtomicRmw8XorU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Xor), ValType::I32, 1)
         }
-        W::I64AtomicLoad16U { memarg } => {
-            atomic(*memarg, AtomicKind::Load, ValType::I64, 2, location)?
+        W::I32AtomicRmw8XchgU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Xchg), ValType::I32, 1)
         }
-        W::I64AtomicLoad32U { memarg } => {
-            atomic(*memarg, AtomicKind::Load, ValType::I64, 4, location)?
+        W::I32AtomicRmw8CmpxchgU { memarg } => (*memarg, AtomicKind::Cmpxchg, ValType::I32, 1),
+        W::I32AtomicRmw16AddU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Add), ValType::I32, 2)
         }
-        W::I32AtomicStore { memarg } => {
-            atomic(*memarg, AtomicKind::Store, ValType::I32, 4, location)?
+        W::I32AtomicRmw16SubU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Sub), ValType::I32, 2)
         }
-        W::I32AtomicStore8 { memarg } => {
-            atomic(*memarg, AtomicKind::Store, ValType::I32, 1, location)?
+        W::I32AtomicRmw16AndU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::And), ValType::I32, 2)
         }
-        W::I32AtomicStore16 { memarg } => {
-            atomic(*memarg, AtomicKind::Store, ValType::I32, 2, location)?
+        W::I32AtomicRmw16OrU { memarg } => (*memarg, AtomicKind::Rmw(RmwKind::Or), ValType::I32, 2),
+        W::I32AtomicRmw16XorU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Xor), ValType::I32, 2)
         }
-        W::I64AtomicStore { memarg } => {
-            atomic(*memarg, AtomicKind::Store, ValType::I64, 8, location)?
+        W::I32AtomicRmw16XchgU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Xchg), ValType::I32, 2)
         }
-        W::I64AtomicStore8 { memarg } => {
-            atomic(*memarg, AtomicKind::Store, ValType::I64, 1, location)?
+        W::I32AtomicRmw16CmpxchgU { memarg } => (*memarg, AtomicKind::Cmpxchg, ValType::I32, 2),
+        W::I64AtomicRmwAdd { memarg } => (*memarg, AtomicKind::Rmw(RmwKind::Add), ValType::I64, 8),
+        W::I64AtomicRmwSub { memarg } => (*memarg, AtomicKind::Rmw(RmwKind::Sub), ValType::I64, 8),
+        W::I64AtomicRmwAnd { memarg } => (*memarg, AtomicKind::Rmw(RmwKind::And), ValType::I64, 8),
+        W::I64AtomicRmwOr { memarg } => (*memarg, AtomicKind::Rmw(RmwKind::Or), ValType::I64, 8),
+        W::I64AtomicRmwXor { memarg } => (*memarg, AtomicKind::Rmw(RmwKind::Xor), ValType::I64, 8),
+        W::I64AtomicRmwXchg { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Xchg), ValType::I64, 8)
         }
-        W::I64AtomicStore16 { memarg } => {
-            atomic(*memarg, AtomicKind::Store, ValType::I64, 2, location)?
+        W::I64AtomicRmwCmpxchg { memarg } => (*memarg, AtomicKind::Cmpxchg, ValType::I64, 8),
+        W::I64AtomicRmw8AddU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Add), ValType::I64, 1)
         }
-        W::I64AtomicStore32 { memarg } => {
-            atomic(*memarg, AtomicKind::Store, ValType::I64, 4, location)?
+        W::I64AtomicRmw8SubU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Sub), ValType::I64, 1)
         }
-        W::I32AtomicRmwAdd { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Add),
-            ValType::I32,
-            4,
-            location,
-        )?,
-        W::I32AtomicRmwSub { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Sub),
-            ValType::I32,
-            4,
-            location,
-        )?,
-        W::I32AtomicRmwAnd { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::And),
-            ValType::I32,
-            4,
-            location,
-        )?,
-        W::I32AtomicRmwOr { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Or),
-            ValType::I32,
-            4,
-            location,
-        )?,
-        W::I32AtomicRmwXor { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Xor),
-            ValType::I32,
-            4,
-            location,
-        )?,
-        W::I32AtomicRmwXchg { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Xchg),
-            ValType::I32,
-            4,
-            location,
-        )?,
-        W::I32AtomicRmwCmpxchg { memarg } => {
-            atomic(*memarg, AtomicKind::Cmpxchg, ValType::I32, 4, location)?
+        W::I64AtomicRmw8AndU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::And), ValType::I64, 1)
         }
-        W::I32AtomicRmw8AddU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Add),
-            ValType::I32,
-            1,
-            location,
-        )?,
-        W::I32AtomicRmw8SubU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Sub),
-            ValType::I32,
-            1,
-            location,
-        )?,
-        W::I32AtomicRmw8AndU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::And),
-            ValType::I32,
-            1,
-            location,
-        )?,
-        W::I32AtomicRmw8OrU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Or),
-            ValType::I32,
-            1,
-            location,
-        )?,
-        W::I32AtomicRmw8XorU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Xor),
-            ValType::I32,
-            1,
-            location,
-        )?,
-        W::I32AtomicRmw8XchgU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Xchg),
-            ValType::I32,
-            1,
-            location,
-        )?,
-        W::I32AtomicRmw8CmpxchgU { memarg } => {
-            atomic(*memarg, AtomicKind::Cmpxchg, ValType::I32, 1, location)?
+        W::I64AtomicRmw8OrU { memarg } => (*memarg, AtomicKind::Rmw(RmwKind::Or), ValType::I64, 1),
+        W::I64AtomicRmw8XorU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Xor), ValType::I64, 1)
         }
-        W::I32AtomicRmw16AddU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Add),
-            ValType::I32,
-            2,
-            location,
-        )?,
-        W::I32AtomicRmw16SubU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Sub),
-            ValType::I32,
-            2,
-            location,
-        )?,
-        W::I32AtomicRmw16AndU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::And),
-            ValType::I32,
-            2,
-            location,
-        )?,
-        W::I32AtomicRmw16OrU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Or),
-            ValType::I32,
-            2,
-            location,
-        )?,
-        W::I32AtomicRmw16XorU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Xor),
-            ValType::I32,
-            2,
-            location,
-        )?,
-        W::I32AtomicRmw16XchgU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Xchg),
-            ValType::I32,
-            2,
-            location,
-        )?,
-        W::I32AtomicRmw16CmpxchgU { memarg } => {
-            atomic(*memarg, AtomicKind::Cmpxchg, ValType::I32, 2, location)?
+        W::I64AtomicRmw8XchgU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Xchg), ValType::I64, 1)
         }
-        W::I64AtomicRmwAdd { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Add),
-            ValType::I64,
-            8,
-            location,
-        )?,
-        W::I64AtomicRmwSub { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Sub),
-            ValType::I64,
-            8,
-            location,
-        )?,
-        W::I64AtomicRmwAnd { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::And),
-            ValType::I64,
-            8,
-            location,
-        )?,
-        W::I64AtomicRmwOr { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Or),
-            ValType::I64,
-            8,
-            location,
-        )?,
-        W::I64AtomicRmwXor { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Xor),
-            ValType::I64,
-            8,
-            location,
-        )?,
-        W::I64AtomicRmwXchg { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Xchg),
-            ValType::I64,
-            8,
-            location,
-        )?,
-        W::I64AtomicRmwCmpxchg { memarg } => {
-            atomic(*memarg, AtomicKind::Cmpxchg, ValType::I64, 8, location)?
+        W::I64AtomicRmw8CmpxchgU { memarg } => (*memarg, AtomicKind::Cmpxchg, ValType::I64, 1),
+        W::I64AtomicRmw16AddU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Add), ValType::I64, 2)
         }
-        W::I64AtomicRmw8AddU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Add),
-            ValType::I64,
-            1,
-            location,
-        )?,
-        W::I64AtomicRmw8SubU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Sub),
-            ValType::I64,
-            1,
-            location,
-        )?,
-        W::I64AtomicRmw8AndU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::And),
-            ValType::I64,
-            1,
-            location,
-        )?,
-        W::I64AtomicRmw8OrU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Or),
-            ValType::I64,
-            1,
-            location,
-        )?,
-        W::I64AtomicRmw8XorU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Xor),
-            ValType::I64,
-            1,
-            location,
-        )?,
-        W::I64AtomicRmw8XchgU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Xchg),
-            ValType::I64,
-            1,
-            location,
-        )?,
-        W::I64AtomicRmw8CmpxchgU { memarg } => {
-            atomic(*memarg, AtomicKind::Cmpxchg, ValType::I64, 1, location)?
+        W::I64AtomicRmw16SubU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Sub), ValType::I64, 2)
         }
-        W::I64AtomicRmw16AddU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Add),
-            ValType::I64,
-            2,
-            location,
-        )?,
-        W::I64AtomicRmw16SubU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Sub),
-            ValType::I64,
-            2,
-            location,
-        )?,
-        W::I64AtomicRmw16AndU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::And),
-            ValType::I64,
-            2,
-            location,
-        )?,
-        W::I64AtomicRmw16OrU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Or),
-            ValType::I64,
-            2,
-            location,
-        )?,
-        W::I64AtomicRmw16XorU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Xor),
-            ValType::I64,
-            2,
-            location,
-        )?,
-        W::I64AtomicRmw16XchgU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Xchg),
-            ValType::I64,
-            2,
-            location,
-        )?,
-        W::I64AtomicRmw16CmpxchgU { memarg } => {
-            atomic(*memarg, AtomicKind::Cmpxchg, ValType::I64, 2, location)?
+        W::I64AtomicRmw16AndU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::And), ValType::I64, 2)
         }
-        W::I64AtomicRmw32AddU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Add),
-            ValType::I64,
-            4,
-            location,
-        )?,
-        W::I64AtomicRmw32SubU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Sub),
-            ValType::I64,
-            4,
-            location,
-        )?,
-        W::I64AtomicRmw32AndU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::And),
-            ValType::I64,
-            4,
-            location,
-        )?,
-        W::I64AtomicRmw32OrU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Or),
-            ValType::I64,
-            4,
-            location,
-        )?,
-        W::I64AtomicRmw32XorU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Xor),
-            ValType::I64,
-            4,
-            location,
-        )?,
-        W::I64AtomicRmw32XchgU { memarg } => atomic(
-            *memarg,
-            AtomicKind::Rmw(RmwKind::Xchg),
-            ValType::I64,
-            4,
-            location,
-        )?,
-        W::I64AtomicRmw32CmpxchgU { memarg } => {
-            atomic(*memarg, AtomicKind::Cmpxchg, ValType::I64, 4, location)?
+        W::I64AtomicRmw16OrU { memarg } => (*memarg, AtomicKind::Rmw(RmwKind::Or), ValType::I64, 2),
+        W::I64AtomicRmw16XorU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Xor), ValType::I64, 2)
         }
-        W::MemoryAtomicNotify { memarg } => {
-            atomic(*memarg, AtomicKind::Notify, ValType::I32, 4, location)?
+        W::I64AtomicRmw16XchgU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Xchg), ValType::I64, 2)
         }
-        W::MemoryAtomicWait32 { memarg } => {
-            atomic(*memarg, AtomicKind::Wait, ValType::I32, 4, location)?
+        W::I64AtomicRmw16CmpxchgU { memarg } => (*memarg, AtomicKind::Cmpxchg, ValType::I64, 2),
+        W::I64AtomicRmw32AddU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Add), ValType::I64, 4)
         }
-        W::MemoryAtomicWait64 { memarg } => {
-            atomic(*memarg, AtomicKind::Wait, ValType::I64, 8, location)?
+        W::I64AtomicRmw32SubU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Sub), ValType::I64, 4)
         }
+        W::I64AtomicRmw32AndU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::And), ValType::I64, 4)
+        }
+        W::I64AtomicRmw32OrU { memarg } => (*memarg, AtomicKind::Rmw(RmwKind::Or), ValType::I64, 4),
+        W::I64AtomicRmw32XorU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Xor), ValType::I64, 4)
+        }
+        W::I64AtomicRmw32XchgU { memarg } => {
+            (*memarg, AtomicKind::Rmw(RmwKind::Xchg), ValType::I64, 4)
+        }
+        W::I64AtomicRmw32CmpxchgU { memarg } => (*memarg, AtomicKind::Cmpxchg, ValType::I64, 4),
+        W::MemoryAtomicNotify { memarg } => (*memarg, AtomicKind::Notify, ValType::I32, 4),
+        W::MemoryAtomicWait32 { memarg } => (*memarg, AtomicKind::Wait, ValType::I32, 4),
+        W::MemoryAtomicWait64 { memarg } => (*memarg, AtomicKind::Wait, ValType::I64, 8),
         // Nothing a single thread can observe is ordered by a fence, and a
         // decompilation that dropped it silently would still be wrong: it is
         // kept in the IR and emitted as a comment.
-        W::AtomicFence => Op::AtomicFence,
+        W::AtomicFence => return Ok(Some(Op::AtomicFence)),
         _ => return Ok(None),
     };
-    Ok(Some(op))
-}
 
-fn atomic(
-    memarg: wasmparser::MemArg,
-    kind: AtomicKind,
-    ty: ValType,
-    width: u32,
-    location: &str,
-) -> Result<Op> {
+    // One check for all sixty-six, rather than one per line. The table says
+    // what each instruction is and nothing else, which is the only thing that
+    // varies between them.
     check_memory_index(&memarg, location)?;
-    Ok(Op::Atomic {
+    Ok(Some(Op::Atomic {
         op: Atomic { kind, ty, width },
         mem: MemArg {
             offset: memarg.offset,
         },
-    })
+    }))
 }
 
 fn load(kind: LoadKind, memarg: &wasmparser::MemArg, location: &str) -> Result<Op> {

@@ -368,11 +368,16 @@ shells started afterwards.
 
 ### Coverage
 
-98.5% of lines, 96.6% of regions. `rt.rs` — the semantics — is at 100%.
+**99.5% of lines.** Every file is complete except `module.rs`, and the twenty
+lines left there are unreachable rather than untested:
 
-The remainder is documented rather than papered over: it is the `other =>` arms
-of wasmparser's `#[non_exhaustive]` enums (constructs from proposals no
-toolchain we target emits), and two checks that the decoder already guarantees.
+- the `other =>` arms over wasmparser's `#[non_exhaustive]` enums. The compiler
+  requires them; the only value that reaches one is from a proposal no
+  toolchain we target emits, and which `wasm-tools` will not assemble.
+- two checks that the function and code sections agree — which the decoder
+  guarantees by three separate routes, each with a test asserting the decoder's
+  message.
+
 Both are kept. Deleting a defence to raise a percentage is how a decoder change
 becomes a panic two years later.
 

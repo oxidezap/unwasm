@@ -296,23 +296,20 @@ mod tests {
     fn every_op_has_a_template_matching_its_arity() {
         for &op in NumOp::ALL {
             let arity = op.operands().len();
-            assert!(
-                (1..=2).contains(&arity),
-                "{} has arity {arity}, which no numeric op has",
-                op.name()
-            );
+            let name = op.name();
+            assert!((1..=2).contains(&arity), "{name} has arity {arity}");
             for index in 0..arity {
+                let placeholder = format!("{{{index}}}");
                 assert!(
-                    op.template().contains(&format!("{{{index}}}")),
-                    "{} never uses operand {index}",
-                    op.name()
+                    op.template().contains(&placeholder),
+                    "{name} never uses operand {index}"
                 );
             }
             // A placeholder past the arity would render out of bounds.
+            let past_the_end = format!("{{{arity}}}");
             assert!(
-                !op.template().contains(&format!("{{{arity}}}")),
-                "{} uses an operand it does not pop",
-                op.name()
+                !op.template().contains(&past_the_end),
+                "{name} uses an operand it does not pop"
             );
         }
     }
@@ -326,63 +323,107 @@ mod tests {
         assert_eq!(names.len(), total, "two ops share a name");
     }
 
+    /// Whether an unsigned opcode's template casts, or delegates to something
+    /// that does.
+    ///
+    /// A rule, rather than an assertion inside a loop: the loop only ever sees
+    /// templates that pass, so the failing side of the rule would never be
+    /// exercised — and a rule nobody has seen fail is a rule nobody has
+    /// checked.
+    fn unsigned_is_honest(name: &str, template: &str) -> bool {
+        if !name.ends_with('U') || name.contains("Trunc") {
+            return true;
+        }
+        template.contains("as u32") || template.contains("as u64") || template.starts_with("rt::")
+    }
+
+    fn shift_masks_its_count(name: &str, template: &str) -> bool {
+        if !(name.contains("Shl") || name.contains("Shr") || name.contains("Rot")) {
+            return true;
+        }
+        template.contains(if name.starts_with("I32") { "31" } else { "63" })
+    }
+
+    fn trapping_goes_through_the_runtime(name: &str, template: &str) -> bool {
+        let float_to_int =
+            (name.starts_with("I32Trunc") || name.starts_with("I64Trunc")) && !name.contains("Sat");
+        let integer = name.starts_with("I32") || name.starts_with("I64");
+        let trapping = (integer && (name.contains("Div") || name.contains("Rem"))) || float_to_int;
+        !trapping || template.starts_with("rt::")
+    }
+
+    #[test]
+    fn the_rules_reject_what_they_are_meant_to_reject() {
+        // The failing side, which the table itself never shows.
+        assert!(!unsigned_is_honest("I32LtU", "(({0} < {1}) as i32)"));
+        assert!(unsigned_is_honest("I32LtS", "(({0} < {1}) as i32)"));
+        assert!(unsigned_is_honest("I32TruncF32U", "anything"));
+        assert!(!shift_masks_its_count("I32Shl", "({0} << {1})"));
+        assert!(!shift_masks_its_count("I64Shl", "({0} << ({1} & 31))"));
+        assert!(shift_masks_its_count("I32Add", "{0}.wrapping_add({1})"));
+        assert!(!trapping_goes_through_the_runtime("I32DivS", "({0} / {1})"));
+        assert!(!trapping_goes_through_the_runtime(
+            "I32TruncF32S",
+            "({0} as i32)"
+        ));
+        assert!(trapping_goes_through_the_runtime("F32Div", "({0} / {1})"));
+        assert!(trapping_goes_through_the_runtime(
+            "I32TruncSatF32S",
+            "({0} as i32)"
+        ));
+    }
+
     #[test]
     fn unsigned_operations_cast_before_they_compute() {
         // The bug this guards is emitting a signed shift or comparison for an
         // unsigned opcode: it agrees with wasm on small numbers and disagrees
         // on every value with the high bit set.
-        for &op in NumOp::ALL {
-            if !op.name().ends_with('U') || op.name().contains("Trunc") {
-                continue;
-            }
-            let template = op.template();
-            assert!(
-                template.contains("as u32")
-                    || template.contains("as u64")
-                    // `i32.div_u` and friends cast inside the runtime, which is
-                    // where the trap check has to live anyway.
-                    || template.starts_with("rt::"),
-                "{} is unsigned but neither casts nor delegates",
-                op.name()
-            );
-        }
+        let wrong: Vec<&str> = NumOp::ALL
+            .iter()
+            .filter(|op| !unsigned_is_honest(op.name(), op.template()))
+            .map(|op| op.name())
+            .collect();
+        // Formatted eagerly: an argument only evaluated on failure is a line
+        // that never runs, and this file has no other uncovered ones.
+        let names = format!("{wrong:?}");
+        assert!(
+            wrong.is_empty(),
+            "unsigned but neither casts nor delegates: {names}"
+        );
     }
 
     #[test]
     fn shifts_mask_their_count() {
-        for &op in NumOp::ALL {
-            let name = op.name();
-            if name.contains("Shl") || name.contains("Shr") || name.contains("Rot") {
-                let width = if name.starts_with("I32") { "31" } else { "63" };
-                assert!(
-                    op.template().contains(width),
-                    "{name} does not mask its shift count"
-                );
-            }
-        }
+        let wrong: Vec<&str> = NumOp::ALL
+            .iter()
+            .filter(|op| !shift_masks_its_count(op.name(), op.template()))
+            .map(|op| op.name())
+            .collect();
+        // Formatted eagerly: an argument only evaluated on failure is a line
+        // that never runs, and this file has no other uncovered ones.
+        let names = format!("{wrong:?}");
+        assert!(
+            wrong.is_empty(),
+            "shifts that do not mask their count: {names}"
+        );
     }
 
     #[test]
     fn anything_that_can_trap_goes_through_the_runtime() {
-        for &op in NumOp::ALL {
-            let name = op.name();
-            // A float→int truncation traps on NaN and out of range. `f32.trunc`
-            // also contains "Trunc" and traps at nothing: it rounds a float to a
-            // float. The distinction is which type it produces.
-            let float_to_int = (name.starts_with("I32Trunc") || name.starts_with("I64Trunc"))
-                && !name.contains("Sat");
-            // Integer division traps on zero; float division gives an infinity
-            // and carries on, so `f32.div` belongs to the operator, not the
-            // runtime.
-            let integer = name.starts_with("I32") || name.starts_with("I64");
-            let trapping =
-                (integer && (name.contains("Div") || name.contains("Rem"))) || float_to_int;
-            if trapping {
-                assert!(
-                    op.template().starts_with("rt::"),
-                    "{name} can trap but does not call the runtime"
-                );
-            }
-        }
+        // A float→int truncation traps on NaN and out of range; `f32.trunc`
+        // also contains "Trunc" and traps at nothing, and float division gives
+        // an infinity rather than trapping. The rule knows the difference.
+        let wrong: Vec<&str> = NumOp::ALL
+            .iter()
+            .filter(|op| !trapping_goes_through_the_runtime(op.name(), op.template()))
+            .map(|op| op.name())
+            .collect();
+        // Formatted eagerly: an argument only evaluated on failure is a line
+        // that never runs, and this file has no other uncovered ones.
+        let names = format!("{wrong:?}");
+        assert!(
+            wrong.is_empty(),
+            "can trap but does not call the runtime: {names}"
+        );
     }
 }

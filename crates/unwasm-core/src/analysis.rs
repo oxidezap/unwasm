@@ -364,9 +364,8 @@ fn derive_names(
         if module.func_name(function).is_some() {
             continue;
         }
-        let Some(name) = identifier_in(&text) else {
-            continue;
-        };
+        // `identifier_in` already accepted this text on the way in.
+        let name = identifier_in(&text).unwrap_or_default();
         // A function referencing several unique messages keeps the first by
         // address order, which is stable across runs; a longer identifier is
         // preferred when they differ, being the more specific of the two.
@@ -634,14 +633,15 @@ fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame>
             }
 
             Op::Call(index) => {
-                let arity = module
-                    .func_type(*index)
-                    .map_or(usize::MAX, |ty| ty.params.len());
-                if !consume(&mut frame, &mut stack, arity) {
+                // An unknown callee has an unknown arity, and the walk cannot
+                // keep its footing past it.
+                let Some(signature) = module.func_type(*index) else {
+                    frame.escapes = true;
                     return Some(frame);
-                }
-                let results = module.func_type(*index).map_or(1, |ty| ty.results.len());
-                stack.extend(std::iter::repeat_n(Tracked::Other, results));
+                };
+                let (takes, makes) = (signature.params.len(), signature.results.len());
+                consume(&mut frame, &mut stack, takes);
+                stack.extend(std::iter::repeat_n(Tracked::Other, makes));
             }
 
             // Everything else: pop what it takes, push what it makes, and treat
@@ -651,9 +651,7 @@ fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame>
                     frame.escapes = true;
                     return Some(frame);
                 };
-                if !consume(&mut frame, &mut stack, takes) {
-                    return Some(frame);
-                }
+                consume(&mut frame, &mut stack, takes);
                 stack.extend(std::iter::repeat_n(Tracked::Other, makes));
             }
         }
@@ -662,18 +660,13 @@ fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame>
 }
 
 /// Pops `count` values, marking the frame as escaping if any of them was the
-/// frame address. Returns false when the analysis has given up.
-fn consume(frame: &mut Frame, stack: &mut Vec<Tracked>, count: usize) -> bool {
-    if count == usize::MAX {
-        frame.escapes = true;
-        return false;
-    }
+/// frame address.
+fn consume(frame: &mut Frame, stack: &mut Vec<Tracked>, count: usize) {
     for _ in 0..count {
         if matches!(stack.pop(), Some(Tracked::Frame(_))) {
             frame.escapes = true;
         }
     }
-    true
 }
 
 fn is_control_flow(op: &Op) -> bool {
@@ -698,7 +691,6 @@ fn arity_of(module: &Module, op: &Op) -> Option<(usize, usize)> {
     Some(match op {
         Op::Nop | Op::DataDrop(_) => (0, 0),
         Op::Num(num) => (num.operands().len(), 1),
-        Op::GlobalSet(_) => (1, 0),
         Op::Select => (3, 1),
         Op::MemorySize => (0, 1),
         Op::MemoryGrow => (1, 1),
@@ -1832,6 +1824,75 @@ mod tests {
             ..Module::default()
         };
         assert_eq!(static_text(&module, 0), None);
+    }
+
+    #[test]
+    fn an_instruction_outside_the_walks_vocabulary_ends_it() {
+        // An atomic: the walk models plain loads and stores, not these, and
+        // stopping is the only safe answer to an instruction it cannot account
+        // for on the stack.
+        let mut body = frame_prologue(16, 0);
+        body.push(Op::Atomic {
+            op: crate::module::Atomic {
+                kind: crate::module::AtomicKind::Load,
+                ty: ValType::I32,
+                width: 4,
+            },
+            mem: crate::module::MemArg { offset: 0 },
+        });
+        assert!(frame_of(body).escapes);
+    }
+
+    #[test]
+    fn a_prologue_whose_second_instruction_is_not_a_size_is_not_one() {
+        let module = framed_module(vec![Op::GlobalGet(0), Op::Nop, Op::LocalTee(0)]);
+        assert!(analyse(&module).frames.is_empty());
+    }
+
+    #[test]
+    fn a_call_that_is_not_a_registration_is_walked_past() {
+        // The embind scan has to keep going through every other call in the
+        // module, of which there are rather more.
+        let mut module = Module {
+            types: vec![
+                FuncType::default(),
+                FuncType {
+                    params: vec![ValType::I32; 7],
+                    results: Vec::new(),
+                },
+            ],
+            datas: vec![DataSegment {
+                offset: Some(ConstExpr::I32(0)),
+                bytes: b"registered_name\0".to_vec(),
+            }],
+            ..Module::default()
+        };
+        module.func_imports.push(crate::module::ImportedFunc {
+            module: "env".into(),
+            field: "_embind_register_function".into(),
+            type_index: 1,
+        });
+        module.func_imports.push(crate::module::ImportedFunc {
+            module: "env".into(),
+            field: "something_else".into(),
+            type_index: 0,
+        });
+        let body = vec![
+            Op::Call(1),
+            Op::I32Const(0),
+            Op::I32Const(0),
+            Op::I32Const(0),
+            Op::I32Const(0),
+            Op::I32Const(0),
+            Op::I32Const(0),
+            Op::I32Const(0),
+            Op::Call(0),
+            Op::Call(1),
+        ];
+        let module = with_bodies(module, vec![body]);
+        let registrations = analyse(&module).registrations;
+        assert_eq!(registrations.len(), 1, "{registrations:?}");
+        assert_eq!(registrations[0].name.as_deref(), Some("registered_name"));
     }
 
     #[test]

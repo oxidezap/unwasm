@@ -157,11 +157,27 @@ mistaken for the enclosing frame's.
 
 ## Coverage is a floor, not a target
 
-98.5% of lines. The rest is `other =>` arms over wasmparser's
-`#[non_exhaustive]` enums and two checks the decoder already makes. Keep them.
-Deleting a defence to raise a percentage is how a decoder change becomes a panic
-two years later — and the tests in `malformed.rs` record *which* layer currently
-rejects each case, so a change in that answer is visible.
+**99.5% of lines. Twenty are left, all in `module.rs`, and all of them are
+unreachable rather than untested:**
+
+- the `other =>` arms over wasmparser's `#[non_exhaustive]` `TypeRef` and
+  `ExternalKind`. The compiler requires the arm; the only value that reaches it
+  is `FuncExact`, from the custom-descriptors proposal, which no toolchain we
+  target emits and `wasm-tools` will not assemble.
+- two checks that the function and code sections agree. The decoder guarantees
+  it by *three* separate routes — inconsistent lengths, a missing function
+  section, and a body count mismatch — and `malformed.rs` has a test for each,
+  asserting the decoder's message rather than ours.
+
+Keep them. Deleting a defence to raise a percentage is how a decoder change
+becomes a panic two years later, and the tests record which layer rejects each
+case today, so a change in that answer shows up as a failing test rather than
+as a crash.
+
+Measure with LCOV, not the text report: `cargo llvm-cov --workspace --lcov` and
+count `DA:` records with a zero. The text report's per-file view misses lines
+and reads as better than it is — it said `codegen.rs` was complete while the
+summary counted sixteen.
 
 ## Layout is a compile-time decision, and it was measured
 
