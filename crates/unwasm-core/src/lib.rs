@@ -3,6 +3,7 @@
 pub mod analysis;
 pub mod codegen;
 pub mod error;
+pub mod hostlib;
 pub mod module;
 pub mod ops;
 pub mod rt;
