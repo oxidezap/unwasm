@@ -341,6 +341,7 @@ impl<'a> Generator<'a> {
 
     fn run(mut self) -> Result<Vec<GeneratedFile>> {
         self.header();
+        self.registered_api();
         self.embed_runtime();
         self.data_constants();
         self.imports_trait();
@@ -377,6 +378,41 @@ impl<'a> Generator<'a> {
             "    clippy::pedantic\n",
             ")]\n\n",
         ));
+    }
+
+    /// The API the module registers with embind, as a comment at the top.
+    ///
+    /// This is what the module says it is for. Everything else in the output is
+    /// what the compiler left behind; this is what the author published, and on
+    /// a stripped module it is the only such thing there is.
+    fn registered_api(&mut self) {
+        let named: Vec<&crate::analysis::Registration> = self
+            .analysis
+            .registrations
+            .iter()
+            .filter(|registration| registration.name.is_some())
+            .collect();
+        if named.is_empty() {
+            return;
+        }
+        let _ = writeln!(
+            self.out,
+            "// The API this module registers with embind at startup — {} of {}\n// registrations name themselves:\n//",
+            named.len(),
+            self.analysis.registrations.len()
+        );
+        for registration in named {
+            let kind = registration
+                .kind
+                .trim_start_matches("_embind_register_")
+                .replace('_', " ");
+            let _ = writeln!(
+                self.out,
+                "//   {kind}: {}",
+                escape_doc(registration.name.as_deref().unwrap_or_default())
+            );
+        }
+        self.out.push('\n');
     }
 
     fn embed_runtime(&mut self) {

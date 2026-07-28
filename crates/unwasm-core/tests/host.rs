@@ -181,3 +181,34 @@ fn the_voip_module_leaves_a_hundred_and_two_methods() {
     eprintln!("D5pLH9sfOOl: {methods} methods for a host, {their_methods} of them WhatsApp's own");
     assert!(their_methods >= 30);
 }
+
+#[test]
+fn the_less_obvious_runtime_imports_are_grouped_with_the_runtime() {
+    // `__assert_fail` and `__resumeException` belong to the C++ runtime as much
+    // as `__cxa_throw` does, and neither starts with `__cxa_`.
+    let wasm = common::assemble(
+        "host-runtime-names",
+        r#"(module
+            (import "env" "__assert_fail" (func (param i32 i32 i32 i32)))
+            (import "env" "__resumeException" (func (param i32)))
+            (import "env" "__syscall_openat" (func (param i32 i32 i32 i32) (result i32)))
+            (import "env" "getentropy" (func (param i32 i32) (result i32)))
+            (import "env" "abort" (func))
+            (func (export "f")))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let skeleton = codegen::generate_host(&module).expect("generates");
+    let runtime = skeleton
+        .find("---- The C++ runtime")
+        .expect("the group exists");
+    let after = &skeleton[runtime..];
+    for method in [
+        "env___assert_fail",
+        "env___resumeException",
+        "env___syscall_openat",
+        "env_getentropy",
+        "env_abort",
+    ] {
+        assert!(after.contains(method), "{method} was grouped elsewhere");
+    }
+}

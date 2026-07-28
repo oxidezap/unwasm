@@ -230,6 +230,26 @@ fn inspect(arguments: &[String]) -> Result<String, String> {
         ));
     }
 
+    if !analysis.registrations.is_empty() {
+        let named = analysis
+            .registrations
+            .iter()
+            .filter(|registration| registration.name.is_some())
+            .count();
+        out.push_str(&format!(
+            "embind: {} registrations, {named} of them named\n",
+            analysis.registrations.len()
+        ));
+        for registration in &analysis.registrations {
+            if let Some(name) = &registration.name {
+                out.push_str(&format!(
+                    "  {} {name}\n",
+                    registration.kind.trim_start_matches("_embind_register_")
+                ));
+            }
+        }
+    }
+
     out.push_str("\nexports:\n");
     for export in &module.exports {
         out.push_str(&format!(

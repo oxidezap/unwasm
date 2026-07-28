@@ -383,3 +383,53 @@ fn host_needs_a_module_and_rejects_what_it_does_not_understand() {
         "{stderr}"
     );
 }
+
+#[test]
+fn inspect_lists_what_the_module_registers_with_embind() {
+    let path = fixture(
+        "sample-embind",
+        r#"(module
+            (import "env" "_embind_register_function"
+                (func $register (param i32 i32 i32 i32 i32 i32 i32)))
+            (memory 1)
+            (data (i32.const 64) "initVoipStack\00")
+            (func (export "register_it")
+                i32.const 64
+                i32.const 0 i32.const 0 i32.const 0 i32.const 0 i32.const 0 i32.const 0
+                call $register))"#,
+    );
+    let (ok, stdout, stderr) = run(&["inspect", path.to_str().expect("utf-8 path")]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("embind: 1 registrations, 1 of them named"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("  function initVoipStack"), "{stdout}");
+}
+
+#[test]
+fn inspect_reports_a_stack_pointer_found_by_its_use() {
+    // No exported name: the prologues are the evidence.
+    let path = fixture(
+        "sample-prologues",
+        r#"(module
+            (memory 1)
+            (global $sp (mut i32) (i32.const 65536))
+            (func (export "a") (result i32)
+                (local i32)
+                global.get $sp i32.const 16 i32.sub local.tee 0 global.set $sp
+                local.get 0 i32.const 16 i32.add global.set $sp
+                i32.const 1)
+            (func (export "b") (result i32)
+                (local i32)
+                global.get $sp i32.const 32 i32.sub local.tee 0 global.set $sp
+                local.get 0 i32.const 32 i32.add global.set $sp
+                i32.const 2))"#,
+    );
+    let (ok, stdout, stderr) = run(&["inspect", path.to_str().expect("utf-8 path")]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("stack pointer: global #0 (by 2 prologues)"),
+        "{stdout}"
+    );
+}

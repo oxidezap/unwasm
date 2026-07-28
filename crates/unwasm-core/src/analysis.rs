@@ -151,6 +151,24 @@ pub struct DerivedName {
     pub evidence: String,
 }
 
+/// Something the module registers with embind at startup.
+///
+/// embind is how a C++ module tells JavaScript what it exposes: classes, their
+/// methods, free functions, enums. The registration happens at run time, but
+/// the arguments are constants in the code — including the pointer to the name
+/// — so it can be read without running anything.
+///
+/// This is the one place a stripped module describes its own API. Everything
+/// else here recovers what the compiler left behind; this recovers what the
+/// author meant to publish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Registration {
+    /// Which `_embind_register_*` was called.
+    pub kind: String,
+    /// The name it registered, when the name is a constant this can resolve.
+    pub name: Option<String>,
+}
+
 /// What could be read out of a module.
 #[derive(Debug, Clone, Default)]
 pub struct Analysis {
@@ -169,6 +187,8 @@ pub struct Analysis {
     /// Names guessed from the strings a function references, by function index.
     /// Only for functions the module did not name itself.
     pub derived_names: std::collections::BTreeMap<u32, DerivedName>,
+    /// What the module registers with embind, in the order it registers it.
+    pub registrations: Vec<Registration>,
 }
 
 /// Reads a module for the things worth naming.
@@ -194,7 +214,98 @@ pub fn analyse(module: &Module) -> Analysis {
         set_threw,
         placements: placements.clone(),
         derived_names: derive_names(module, &placements),
+        registrations: find_registrations(module, &placements),
     }
+}
+
+/// Which argument of each `_embind_register_*` holds the name.
+///
+/// From embind's own signatures. A registration not listed here is still
+/// reported — that it happened is worth knowing — just without a name.
+const EMBIND_NAME_ARGUMENT: &[(&str, usize)] = &[
+    ("_embind_register_void", 1),
+    ("_embind_register_bool", 1),
+    ("_embind_register_integer", 1),
+    ("_embind_register_bigint", 1),
+    ("_embind_register_float", 1),
+    ("_embind_register_std_string", 1),
+    ("_embind_register_std_wstring", 2),
+    ("_embind_register_emval", 1),
+    ("_embind_register_memory_view", 2),
+    ("_embind_register_function", 0),
+    ("_embind_register_value_array", 1),
+    ("_embind_register_value_object", 1),
+    ("_embind_register_class", 10),
+    ("_embind_register_class_function", 1),
+    ("_embind_register_class_property", 1),
+    ("_embind_register_class_class_function", 1),
+    ("_embind_register_enum", 1),
+    ("_embind_register_enum_value", 1),
+    ("_embind_register_constant", 0),
+];
+
+/// Reads what the module registers with embind.
+///
+/// The arguments are taken only when every one of them is a constant sitting
+/// immediately before the call, which is what Emscripten emits — a registration
+/// assembled at run time is reported without a name rather than with a guess at
+/// one.
+fn find_registrations(
+    module: &Module,
+    placements: &std::collections::BTreeMap<u32, Placement>,
+) -> Vec<Registration> {
+    // Which imports are embind registrations, and where their name sits.
+    let mut registrars: std::collections::BTreeMap<u32, (&str, Option<usize>)> = Default::default();
+    for (index, import) in module.func_imports.iter().enumerate() {
+        if !import.field.starts_with("_embind_register") {
+            continue;
+        }
+        let at = EMBIND_NAME_ARGUMENT
+            .iter()
+            .find(|(name, _)| *name == import.field)
+            .map(|(_, at)| *at);
+        registrars.insert(index as u32, (import.field.as_str(), at));
+    }
+    if registrars.is_empty() {
+        return Vec::new();
+    }
+
+    let mut registrations = Vec::new();
+    for func in &module.funcs {
+        for (position, op) in func.body.iter().enumerate() {
+            let Op::Call(callee) = op else { continue };
+            let Some((field, name_at)) = registrars.get(callee) else {
+                continue;
+            };
+            let arity = module
+                .func_type(*callee)
+                .map_or(0, |signature| signature.params.len());
+
+            // The arguments, if they are all constants immediately before the
+            // call. Anything else and the name is not knowable from here.
+            let arguments: Option<Vec<i32>> = position.checked_sub(arity).and_then(|first| {
+                func.body[first..position]
+                    .iter()
+                    .map(|op| match op {
+                        Op::I32Const(value) => Some(*value),
+                        _ => None,
+                    })
+                    .collect()
+            });
+
+            let name = match (name_at, &arguments) {
+                (Some(at), Some(arguments)) => arguments
+                    .get(*at)
+                    .and_then(|address| placed_text(module, placements, *address, None)),
+                _ => None,
+            };
+            registrations.push(Registration {
+                kind: (*field).to_string(),
+                name,
+            });
+        }
+    }
+    registrations
 }
 
 /// Guesses names for unnamed functions from the messages they log.
@@ -1685,6 +1796,42 @@ mod tests {
         let analysis = analyse(&module);
         assert!(analysis.stack_pointer.is_none());
         assert!(analysis.frames.is_empty());
+    }
+
+    #[test]
+    fn a_function_with_two_unique_messages_keeps_the_more_specific_one() {
+        // Both belong to it alone; the longer identifier says more.
+        let module = Module {
+            datas: vec![DataSegment {
+                offset: Some(ConstExpr::I32(0)),
+                bytes: b"short_one: x\0handle_incoming_signalling_offer: y\0".to_vec(),
+            }],
+            types: vec![FuncType::default()],
+            ..Module::default()
+        };
+        let module = with_bodies(
+            module,
+            vec![vec![Op::I32Const(0), Op::Drop, Op::I32Const(13), Op::Drop]],
+        );
+        let derived = analyse(&module).derived_names;
+        assert_eq!(
+            derived[&0].name, "handle_incoming_signalling_offer",
+            "{derived:?}"
+        );
+    }
+
+    #[test]
+    fn a_segment_placed_by_a_global_offset_is_not_read_from() {
+        // Only an imported global can mean this, and its value is not known
+        // here — so nothing in that segment resolves.
+        let module = Module {
+            datas: vec![DataSegment {
+                offset: Some(ConstExpr::GlobalGet(0)),
+                bytes: b"unreachable_text\0".to_vec(),
+            }],
+            ..Module::default()
+        };
+        assert_eq!(static_text(&module, 0), None);
     }
 
     #[test]

@@ -1197,3 +1197,42 @@ fn a_long_chain_of_arithmetic_is_named_rather_than_nested_forever() {
         &[common::call("chain", &[common::Arg::I32(1)])],
     );
 }
+
+#[test]
+fn an_operand_that_reads_a_global_is_named_before_the_call_that_takes_it() {
+    // `self.f1(self.g0)` borrows `self` twice, and the second one is a method
+    // call. Anything mentioning `self` is named first; a plain local is not.
+    let wasm = common::assemble(
+        "spill-global",
+        r#"(module
+            (memory (export "memory") 1)
+            (global $counter (mut i32) (i32.const 7))
+            (func $double (param i32) (result i32) local.get 0 i32.const 2 i32.mul)
+            (func (export "through_a_global") (param i32) (result i32)
+                global.get $counter
+                local.get 0
+                i32.add
+                call $double
+                global.get $counter
+                i32.add)
+            (func (export "store_a_global") (param i32) (result i32)
+                local.get 0
+                global.get $counter
+                i32.store
+                local.get 0
+                i32.load))"#,
+    );
+    let code = common::decompile(&wasm);
+    assert!(
+        code.contains("let t"),
+        "an operand mentioning self must be named:\n{code}"
+    );
+    common::assert_agrees(
+        "spill-global",
+        &wasm,
+        &[
+            common::call("through_a_global", &[common::Arg::I32(3)]),
+            common::call("store_a_global", &[common::Arg::I32(64)]),
+        ],
+    );
+}
