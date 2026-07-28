@@ -100,9 +100,14 @@ instructions; see below.
 `COs9e0Kj0ic` compiles with rustc in about 2.5 seconds and instantiates, which
 runs the module's own `__wasm_call_ctors` and every static initialiser with it.
 
-`ayqr5HQtlkb` — 2.0 MiB of wasm, 3055 functions, 660k lines of Rust — compiles
-and instantiates in **23 seconds**, split across 192 module files. In a single
-file the same module took **22m49s**.
+`ayqr5HQtlkb` — 2.0 MiB of wasm, 3055 functions — compiles and instantiates in
+**23 seconds**. In a single file the same module took **22m49s**.
+
+`D5pLH9sfOOl`, the 9.4 MiB VoIP module — 13347 functions, 2.4M lines of Rust
+across 415 files, a shared imported memory and 1070 atomics — **compiles and
+instantiates in 13m44s**, and comes up with the 160 pages of memory its import
+declares. Its `start` function runs during instantiation without needing a
+host.
 
 ### The split, and why it is not cosmetic
 
@@ -447,10 +452,9 @@ import stays the host's to implement.
 - **Compile time still scales with the module**, just not catastrophically:
   23 seconds for 2.0 MiB of wasm. The 9.4 MiB VoIP module would be several
   minutes, if the rest of it were supported.
-- **The VoIP module decompiles but cannot yet run**: 102 host imports remain,
-  and they are the ones only a host can answer — 7 WASI, 20 Emscripten runtime,
-  20 C++ runtime and syscalls, 16 embind/emval, and 40 callbacks belonging to
-  WhatsApp itself.
+- **The VoIP module compiles and instantiates, but cannot do anything yet**:
+  102 host imports remain, and 35 of them are WhatsApp's own callbacks that
+  only the application can answer. `unwasm host` writes the skeleton.
 - **No SIMD, no reference types, no exceptions, no multi-value.** Each is
   refused by name.
 - **Level 0 only.** Linear memory is bytes; a C local that lived in the shadow
