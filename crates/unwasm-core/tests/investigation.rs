@@ -213,3 +213,102 @@ fn arithmetic_that_is_not_an_address_is_not_called_one() {
         "outside the span the data segments occupy: {hot:?}"
     );
 }
+
+// ---- cross-reference ----
+
+/// A module with a call chain, an indirect call, and an unreachable function.
+const CALLERS: &str = r#"(module
+    (import "env" "host" (func (param i32)))
+    (memory (export "memory") 1)
+    (type $unary (func (param i32) (result i32)))
+    (func (export "entry") (param i32) (result i32)
+        local.get 0
+        call 2)
+    (func (param i32) (result i32)
+        local.get 0
+        call 3
+        i32.const 0
+        call 0
+        local.get 0
+        i32.const 0
+        call_indirect (type $unary))
+    (func (param i32) (result i32) local.get 0 i32.const 2 i32.mul)
+    (func (param i32) (result i32) local.get 0)
+    (table 2 funcref)
+    (elem (i32.const 0) func 4))"#;
+
+#[test]
+fn the_call_graph_runs_in_both_directions() {
+    let wasm = common::assemble("xref", CALLERS);
+    let module = Module::parse(&wasm).expect("valid");
+    let graph = analysis::analyse(&module).call_graph;
+
+    // f1 (entry) calls f2; f2 calls f3 and the import.
+    assert!(graph.calls_from(1).contains(&2));
+    assert!(graph.calls_from(2).contains(&3));
+    assert!(graph.calls_from(2).contains(&0), "the import counts too");
+    // And upwards, which is the direction the module does not record.
+    assert!(graph.callers_of(2).contains(&1));
+    assert_eq!(graph.callers_of(1).len(), 0, "entry is called by nobody");
+    // An indirect call names a type, not a target.
+    assert!(graph.calls_indirectly[&2].contains(&0));
+    assert!(
+        !graph.calls_from(2).contains(&4),
+        "what the table holds is not a direct call"
+    );
+}
+
+#[test]
+fn a_function_says_who_calls_it_and_what_it_calls() {
+    let wasm = common::assemble("xref-output", CALLERS);
+    let code = common::decompile(&wasm);
+    assert!(code.contains("Called by 1: `f1`"), "{code}");
+    assert!(code.contains("Calls 2: `f0`, `f3`"), "{code}");
+    assert!(
+        code.contains("through the table: (i32) -> (i32)"),
+        "an indirect call is not a direct one, and says so:\n{code}"
+    );
+}
+
+#[test]
+fn a_function_nothing_reaches_says_which_kind_of_nothing() {
+    let wasm = common::assemble("xref-unreached", CALLERS);
+    let code = common::decompile(&wasm);
+    // Exported: reachable from outside.
+    assert!(code.contains("No direct callers: it is exported"), "{code}");
+    // In the table: reachable indirectly.
+    assert!(
+        code.contains("No direct callers: the table reaches it"),
+        "{code}"
+    );
+}
+
+#[test]
+fn a_function_that_truly_nothing_reaches_is_named_as_such() {
+    let wasm = common::assemble(
+        "xref-dead",
+        r#"(module
+            (func (export "used") (result i32) i32.const 1)
+            (func (result i32) i32.const 2))"#,
+    );
+    let code = common::decompile(&wasm);
+    assert!(
+        code.contains("an entry point, or dead"),
+        "not exported, not in the table, not called:\n{code}"
+    );
+}
+
+#[test]
+fn the_index_carries_the_call_graph() {
+    let wasm = common::assemble("xref-index", CALLERS);
+    let module = Module::parse(&wasm).expect("valid");
+    let files = codegen::generate_files(&module, codegen::Layout::Single).expect("generates");
+    let json = &files
+        .iter()
+        .find(|file| file.name == "names.json")
+        .expect("present")
+        .contents;
+    assert!(json.contains(r#""calls": [2]"#), "{json}");
+    assert!(json.contains(r#""called_by": [1]"#), "{json}");
+    common::assert_valid_json(json);
+}

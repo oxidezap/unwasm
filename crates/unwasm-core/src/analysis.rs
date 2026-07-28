@@ -196,6 +196,46 @@ pub struct Registration {
     pub name: Option<String>,
 }
 
+/// Who calls whom.
+///
+/// A call site says which function it calls; nothing says who calls *this* one,
+/// and that is the direction a reader wants — "what reaches this code" is the
+/// first question about any function in a stripped binary. Reading it out of
+/// the module is a scan; recovering it by grep over two million lines of output
+/// is an afternoon.
+#[derive(Debug, Clone, Default)]
+pub struct CallGraph {
+    /// For each function, the functions it calls directly.
+    pub calls: std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>>,
+    /// For each function, the functions that call it directly.
+    pub called_by: std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>>,
+    /// For each function, the signatures it calls through the table.
+    ///
+    /// An indirect call names a type, not a target. Which functions that could
+    /// reach is the table's business — see [`Analysis::table`] — and keeping
+    /// the two apart is the difference between "calls this" and "could call
+    /// anything with this shape".
+    pub calls_indirectly: std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>>,
+}
+
+impl CallGraph {
+    /// The functions this one calls directly.
+    #[must_use]
+    pub fn calls_from(&self, func: u32) -> &std::collections::BTreeSet<u32> {
+        static EMPTY: std::sync::LazyLock<std::collections::BTreeSet<u32>> =
+            std::sync::LazyLock::new(Default::default);
+        self.calls.get(&func).unwrap_or(&EMPTY)
+    }
+
+    /// The functions that call this one directly.
+    #[must_use]
+    pub fn callers_of(&self, func: u32) -> &std::collections::BTreeSet<u32> {
+        static EMPTY: std::sync::LazyLock<std::collections::BTreeSet<u32>> =
+            std::sync::LazyLock::new(Default::default);
+        self.called_by.get(&func).unwrap_or(&EMPTY)
+    }
+}
+
 /// What could be read out of a module.
 #[derive(Debug, Clone, Default)]
 pub struct Analysis {
@@ -223,6 +263,8 @@ pub struct Analysis {
     /// functions, and every one of them reads as noise until you notice it is
     /// the same number. Counting is what makes it noticeable.
     pub hot_addresses: std::collections::BTreeMap<i32, usize>,
+    /// Who calls whom.
+    pub call_graph: CallGraph,
     /// What the function table holds: slot to function index.
     ///
     /// `call_indirect` takes a *table* index, not a function index, so reading
@@ -257,7 +299,34 @@ pub fn analyse(module: &Module) -> Analysis {
         registrations: find_registrations(module, &placements),
         table: read_table(module),
         hot_addresses: find_hot_addresses(module, &placements),
+        call_graph: read_call_graph(module),
     }
+}
+
+/// Reads the call graph out of the function bodies.
+fn read_call_graph(module: &Module) -> CallGraph {
+    let import_count = module.func_imports.len() as u32;
+    let mut graph = CallGraph::default();
+    for (at, func) in module.funcs.iter().enumerate() {
+        let caller = import_count + at as u32;
+        for op in &func.body {
+            match op {
+                Op::Call(callee) => {
+                    graph.calls.entry(caller).or_default().insert(*callee);
+                    graph.called_by.entry(*callee).or_default().insert(caller);
+                }
+                Op::CallIndirect { type_index } => {
+                    graph
+                        .calls_indirectly
+                        .entry(caller)
+                        .or_default()
+                        .insert(*type_index);
+                }
+                _ => {}
+            }
+        }
+    }
+    graph
 }
 
 /// How many functions must share an address before it is worth pointing out.

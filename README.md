@@ -315,6 +315,26 @@ editor can still follow a call.
 file, line, how it was named, and which table slots reach it. That is the thing
 to look a function up in, rather than `grep -n` over two million lines.
 
+**`unwasm calls`** answers the other question a module does not record. Every
+call site says what it calls; nothing says what calls *this* function, and that
+is the direction a reader wants first.
+
+```console
+$ unwasm calls voip.wasm 10532
+f10532  (i32,i32,i32,i32,i32,i32) -> (i32)  wa_call_group_create_participant
+
+called by 6:
+  f10425  …  wa_call_start_internal
+  f10534  …  wa_call_invite_internal
+  …
+calls 38:
+  f4174   …  wa_vid_quality_manager_create
+```
+
+Each function carries the same in its doc comment, and a function nothing calls
+says which kind of nothing: exported, reached only through the table, or
+neither — an entry point or dead code.
+
 **`unwasm table`** answers the question a call site cannot: `call_indirect`
 takes a *table* index, not a function index.
 

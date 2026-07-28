@@ -16,6 +16,7 @@ usage:
   unwasm decompile <module.wasm> [-o <out>] [--split <n>] [--only <indices>]
   unwasm host      <module.wasm> [-o <host.rs>]
   unwasm table     <module.wasm> [--type <signature>]
+  unwasm calls     <module.wasm> <index>
   unwasm inspect   <module.wasm>
 
   -o <out>       a path ending in .rs writes one file; any other path is a
@@ -37,6 +38,10 @@ grepping the output.
 signature. `call_indirect` takes a table index rather than a function index, so
 this is what says which slot a call site reaches — and which slot a callback
 has to go into. `--type \"(i32,i32,i32)->()\"` narrows it to one signature.
+
+`calls` answers the question a call site cannot: what reaches this function.
+The module says what each function calls; nothing in it says what calls a given
+one, and that is usually the direction you want.
 
 `host` writes a skeleton `impl Imports`: every import the module still needs,
 grouped by where it comes from, each one a `todo!()`. Emscripten's `invoke_*`
@@ -73,6 +78,7 @@ fn run(arguments: &[String]) -> Result<String, String> {
         Some("decompile") => decompile(&arguments[1..]),
         Some("host") => host(&arguments[1..]),
         Some("table") => table(&arguments[1..]),
+        Some("calls") => calls(&arguments[1..]),
         Some("inspect") => inspect(&arguments[1..]),
         Some("-h" | "--help" | "help") | None => Ok(USAGE.to_string()),
         Some(other) => Err(format!("unknown command `{other}`\n\n{USAGE}")),
@@ -204,11 +210,91 @@ fn host(arguments: &[String]) -> Result<String, String> {
     }
 }
 
-/// A signature as this prints it: `(i32,i32) -> i32`, `() -> ()`.
-fn signature_text(ty: &unwasm_core::module::FuncType) -> String {
-    let params: Vec<&str> = ty.params.iter().map(|param| param.rust_name()).collect();
-    let results: Vec<&str> = ty.results.iter().map(|result| result.rust_name()).collect();
-    format!("({}) -> ({})", params.join(","), results.join(","))
+fn calls(arguments: &[String]) -> Result<String, String> {
+    let path = arguments.first().ok_or("calls needs a module path")?;
+    let index = arguments
+        .get(1)
+        .ok_or("calls needs a function index")?
+        .parse::<u32>()
+        .map_err(|_| "calls takes a function index".to_string())?;
+    if let Some(extra) = arguments.get(2) {
+        return Err(format!("unexpected argument `{extra}`"));
+    }
+
+    let module = read(path)?;
+    let analysis = unwasm_core::analysis::analyse(&module);
+    let total = module.func_imports.len() + module.funcs.len();
+    if index as usize >= total {
+        return Err(format!(
+            "the module has {total} functions; #{index} is not one of them"
+        ));
+    }
+
+    let describe = |func: u32| {
+        let name = module
+            .func_name(func)
+            .map(str::to_string)
+            .or_else(|| {
+                analysis
+                    .derived_names
+                    .get(&func)
+                    .map(|derived| derived.name.clone())
+            })
+            .unwrap_or_default();
+        let signature = module
+            .func_type(func)
+            .map_or_else(|| "?".to_string(), unwasm_core::codegen::signature_text);
+        format!(
+            "  f{func:<6} {signature}{}{name}\n",
+            if name.is_empty() { "" } else { "  " }
+        )
+    };
+
+    let mut out = describe(index).replacen("  ", "", 1);
+    let callers = analysis.call_graph.callers_of(index);
+    let callees = analysis.call_graph.calls_from(index);
+
+    let slots: Vec<String> = analysis
+        .table
+        .iter()
+        .filter(|(_, func)| **func == index)
+        .map(|(slot, _)| slot.to_string())
+        .collect();
+    if !slots.is_empty() {
+        out.push_str(&format!("in table slots: {}\n", slots.join(", ")));
+    }
+    if let Some(export) = module.exports.iter().find(|export| {
+        export.kind == unwasm_core::module::ExportKind::Func && export.index == index
+    }) {
+        out.push_str(&format!("exported as: {}\n", export.name));
+    }
+
+    out.push_str(&format!("\ncalled by {}:\n", callers.len()));
+    for caller in callers {
+        out.push_str(&describe(*caller));
+    }
+    out.push_str(&format!("\ncalls {}:\n", callees.len()));
+    for callee in callees {
+        out.push_str(&describe(*callee));
+    }
+    if let Some(types) = analysis.call_graph.calls_indirectly.get(&index) {
+        out.push_str("\nand through the table, functions of type:\n");
+        for ty in types {
+            let signature = module.types.get(*ty as usize).map_or_else(
+                || format!("type {ty}"),
+                unwasm_core::codegen::signature_text,
+            );
+            // How many slots could actually answer such a call.
+            let wanted = module.types.get(*ty as usize);
+            let holding = analysis
+                .table
+                .values()
+                .filter(|func| module.func_type(**func) == wanted)
+                .count();
+            out.push_str(&format!("  {signature}  ({holding} slots hold one)\n"));
+        }
+    }
+    Ok(out)
 }
 
 fn table(arguments: &[String]) -> Result<String, String> {
@@ -238,7 +324,7 @@ fn table(arguments: &[String]) -> Result<String, String> {
     for (slot, func) in &analysis.table {
         let signature = module
             .func_type(*func)
-            .map_or_else(|| "?".to_string(), signature_text);
+            .map_or_else(|| "?".to_string(), unwasm_core::codegen::signature_text);
         if let Some(wanted) = &wanted
             && tidy(&signature) != *wanted
         {

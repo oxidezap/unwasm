@@ -227,6 +227,14 @@ test read a file another is still writing, and the failure that produces —
 "unexpected end-of-file" on a module that is fine — reads as a decoder bug. It
 happened twice before this was fixed properly.
 
+## An indirect call is not a direct call
+
+`CallGraph` keeps them apart: `calls` holds what a function calls by index, and
+`calls_indirectly` holds the *signatures* it calls through the table. Merging
+them would turn "could reach anything with this shape" into "calls this", which
+is a much stronger claim than the module makes. What a signature could reach is
+the table's business, and `unwasm table --type` is where to ask.
+
 ## Open work
 
 1. **Host the VoIP module.** `unwasm host` writes the skeleton; what is left is

@@ -409,9 +409,17 @@ impl<'a> Generator<'a> {
                 None if self.module.func_name(*index).is_some() => "name section",
                 None => "none",
             };
+            let numbers = |set: &std::collections::BTreeSet<u32>| {
+                set.iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let calls = numbers(self.analysis.call_graph.calls_from(*index));
+            let called_by = numbers(self.analysis.call_graph.callers_of(*index));
             let _ = writeln!(
                 out,
-                "    {{\"index\": {index}, \"name\": \"{name}\", \"file\": \"{file}\", \"line\": {line}, \"named_by\": \"{source}\", \"table_slots\": [{}]}}{}",
+                "    {{\"index\": {index}, \"name\": \"{name}\", \"file\": \"{file}\", \"line\": {line}, \"named_by\": \"{source}\", \"table_slots\": [{}], \"calls\": [{calls}], \"called_by\": [{called_by}]}}{}",
                 slots.join(", "),
                 if at + 1 == self.located.len() {
                     ""
@@ -1015,6 +1023,83 @@ impl<'a> Generator<'a> {
         Ok(())
     }
 
+    /// Who reaches this function, and what it reaches.
+    ///
+    /// The direction that matters is upwards: a call site says what it calls,
+    /// and nothing in the module says what calls *this*. A function with no
+    /// direct callers at all is worth saying so about — it is either an entry
+    /// point, something only the table reaches, or dead.
+    fn cross_reference(&self, index: u32, slots: &[u32]) -> String {
+        const NAMED: usize = 6;
+        let graph = &self.analysis.call_graph;
+        let callers = graph.callers_of(index);
+        let calls = graph.calls_from(index);
+        let mut out = String::new();
+
+        if callers.is_empty() {
+            let exported = self
+                .module
+                .exports
+                .iter()
+                .any(|export| export.kind == ExportKind::Func && export.index == index);
+            let reached = if exported {
+                "it is exported"
+            } else if slots.is_empty() {
+                "nothing in this module reaches it — an entry point, or dead"
+            } else {
+                "the table reaches it"
+            };
+            let _ = writeln!(out, "    ///\n    /// No direct callers: {reached}.");
+        } else {
+            let named: Vec<String> = callers
+                .iter()
+                .take(NAMED)
+                .map(|caller| format!("`{}`", function_ident(*caller, &self.analysis)))
+                .collect();
+            let _ = writeln!(
+                out,
+                "    ///\n    /// Called by {}: {}{}.",
+                callers.len(),
+                named.join(", "),
+                if callers.len() > NAMED { ", …" } else { "" }
+            );
+        }
+
+        let indirect = self.analysis.call_graph.calls_indirectly.get(&index);
+        if !calls.is_empty() || indirect.is_some() {
+            let named: Vec<String> = calls
+                .iter()
+                .take(NAMED)
+                .map(|callee| format!("`{}`", function_ident(*callee, &self.analysis)))
+                .collect();
+            let through_the_table = indirect
+                .map(|types| {
+                    format!(
+                        ", and through the table: {}",
+                        types
+                            .iter()
+                            .map(|ty| self
+                                .module
+                                .types
+                                .get(*ty as usize)
+                                .map_or_else(|| format!("type {ty}"), signature_text))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })
+                .unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "    /// Calls {}{}{}{}{through_the_table}.",
+                calls.len(),
+                if named.is_empty() { "" } else { ": " },
+                named.join(", "),
+                if calls.len() > NAMED { ", …" } else { "" }
+            );
+        }
+        out
+    }
+
     /// One function, as text.
     ///
     /// Returned rather than written straight out, because under a split layout
@@ -1107,6 +1192,8 @@ impl<'a> Generator<'a> {
                     .join(", ")
             );
         }
+
+        out.push_str(&self.cross_reference(index, &slots));
 
         let frame = self.analysis.frames.get(&index);
         if let Some(frame) = frame {
@@ -2237,6 +2324,14 @@ fn escape_comment(text: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// A signature as the comments print it: `(i32,i32) -> ()`.
+#[must_use]
+pub fn signature_text(ty: &crate::module::FuncType) -> String {
+    let params: Vec<&str> = ty.params.iter().map(|param| param.rust_name()).collect();
+    let results: Vec<&str> = ty.results.iter().map(|result| result.rust_name()).collect();
+    format!("({}) -> ({})", params.join(","), results.join(","))
 }
 
 fn signature_of(ty: &crate::module::FuncType) -> String {

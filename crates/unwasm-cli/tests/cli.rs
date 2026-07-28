@@ -573,3 +573,116 @@ fn only_to_stdout_writes_just_the_rust() {
         "the index needs a directory"
     );
 }
+
+#[test]
+fn calls_reports_both_directions_for_one_function() {
+    let path = fixture(
+        "sample-calls",
+        r#"(module
+            (func (export "entry") (result i32) call 1)
+            (func (result i32) call 2)
+            (func (result i32) i32.const 7)
+            (table 1 funcref)
+            (elem (i32.const 0) func 2))"#,
+    );
+    let (ok, stdout, stderr) = run(&["calls", path.to_str().expect("utf-8 path"), "1"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("called by 1:"), "{stdout}");
+    assert!(stdout.contains("f0"), "{stdout}");
+    assert!(stdout.contains("calls 1:"), "{stdout}");
+    assert!(stdout.contains("f2"), "{stdout}");
+
+    // The one in the table says so, and so does the exported one.
+    let (ok, stdout, _) = run(&["calls", path.to_str().expect("utf-8 path"), "2"]);
+    assert!(ok);
+    assert!(stdout.contains("in table slots: 0"), "{stdout}");
+    let (ok, stdout, _) = run(&["calls", path.to_str().expect("utf-8 path"), "0"]);
+    assert!(ok);
+    assert!(stdout.contains("exported as: entry"), "{stdout}");
+    assert!(stdout.contains("called by 0:"), "{stdout}");
+}
+
+#[test]
+fn calls_rejects_an_index_the_module_does_not_have() {
+    let path = fixture("sample-callsargs", SAMPLE);
+    let (ok, _, stderr) = run(&["calls", path.to_str().expect("utf-8 path"), "9999"]);
+    assert!(!ok);
+    assert!(stderr.contains("#9999 is not one of them"), "{stderr}");
+
+    let (ok, _, stderr) = run(&["calls", path.to_str().expect("utf-8 path")]);
+    assert!(!ok);
+    assert!(stderr.contains("calls needs a function index"), "{stderr}");
+
+    let (ok, _, stderr) = run(&["calls", path.to_str().expect("utf-8 path"), "add"]);
+    assert!(!ok);
+    assert!(stderr.contains("calls takes a function index"), "{stderr}");
+
+    let (ok, _, stderr) = run(&["calls"]);
+    assert!(!ok);
+    assert!(stderr.contains("calls needs a module path"), "{stderr}");
+
+    let (ok, _, stderr) = run(&["calls", path.to_str().expect("utf-8 path"), "1", "extra"]);
+    assert!(!ok);
+    assert!(stderr.contains("unexpected argument `extra`"), "{stderr}");
+}
+
+#[test]
+fn calls_says_what_an_indirect_call_could_reach() {
+    let path = fixture(
+        "sample-callsindirect",
+        r#"(module
+            (type $unary (func (param i32) (result i32)))
+            (func (export "dispatch") (param i32) (result i32)
+                local.get 0
+                i32.const 0
+                call_indirect (type $unary))
+            (func (param i32) (result i32) local.get 0)
+            (table 2 funcref)
+            (elem (i32.const 0) func 1))"#,
+    );
+    let (ok, stdout, stderr) = run(&["calls", path.to_str().expect("utf-8 path"), "0"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("and through the table"), "{stdout}");
+    assert!(stdout.contains("(i32) -> (i32)"), "{stdout}");
+    assert!(stdout.contains("1 slots hold one"), "{stdout}");
+}
+
+#[test]
+fn calls_prints_a_placeholder_for_a_signature_the_module_does_not_have() {
+    // A function whose type index points at nothing. wasm-tools will not
+    // assemble that, so the bytes are written directly: one type, one function
+    // declared with type 5, one empty body.
+    const INCONSISTENT: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // types: one, () -> ()
+        0x03, 0x02, 0x01, 0x05, // functions: one, of type 5
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b, // code: one empty body
+    ];
+    let path = scratch().join("inconsistent.wasm");
+    std::fs::write(&path, INCONSISTENT).expect("writing the module");
+
+    let (ok, stdout, stderr) = run(&["calls", path.to_str().expect("utf-8 path"), "0"]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains('?'),
+        "a signature that cannot be resolved is shown as unknown, not invented:\n{stdout}"
+    );
+}
+
+#[test]
+fn calls_names_an_indirect_type_it_cannot_resolve() {
+    // `call_indirect (type 9)` in a module with fewer types. Again by hand.
+    const INCONSISTENT: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // types: one, () -> ()
+        0x03, 0x02, 0x01, 0x00, // functions: one, of type 0
+        0x04, 0x04, 0x01, 0x70, 0x00, 0x01, // table: one funcref, min 1
+        0x0a, 0x09, 0x01, 0x07, 0x00, 0x41, 0x00, 0x11, 0x09, 0x00, 0x0b,
+    ];
+    let path = scratch().join("indirect-unknown.wasm");
+    std::fs::write(&path, INCONSISTENT).expect("writing the module");
+
+    let (ok, stdout, stderr) = run(&["calls", path.to_str().expect("utf-8 path"), "0"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("type 9"), "{stdout}");
+}
