@@ -31,6 +31,12 @@ pub const PAGE_SIZE: usize = 65536;
 pub struct Hit {
     /// The function that did it, by index.
     pub site: u32,
+    /// Where the instruction that did it sits in the wasm file.
+    ///
+    /// The function alone leaves the next question open — a function with
+    /// fifty stores in it wrote the address from one of them — and this is the
+    /// one. `unwasm bytes <module> <at> <len>` prints it.
+    pub at: u32,
     /// The address written, after the static offset was added.
     pub address: i32,
     /// How many bytes it wrote.
@@ -129,7 +135,7 @@ impl Memory {
     /// If `watch.stop` is set and the write is watched. That is the point: the
     /// panic carries the site and the address, and the backtrace carries the
     /// call chain that reached it.
-    fn note(&mut self, site: u32, addr: i32, offset: u64, bytes: u64, kind: WriteKind) {
+    fn note(&mut self, site: u32, at: u32, addr: i32, offset: u64, bytes: u64, kind: WriteKind) {
         if self.watch.ranges.is_empty() {
             return;
         }
@@ -145,6 +151,7 @@ impl Memory {
         }
         let hit = Hit {
             site,
+            at,
             address: start as u32 as i32,
             bytes: bytes as u32,
             kind,
@@ -152,67 +159,82 @@ impl Memory {
         self.watch.hits.push(hit);
         if self.watch.stop {
             panic!(
-                "watchpoint: function #{site} wrote {bytes} bytes at {:#x} ({:?})",
-                start, kind
+                "watchpoint: function #{site} wrote {bytes} bytes at {start:#x} ({kind:?}), \
+                 from the instruction at file offset {at}"
             );
         }
     }
 
     /// `i32.store8` / `i64.store8`, reporting to any watchpoint.
-    pub fn store8_at(&mut self, site: u32, addr: i32, offset: u64, value: i64) {
+    pub fn store8_at(&mut self, site: u32, at: u32, addr: i32, offset: u64, value: i64) {
         self.store8(addr, offset, value);
-        self.note(site, addr, offset, 1, WriteKind::Store);
+        self.note(site, at, addr, offset, 1, WriteKind::Store);
     }
     /// `i32.store16` / `i64.store16`, reporting to any watchpoint.
-    pub fn store16_at(&mut self, site: u32, addr: i32, offset: u64, value: i64) {
+    pub fn store16_at(&mut self, site: u32, at: u32, addr: i32, offset: u64, value: i64) {
         self.store16(addr, offset, value);
-        self.note(site, addr, offset, 2, WriteKind::Store);
+        self.note(site, at, addr, offset, 2, WriteKind::Store);
     }
     /// `i32.store` / `i64.store32`, reporting to any watchpoint.
-    pub fn store32_at(&mut self, site: u32, addr: i32, offset: u64, value: i64) {
+    pub fn store32_at(&mut self, site: u32, at: u32, addr: i32, offset: u64, value: i64) {
         self.store32(addr, offset, value);
-        self.note(site, addr, offset, 4, WriteKind::Store);
+        self.note(site, at, addr, offset, 4, WriteKind::Store);
     }
     /// `i64.store`, reporting to any watchpoint.
-    pub fn store64_at(&mut self, site: u32, addr: i32, offset: u64, value: i64) {
+    pub fn store64_at(&mut self, site: u32, at: u32, addr: i32, offset: u64, value: i64) {
         self.store64(addr, offset, value);
-        self.note(site, addr, offset, 8, WriteKind::Store);
+        self.note(site, at, addr, offset, 8, WriteKind::Store);
     }
     /// `f32.store`, reporting to any watchpoint.
-    pub fn store_f32_at(&mut self, site: u32, addr: i32, offset: u64, value: f32) {
+    pub fn store_f32_at(&mut self, site: u32, at: u32, addr: i32, offset: u64, value: f32) {
         self.store_f32(addr, offset, value);
-        self.note(site, addr, offset, 4, WriteKind::Store);
+        self.note(site, at, addr, offset, 4, WriteKind::Store);
     }
     /// `f64.store`, reporting to any watchpoint.
-    pub fn store_f64_at(&mut self, site: u32, addr: i32, offset: u64, value: f64) {
+    pub fn store_f64_at(&mut self, site: u32, at: u32, addr: i32, offset: u64, value: f64) {
         self.store_f64(addr, offset, value);
-        self.note(site, addr, offset, 8, WriteKind::Store);
+        self.note(site, at, addr, offset, 8, WriteKind::Store);
     }
     /// `memory.fill`, reporting to any watchpoint. This is the one that
     /// answers "who zeroed it": a `memset` is a fill, not a store.
-    pub fn fill_at(&mut self, site: u32, addr: i32, value: i32, len: i32) {
+    pub fn fill_at(&mut self, site: u32, at: u32, addr: i32, value: i32, len: i32) {
         self.fill(addr, value, len);
-        self.note(site, addr, 0, u64::from(len as u32), WriteKind::Fill);
+        self.note(site, at, addr, 0, u64::from(len as u32), WriteKind::Fill);
     }
     /// `memory.copy`, reporting to any watchpoint on the destination.
-    pub fn copy_at(&mut self, site: u32, dst: i32, src: i32, len: i32) {
+    pub fn copy_at(&mut self, site: u32, at: u32, dst: i32, src: i32, len: i32) {
         self.copy(dst, src, len);
-        self.note(site, dst, 0, u64::from(len as u32), WriteKind::Copy);
+        self.note(site, at, dst, 0, u64::from(len as u32), WriteKind::Copy);
     }
     /// `memory.init`, reporting to any watchpoint on the destination.
-    pub fn init_at(&mut self, site: u32, dst: i32, segment: &[u8], src: i32, len: i32) {
+    pub fn init_at(&mut self, site: u32, at: u32, dst: i32, segment: &[u8], src: i32, len: i32) {
         self.init(dst, segment, src, len);
-        self.note(site, dst, 0, u64::from(len as u32), WriteKind::Init);
+        self.note(site, at, dst, 0, u64::from(len as u32), WriteKind::Init);
     }
     /// An atomic store, reporting to any watchpoint.
-    pub fn atomic_store_at(&mut self, site: u32, addr: i32, offset: u64, bytes: u32, value: i64) {
+    pub fn atomic_store_at(
+        &mut self,
+        site: u32,
+        at: u32,
+        addr: i32,
+        offset: u64,
+        bytes: u32,
+        value: i64,
+    ) {
         self.atomic_store(addr, offset, bytes, value);
-        self.note(site, addr, offset, u64::from(bytes), WriteKind::Atomic);
+        self.note(site, at, addr, offset, u64::from(bytes), WriteKind::Atomic);
     }
     /// An atomic read-modify-write, reporting to any watchpoint.
+    // Eight arguments, and every one of them is the instruction's: the site
+    // that identifies it, and the six operands `i32.atomic.rmw.add` has.
+    // Bundling them into a struct would put a literal at every call site in a
+    // two-million-line file to satisfy a count.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn atomic_rmw_at(
         &mut self,
         site: u32,
+        at: u32,
         addr: i32,
         offset: u64,
         bytes: u32,
@@ -220,7 +242,7 @@ impl Memory {
         value: i64,
     ) -> i64 {
         let old = self.atomic_rmw(addr, offset, bytes, op, value);
-        self.note(site, addr, offset, u64::from(bytes), WriteKind::Atomic);
+        self.note(site, at, addr, offset, u64::from(bytes), WriteKind::Atomic);
         old
     }
     /// An atomic compare-and-exchange, reporting to any watchpoint.
@@ -228,9 +250,11 @@ impl Memory {
     /// Reported whether or not the exchange happened: "something looked at
     /// this address and might have written it" is the useful signal, and a
     /// comparison that failed is exactly the case a reader wants to see.
+    #[allow(clippy::too_many_arguments)]
     pub fn atomic_cmpxchg_at(
         &mut self,
         site: u32,
+        at: u32,
         addr: i32,
         offset: u64,
         bytes: u32,
@@ -238,7 +262,7 @@ impl Memory {
         replacement: i64,
     ) -> i64 {
         let old = self.atomic_cmpxchg(addr, offset, bytes, expected, replacement);
-        self.note(site, addr, offset, u64::from(bytes), WriteKind::Atomic);
+        self.note(site, at, addr, offset, u64::from(bytes), WriteKind::Atomic);
         old
     }
 
@@ -1004,7 +1028,7 @@ impl SharedMemory {
     }
 
     /// Records a write that has already happened, if anyone is watching it.
-    fn note(&self, site: u32, addr: i32, offset: u64, bytes: u64, kind: WriteKind) {
+    fn note(&self, site: u32, at: u32, addr: i32, offset: u64, bytes: u64, kind: WriteKind) {
         let mut watch = self.watchpoints();
         if watch.ranges.is_empty() {
             return;
@@ -1020,6 +1044,7 @@ impl SharedMemory {
         }
         watch.hits.push(Hit {
             site,
+            at,
             address: start as u32 as i32,
             bytes: bytes as u32,
             kind,
@@ -1028,67 +1053,77 @@ impl SharedMemory {
         drop(watch);
         if stop {
             panic!(
-                "watchpoint: function #{site} wrote {bytes} bytes at {start:#x} ({kind:?}) \
-                 on thread {:?}",
+                "watchpoint: function #{site} wrote {bytes} bytes at {start:#x} ({kind:?}), \
+                 from the instruction at file offset {at}, on thread {:?}",
                 std::thread::current().id()
             );
         }
     }
 
     /// `i32.store8` / `i64.store8`, reporting to any watchpoint.
-    pub fn store8_at(&mut self, site: u32, addr: i32, offset: u64, value: i64) {
+    pub fn store8_at(&mut self, site: u32, at: u32, addr: i32, offset: u64, value: i64) {
         self.store8(addr, offset, value);
-        self.note(site, addr, offset, 1, WriteKind::Store);
+        self.note(site, at, addr, offset, 1, WriteKind::Store);
     }
     /// `i32.store16` / `i64.store16`, reporting to any watchpoint.
-    pub fn store16_at(&mut self, site: u32, addr: i32, offset: u64, value: i64) {
+    pub fn store16_at(&mut self, site: u32, at: u32, addr: i32, offset: u64, value: i64) {
         self.store16(addr, offset, value);
-        self.note(site, addr, offset, 2, WriteKind::Store);
+        self.note(site, at, addr, offset, 2, WriteKind::Store);
     }
     /// `i32.store` / `i64.store32`, reporting to any watchpoint.
-    pub fn store32_at(&mut self, site: u32, addr: i32, offset: u64, value: i64) {
+    pub fn store32_at(&mut self, site: u32, at: u32, addr: i32, offset: u64, value: i64) {
         self.store32(addr, offset, value);
-        self.note(site, addr, offset, 4, WriteKind::Store);
+        self.note(site, at, addr, offset, 4, WriteKind::Store);
     }
     /// `i64.store`, reporting to any watchpoint.
-    pub fn store64_at(&mut self, site: u32, addr: i32, offset: u64, value: i64) {
+    pub fn store64_at(&mut self, site: u32, at: u32, addr: i32, offset: u64, value: i64) {
         self.store64(addr, offset, value);
-        self.note(site, addr, offset, 8, WriteKind::Store);
+        self.note(site, at, addr, offset, 8, WriteKind::Store);
     }
     /// `f32.store`, reporting to any watchpoint.
-    pub fn store_f32_at(&mut self, site: u32, addr: i32, offset: u64, value: f32) {
+    pub fn store_f32_at(&mut self, site: u32, at: u32, addr: i32, offset: u64, value: f32) {
         self.store_f32(addr, offset, value);
-        self.note(site, addr, offset, 4, WriteKind::Store);
+        self.note(site, at, addr, offset, 4, WriteKind::Store);
     }
     /// `f64.store`, reporting to any watchpoint.
-    pub fn store_f64_at(&mut self, site: u32, addr: i32, offset: u64, value: f64) {
+    pub fn store_f64_at(&mut self, site: u32, at: u32, addr: i32, offset: u64, value: f64) {
         self.store_f64(addr, offset, value);
-        self.note(site, addr, offset, 8, WriteKind::Store);
+        self.note(site, at, addr, offset, 8, WriteKind::Store);
     }
     /// `memory.fill`, reporting to any watchpoint.
-    pub fn fill_at(&mut self, site: u32, addr: i32, value: i32, len: i32) {
+    pub fn fill_at(&mut self, site: u32, at: u32, addr: i32, value: i32, len: i32) {
         self.fill(addr, value, len);
-        self.note(site, addr, 0, u64::from(len as u32), WriteKind::Fill);
+        self.note(site, at, addr, 0, u64::from(len as u32), WriteKind::Fill);
     }
     /// `memory.copy`, reporting to any watchpoint on the destination.
-    pub fn copy_at(&mut self, site: u32, dst: i32, src: i32, len: i32) {
+    pub fn copy_at(&mut self, site: u32, at: u32, dst: i32, src: i32, len: i32) {
         self.copy(dst, src, len);
-        self.note(site, dst, 0, u64::from(len as u32), WriteKind::Copy);
+        self.note(site, at, dst, 0, u64::from(len as u32), WriteKind::Copy);
     }
     /// `memory.init`, reporting to any watchpoint on the destination.
-    pub fn init_at(&mut self, site: u32, dst: i32, segment: &[u8], src: i32, len: i32) {
+    pub fn init_at(&mut self, site: u32, at: u32, dst: i32, segment: &[u8], src: i32, len: i32) {
         self.init(dst, segment, src, len);
-        self.note(site, dst, 0, u64::from(len as u32), WriteKind::Init);
+        self.note(site, at, dst, 0, u64::from(len as u32), WriteKind::Init);
     }
     /// An atomic store, reporting to any watchpoint.
-    pub fn atomic_store_at(&mut self, site: u32, addr: i32, offset: u64, bytes: u32, value: i64) {
+    pub fn atomic_store_at(
+        &mut self,
+        site: u32,
+        at: u32,
+        addr: i32,
+        offset: u64,
+        bytes: u32,
+        value: i64,
+    ) {
         self.atomic_store(addr, offset, bytes, value);
-        self.note(site, addr, offset, u64::from(bytes), WriteKind::Atomic);
+        self.note(site, at, addr, offset, u64::from(bytes), WriteKind::Atomic);
     }
     /// An atomic read-modify-write, reporting to any watchpoint.
+    #[allow(clippy::too_many_arguments)]
     pub fn atomic_rmw_at(
         &mut self,
         site: u32,
+        at: u32,
         addr: i32,
         offset: u64,
         bytes: u32,
@@ -1096,13 +1131,15 @@ impl SharedMemory {
         value: i64,
     ) -> i64 {
         let old = self.atomic_rmw(addr, offset, bytes, op, value);
-        self.note(site, addr, offset, u64::from(bytes), WriteKind::Atomic);
+        self.note(site, at, addr, offset, u64::from(bytes), WriteKind::Atomic);
         old
     }
     /// An atomic compare-and-exchange, reporting to any watchpoint.
+    #[allow(clippy::too_many_arguments)]
     pub fn atomic_cmpxchg_at(
         &mut self,
         site: u32,
+        at: u32,
         addr: i32,
         offset: u64,
         bytes: u32,
@@ -1110,7 +1147,7 @@ impl SharedMemory {
         replacement: i64,
     ) -> i64 {
         let old = self.atomic_cmpxchg(addr, offset, bytes, expected, replacement);
-        self.note(site, addr, offset, u64::from(bytes), WriteKind::Atomic);
+        self.note(site, at, addr, offset, u64::from(bytes), WriteKind::Atomic);
         old
     }
 }
@@ -1785,22 +1822,22 @@ mod tests {
     fn a_watchpoint_on_a_shared_memory_collects_from_every_thread() {
         let mut memory = SharedMemory::new(1, None, 1);
         memory.watch(256, 4);
-        memory.store32_at(1, 256, 0, 1);
-        memory.store8_at(2, 256, 0, 1);
-        memory.store16_at(3, 256, 0, 1);
-        memory.store64_at(4, 256, 0, 1);
-        memory.store_f32_at(5, 256, 0, 1.0);
-        memory.store_f64_at(6, 256, 0, 1.0);
-        memory.fill_at(7, 256, 0, 4);
-        memory.copy_at(8, 256, 0, 4);
-        memory.init_at(9, 256, b"abcd", 0, 4);
-        memory.atomic_store_at(10, 256, 0, 4, 1);
-        memory.atomic_rmw_at(11, 256, 0, 4, Rmw::Add, 1);
-        memory.atomic_cmpxchg_at(12, 256, 0, 4, 0, 1);
-        memory.store32_at(13, 1024, 0, 1);
+        memory.store32_at(1, 14, 256, 0, 1);
+        memory.store8_at(2, 24, 256, 0, 1);
+        memory.store16_at(3, 34, 256, 0, 1);
+        memory.store64_at(4, 44, 256, 0, 1);
+        memory.store_f32_at(5, 54, 256, 0, 1.0);
+        memory.store_f64_at(6, 64, 256, 0, 1.0);
+        memory.fill_at(7, 74, 256, 0, 4);
+        memory.copy_at(8, 84, 256, 0, 4);
+        memory.init_at(9, 94, 256, b"abcd", 0, 4);
+        memory.atomic_store_at(10, 104, 256, 0, 4, 1);
+        memory.atomic_rmw_at(11, 114, 256, 0, 4, Rmw::Add, 1);
+        memory.atomic_cmpxchg_at(12, 124, 256, 0, 4, 0, 1);
+        memory.store32_at(13, 134, 1024, 0, 1);
 
         let mut other = memory.clone();
-        std::thread::spawn(move || other.store32_at(99, 256, 0, 5))
+        std::thread::spawn(move || other.store32_at(99, 994, 256, 0, 5))
             .join()
             .expect("the other thread finishes");
 
@@ -1814,7 +1851,7 @@ mod tests {
         let mut memory = SharedMemory::new(1, None, 1);
         memory.watch(0x100, 4);
         memory.stop_on_hit(true);
-        memory.store32_at(3, 0x100, 0, 1);
+        memory.store32_at(3, 34, 0x100, 0, 1);
     }
 
     #[test]
@@ -1984,7 +2021,7 @@ mod tests {
     #[test]
     fn a_shared_write_reports_nothing_when_nothing_is_watched() {
         let mut memory = SharedMemory::new(1, None, 1);
-        memory.store32_at(1, 0, 0, 1);
+        memory.store32_at(1, 14, 0, 0, 1);
         assert!(memory.hits().is_empty());
     }
 
@@ -1992,16 +2029,16 @@ mod tests {
     fn a_shared_watchpoint_ignores_a_write_beside_the_range() {
         let mut memory = SharedMemory::new(1, None, 1);
         memory.watch(0x100, 4);
-        memory.store32_at(1, 0x0FC, 0, 1);
-        memory.store32_at(2, 0x104, 0, 1);
+        memory.store32_at(1, 14, 0x0FC, 0, 1);
+        memory.store32_at(2, 24, 0x104, 0, 1);
         assert!(memory.hits().is_empty());
     }
 
     #[test]
     fn nothing_is_watched_until_a_host_asks() {
         let mut memory = Memory::new(1, None);
-        memory.store32_at(7, 0, 0, 1);
-        memory.fill_at(7, 0, 0, 4);
+        memory.store32_at(7, 74, 0, 0, 1);
+        memory.fill_at(7, 74, 0, 0, 4);
         assert!(memory.hits().is_empty());
     }
 
@@ -2009,15 +2046,15 @@ mod tests {
     fn a_watched_write_records_who_did_it_and_what_kind_it_was() {
         let mut memory = Memory::new(1, None);
         memory.watch(0x100, 4);
-        memory.store32_at(11, 0x100, 0, 42);
-        memory.store8_at(12, 0x102, 0, 1);
-        memory.store16_at(13, 0x102, 0, 1);
-        memory.store64_at(14, 0x0FC, 0, 1);
-        memory.store_f32_at(15, 0x100, 0, 1.0);
-        memory.store_f64_at(16, 0x100, 0, 1.0);
-        memory.fill_at(17, 0x100, 0, 4);
-        memory.copy_at(18, 0x100, 0, 4);
-        memory.init_at(19, 0x100, b"abcd", 0, 4);
+        memory.store32_at(11, 114, 0x100, 0, 42);
+        memory.store8_at(12, 124, 0x102, 0, 1);
+        memory.store16_at(13, 134, 0x102, 0, 1);
+        memory.store64_at(14, 144, 0x0FC, 0, 1);
+        memory.store_f32_at(15, 154, 0x100, 0, 1.0);
+        memory.store_f64_at(16, 164, 0x100, 0, 1.0);
+        memory.fill_at(17, 174, 0x100, 0, 4);
+        memory.copy_at(18, 184, 0x100, 0, 4);
+        memory.init_at(19, 194, 0x100, b"abcd", 0, 4);
         assert_eq!(
             memory
                 .hits()
@@ -2049,11 +2086,11 @@ mod tests {
     fn a_write_beside_the_range_is_not_a_hit() {
         let mut memory = Memory::new(1, None);
         memory.watch(0x100, 4);
-        memory.store32_at(1, 0x0FC, 0, 1);
-        memory.store32_at(2, 0x104, 0, 1);
+        memory.store32_at(1, 14, 0x0FC, 0, 1);
+        memory.store32_at(2, 24, 0x104, 0, 1);
         // The static offset counts towards the address, or an instrumented
         // `store offset=4` would be attributed to the wrong place.
-        memory.store32_at(3, 0x0FC, 4, 1);
+        memory.store32_at(3, 34, 0x0FC, 4, 1);
         assert_eq!(
             memory.hits().iter().map(|hit| hit.site).collect::<Vec<_>>(),
             vec![3]
@@ -2065,11 +2102,11 @@ mod tests {
     fn an_atomic_write_is_reported_and_says_it_was_atomic() {
         let mut memory = Memory::new(1, None);
         memory.watch(0x200, 4);
-        memory.atomic_store_at(1, 0x200, 0, 4, 7);
-        assert_eq!(memory.atomic_rmw_at(2, 0x200, 0, 4, Rmw::Add, 1), 7);
+        memory.atomic_store_at(1, 14, 0x200, 0, 4, 7);
+        assert_eq!(memory.atomic_rmw_at(2, 24, 0x200, 0, 4, Rmw::Add, 1), 7);
         // Reported even though the comparison fails and nothing is written:
         // "something looked at this and might have written it" is the signal.
-        assert_eq!(memory.atomic_cmpxchg_at(3, 0x200, 0, 4, 99, 1), 8);
+        assert_eq!(memory.atomic_cmpxchg_at(3, 34, 0x200, 0, 4, 99, 1), 8);
         assert_eq!(memory.load32(0x200, 0), 8);
         assert_eq!(memory.hits().len(), 3);
         assert!(
@@ -2081,12 +2118,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "watchpoint: function #5 wrote 4 bytes at 0x100")]
+    #[should_panic(
+        expected = "watchpoint: function #5 wrote 4 bytes at 0x100 (Store), from the instruction at file offset 54"
+    )]
     fn stopping_on_a_hit_panics_where_the_write_happened() {
         let mut memory = Memory::new(1, None);
         memory.watch(0x100, 4);
         memory.watch.stop = true;
-        memory.store32_at(5, 0x100, 0, 1);
+        memory.store32_at(5, 54, 0x100, 0, 1);
     }
 
     #[test]
@@ -2096,7 +2135,7 @@ mod tests {
         // ever in the list.
         let mut memory = Memory::new(1, None);
         memory.watch(0, 4);
-        memory.store32_at(1, (PAGE_SIZE - 2) as i32, 0, 1);
+        memory.store32_at(1, 14, (PAGE_SIZE - 2) as i32, 0, 1);
     }
 
     #[test]

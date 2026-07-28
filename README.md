@@ -416,10 +416,15 @@ $ unwasm decompile voip.wasm -o out/ --instrument-stores
 
 ```rust
 instance.memory.watch(0x24bed0, 4);
-instance.memory.watch.stop = true;   // or leave it off and read memory.hits()
+instance.memory.stop_on_hit(true);   // or leave it off and read memory.hits()
 instance.start();
-// panicked at 'watchpoint: function #10284 wrote 4 bytes at 0x24bed0 (Fill)'
+// panicked at 'watchpoint: function #10284 wrote 4 bytes at 0x24bed0 (Fill),
+//              from the instruction at file offset 4667241'
 ```
+
+A hit names the *instruction*, not only the function: a function with fifty
+stores in it leaves the next question open, and `unwasm bytes voip.wasm 4667241
+8` prints the one that fired.
 
 Every write goes through the check — including `memory.fill` and
 `memory.copy`, since a `memset` is the usual answer to "who zeroed it" and it

@@ -95,6 +95,47 @@ fn main() {
 }
 
 #[test]
+fn a_hit_names_the_instruction_and_not_only_the_function() {
+    // A function with several stores in it leaves the next question open, and
+    // the file offset closes it: the bytes at that offset are the store that
+    // fired, which `unwasm bytes` prints and which a patch would replace.
+    let wasm = common::assemble(
+        "watch-instruction",
+        r#"(module
+            (memory (export "memory") 1)
+            (func (export "two_stores") (param i32)
+                i32.const 512 local.get 0 i32.store
+                i32.const 256 local.get 0 i32.store))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let code = instrumented(&module);
+
+    const DRIVER: &str = r#"
+mod generated;
+fn main() {
+    let mut instance = generated::Instance::new();
+    instance.memory.watch(256, 4);
+    instance.two_stores(7);
+    for hit in instance.memory.hits() {
+        println!("{} {}", hit.site, hit.at);
+    }
+}
+"#;
+    let output = common::run_with_generated("watch-instruction", &code, DRIVER);
+    let (site, at) = output.trim().split_once(' ').expect("one hit");
+    assert_eq!(site, "0");
+    let at: usize = at.parse().expect("an offset");
+
+    // The offset is the store instruction itself: opcode, then its memarg.
+    let store = &wasm[at..at + 3];
+    assert_eq!(store, &[0x36, 0x02, 0x00], "i32.store: {store:02x?}");
+    // And it is the *second* store, not the first — the first wrote 512, which
+    // nothing was watching. The address it pushes is three bytes back.
+    let pushes_256 = wasm[at - 5..at - 2] == [0x41, 0x80, 0x02];
+    assert!(pushes_256, "{:02x?}", &wasm[at - 6..at]);
+}
+
+#[test]
 fn stopping_at_the_write_gives_a_backtrace_through_the_guest() {
     // A panic rather than a log, so the stack shows the call chain that
     // reached the write — which is the thing a hit list does not tell you.
@@ -127,6 +168,10 @@ fn main() {
     assert!(
         output.contains("watchpoint: function #0 wrote 4 bytes at 0x100"),
         "{output}"
+    );
+    assert!(
+        output.contains("from the instruction at file offset"),
+        "and says which instruction, not only which function: {output}"
     );
 }
 

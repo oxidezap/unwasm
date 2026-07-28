@@ -315,16 +315,32 @@ fn known_import(field: &str, ty: &crate::module::FuncType) -> Option<&'static st
 /// uses, so what a run reports and what `unwasm inspect` claims cannot drift
 /// apart.
 fn known_registration(field: &str, ty: &crate::module::FuncType) -> Option<String> {
-    let at = analysis::EMBIND_NAME_ARGUMENT
+    let kind = field.strip_prefix("_embind_register_")?;
+    let Some(at) = analysis::EMBIND_NAME_ARGUMENT
         .iter()
-        .find(|(name, _)| *name == field)?
-        .1;
+        .find(|(name, _)| *name == field)
+        .map(|(_, at)| *at)
+    else {
+        // A registration that carries no name — a constructor is the one that
+        // matters — is still worth recording: what a class registers, and in
+        // which order, is the shape of its API.
+        let arguments: Vec<String> = ty
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(_, param)| **param == ValType::I32)
+            .map(|(index, _)| format!("p{index}"))
+            .collect();
+        return Some(format!(
+            "self.embind.register_unnamed(\"{kind}\", &[{}])",
+            arguments.join(", ")
+        ));
+    };
     // Every registration takes its name as an i32 address, and the ones that
     // do not are not this.
     if ty.params.get(at) != Some(&ValType::I32) {
         return None;
     }
-    let kind = field.trim_start_matches("_embind_register_");
     // The i64 arguments of `_embind_register_bigint` are its bounds, not
     // anything a reader looks up, and they do not fit an i32 list.
     let rest: Vec<String> = ty
@@ -1946,6 +1962,9 @@ struct Body<'a> {
     pending: Option<u32>,
     /// Lines emitted so far, kept rather than counted.
     lines: usize,
+    /// Where the operator being lowered sits in the wasm file, or 0 if the
+    /// decoder did not record it.
+    here: u32,
     /// This function's C stack frame, when it has one.
     frame: Option<&'a StackFrame>,
     func: &'a Func,
@@ -1988,6 +2007,7 @@ impl<'a> Body<'a> {
             map_offsets,
             pending: None,
             lines: 0,
+            here: 0,
             frame: analysis.frames.get(&index),
             func,
             ty,
@@ -2017,7 +2037,12 @@ impl<'a> Body<'a> {
     /// not a store.
     fn write_call(&self, method: &str) -> String {
         if self.instrument {
-            format!("{method}_at({}, ", self.index)
+            // The function *and* the instruction. The function alone answers
+            // "who wrote this address"; a function with fifty stores in it
+            // leaves the next question open, and the offset closes it —
+            // `unwasm bytes <module> <offset> <len>` prints exactly the store
+            // that fired.
+            format!("{method}_at({}, {}, ", self.index, self.here)
         } else {
             format!("{method}(")
         }
@@ -2053,6 +2078,7 @@ impl<'a> Body<'a> {
             self.next_op = body.get(at + 1).cloned();
             let before = self.emitted_lines();
             let span = self.func.offsets.get(at).copied();
+            self.here = span.map_or(0, |(offset, _)| offset);
             if self.map_offsets && self.pending.is_none() {
                 self.pending = span.map(|(offset, _)| offset);
             }

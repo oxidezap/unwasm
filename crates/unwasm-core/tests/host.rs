@@ -325,6 +325,29 @@ fn a_registration_with_the_real_shape_is_answered() {
 }
 
 #[test]
+fn a_registration_that_carries_no_name_is_still_recorded() {
+    // A class constructor has no name of its own — it is the class's. What it
+    // registers, and in which order, is still the shape of the API, so it is
+    // recorded rather than left as a `todo!()`.
+    let wasm = common::assemble(
+        "host-embind-unnamed",
+        r#"(module
+            (import "env" "_embind_register_class_constructor"
+                (func (param i32 i32 i32 i32 i32 i32)))
+            (func (export "go")))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let body = trait_body(&codegen::generate_host(&module).expect("generates")).to_string();
+    assert!(
+        body.contains(
+            r#"self.embind.register_unnamed("class_constructor", &[p0, p1, p2, p3, p4, p5])"#
+        ),
+        "{body}"
+    );
+    assert!(!body.contains("todo!(\""), "{body}");
+}
+
+#[test]
 fn an_import_whose_signature_is_not_the_expected_one_is_left_alone() {
     // `fd_write` with three arguments is not the `fd_write` this host knows,
     // and guessing which three would be a body that compiles and lies.
