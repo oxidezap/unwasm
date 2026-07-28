@@ -77,8 +77,8 @@ mod generated;
 struct Host { logged: Vec<i32> }
 
 impl generated::Imports for Host {
-    fn env_add(&mut self, p0: i32, p1: i32) -> i32 { p0 + p1 }
-    fn env_log(&mut self, p0: i32) { self.logged.push(p0); }
+    fn env_add(&mut self, _c: &mut generated::rt::Caller<'_>, p0: i32, p1: i32) -> i32 { p0 + p1 }
+    fn env_log(&mut self, _c: &mut generated::rt::Caller<'_>, p0: i32) { self.logged.push(p0); }
 }
 
 fn main() {
@@ -520,7 +520,7 @@ fn an_indirect_call_can_reach_an_imported_function() {
 mod generated;
 struct Host;
 impl generated::Imports for Host {
-    fn env_double(&mut self, p0: i32) -> i32 { p0 * 2 }
+    fn env_double(&mut self, _c: &mut generated::rt::Caller<'_>, p0: i32) -> i32 { p0 * 2 }
 }
 fn main() {
     let mut instance = generated::Instance::with_host(Host);
@@ -557,7 +557,7 @@ fn an_indirect_call_that_returns_nothing_is_a_statement() {
 mod generated;
 struct Host;
 impl generated::Imports for Host {
-    fn env_unused(&mut self) -> i32 { 0 }
+    fn env_unused(&mut self, _c: &mut generated::rt::Caller<'_>) -> i32 { 0 }
 }
 fn main() {
     let mut instance = generated::Instance::with_host(Host);

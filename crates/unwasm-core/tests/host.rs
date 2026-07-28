@@ -29,12 +29,12 @@ fn every_import_the_host_must_answer_appears_once() {
     let skeleton = codegen::generate_host(&module).expect("generates");
 
     for method in [
-        "fn wasi_snapshot_preview1_fd_write(&mut self, p0: i32, p1: i32, p2: i32, p3: i32) -> i32",
-        "fn env___cxa_throw(&mut self, p0: i32, p1: i32, p2: i32)",
-        "fn env_emscripten_resize_heap(&mut self, p0: i32) -> i32",
-        "fn env__embind_register_class(&mut self, p0: i32, p1: i32)",
-        "fn env__emval_incref(&mut self, p0: i32)",
-        "fn env_on_call_event(&mut self, p0: i32, p1: i32)",
+        "fn wasi_snapshot_preview1_fd_write(&mut self, _caller: &mut rt::Caller<'_>, p0: i32, p1: i32, p2: i32, p3: i32) -> i32",
+        "fn env___cxa_throw(&mut self, _caller: &mut rt::Caller<'_>, p0: i32, p1: i32, p2: i32)",
+        "fn env_emscripten_resize_heap(&mut self, _caller: &mut rt::Caller<'_>, p0: i32) -> i32",
+        "fn env__embind_register_class(&mut self, _caller: &mut rt::Caller<'_>, p0: i32, p1: i32)",
+        "fn env__emval_incref(&mut self, _caller: &mut rt::Caller<'_>, p0: i32)",
+        "fn env_on_call_event(&mut self, _caller: &mut rt::Caller<'_>, p0: i32, p1: i32)",
     ] {
         assert_eq!(
             skeleton.matches(method).count(),
@@ -132,8 +132,8 @@ fn the_skeleton_compiles_against_the_module_and_runs_what_it_can() {
     // needs, and leaves the rest as `todo!()` — which is how it will actually
     // be used.
     let filled = skeleton.replace(
-        "fn env_add_ten(&mut self, p0: i32) -> i32 {\n        todo!(\"env::add_ten\")",
-        "fn env_add_ten(&mut self, p0: i32) -> i32 {\n        return p0 + 10;",
+        "fn env_add_ten(&mut self, _caller: &mut rt::Caller<'_>, p0: i32) -> i32 {\n        todo!(\"env::add_ten\")",
+        "fn env_add_ten(&mut self, _caller: &mut rt::Caller<'_>, p0: i32) -> i32 {\n        return p0 + 10;",
     );
     assert_ne!(filled, skeleton, "the method to fill was not found");
 
@@ -146,6 +146,63 @@ fn the_skeleton_compiles_against_the_module_and_runs_what_it_can() {
     );
     let output = common::run_with_driver("host-compiles", &wasm, &driver);
     assert_eq!(output.trim(), "15");
+}
+
+/// The point of the `Caller`: an import that is handed a pointer can follow it.
+///
+/// This is `fd_write`'s shape in miniature — a string address and a place to
+/// put the answer — and it is the thing that was impossible when an import
+/// received only its arguments.
+#[test]
+fn a_host_reads_and_writes_the_memory_its_arguments_point_into() {
+    let wasm = common::assemble(
+        "host-caller",
+        r#"(module
+            (import "env" "shout" (func $shout (param i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 64) "hello\00")
+            ;; The guest passes an address and a place to write the answer, and
+            ;; reads the answer back out of memory itself.
+            (func (export "go") (result i32)
+                i32.const 64
+                i32.const 128
+                call $shout
+                drop
+                i32.const 128
+                i32.load))"#,
+    );
+
+    const DRIVER: &str = r#"
+mod generated;
+use generated::{rt, Imports};
+
+#[derive(Default)]
+struct Host {
+    seen: String,
+}
+
+impl Imports for Host {
+    fn env_shout(&mut self, caller: &mut rt::Caller<'_>, text: i32, out: i32) -> i32 {
+        let bytes = caller.cstring(text).to_vec();
+        self.seen = String::from_utf8(bytes.clone()).expect("utf-8");
+        // Uppercase it in place, and report the length where the guest asked.
+        let shouted: Vec<u8> = bytes.iter().map(|byte| byte.to_ascii_uppercase()).collect();
+        caller.write(text, &shouted);
+        caller.memory.store32(out, 0, shouted.len() as i64);
+        0
+    }
+}
+
+fn main() {
+    let mut instance = generated::Instance::with_host(Host::default());
+    let length = instance.go();
+    let text = instance.host.seen.clone();
+    let rewritten = String::from_utf8(instance.memory.data[64..69].to_vec()).expect("utf-8");
+    println!("{text} {length} {rewritten}");
+}
+"#;
+    let output = common::run_with_driver("host-caller", &wasm, DRIVER);
+    assert_eq!(output.trim(), "hello 5 HELLO");
 }
 
 #[test]

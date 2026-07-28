@@ -71,7 +71,7 @@ fn what_was_left_out_still_compiles() {
 mod generated;
 struct Host;
 impl generated::Imports for Host {
-    fn env_log(&mut self, _p0: i32) {}
+    fn env_log(&mut self, _caller: &mut generated::rt::Caller<'_>, _p0: i32) {}
 }
 fn main() {
     let mut instance = generated::Instance::with_host(Host);

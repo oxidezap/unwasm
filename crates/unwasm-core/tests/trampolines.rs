@@ -101,7 +101,7 @@ mod generated;
 struct Host;
 
 impl generated::Imports for Host {
-    fn env_throwing(&mut self, p0: i32) {
+    fn env_throwing(&mut self, _c: &mut generated::rt::Caller<'_>, p0: i32) {
         if p0 != 0 {
             // What a host's `__cxa_throw` does.
             generated::rt::throw(p0, 0);
@@ -146,7 +146,7 @@ mod generated;
 struct Host;
 
 impl generated::Imports for Host {
-    fn env_throwing(&mut self, p0: i32) {
+    fn env_throwing(&mut self, _c: &mut generated::rt::Caller<'_>, p0: i32) {
         if p0 != 0 {
             // Not an exception: a trap, as an out-of-bounds access would be.
             generated::rt::trap("something went badly wrong");

@@ -310,15 +310,27 @@ impl Imports for Host {
     // exception trampolines and are generated, so they are not here.
 
     // ---- WASI. A subset over an in-memory filesystem answers these.
-    fn wasi_snapshot_preview1_fd_write(&mut self, p0: i32, ..) -> i32 {
+    fn wasi_snapshot_preview1_fd_write(
+        &mut self,
+        _caller: &mut rt::Caller<'_>,
+        p0: i32, ..
+    ) -> i32 {
         todo!("wasi_snapshot_preview1::fd_write")
     }
     // ---- The application's own callbacks. Nothing but the application can
     // say what these should do.
-    fn env_on_call_event_js_sync(&mut self, p0: i32, p1: i32) {
+    fn env_on_call_event_js_sync(&mut self, _caller: &mut rt::Caller<'_>, p0: i32, p1: i32) {
         todo!("env::on_call_event_js_sync")
     }
 ```
+
+Every method takes a `rt::Caller` as well as its arguments. A wasm import is
+handed numbers, and almost every interesting one is a number *into* linear
+memory — `fd_write` gets the address of an iovec array, `__assert_fail` the
+address of a string — so without the memory a host cannot answer at all. The
+`Caller` carries it, and is a struct rather than a bare `&mut Memory` because
+it is where the next capability goes: adding a field costs nothing, while
+adding a parameter changes every host ever written.
 
 Grouped by where each import comes from, because 102 methods in one list is a
 wall and the same 102 split into "these are WASI", "these are the C++ runtime"
@@ -450,7 +462,9 @@ With a host:
 ```rust
 struct Host;
 impl generated::Imports for Host {
-    fn env_add(&mut self, a: i32, b: i32) -> i32 { a + b }
+    fn env_add(&mut self, _c: &mut generated::rt::Caller<'_>, a: i32, b: i32) -> i32 {
+        a + b
+    }
 }
 let mut instance = generated::Instance::with_host(Host);
 ```

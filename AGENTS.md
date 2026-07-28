@@ -245,6 +245,19 @@ ten. Precision is the whole value: a wrong name is worse than `f8421`, which is
 also why a fingerprint two names share is dropped rather than resolved, and why
 what the module says about itself is never overridden.
 
+## An import is given the memory, not just its arguments
+
+Every `Imports` method takes `caller: &mut rt::Caller<'_>` first. wasm hands an
+import numbers, and almost all of them are numbers into linear memory; a host
+without it cannot answer `fd_write` at all. The thunk builds the `Caller` from
+`&mut self.memory` while `&mut self.host` is borrowed — disjoint fields, so it
+type-checks without any interior mutability.
+
+`Caller` is a struct, not a `&mut Memory` alias, because the next capability a
+host needs (the table, the globals, a way back into an export) goes in it as a
+field. Adding a field costs nothing; adding a parameter changes every host that
+has ever been written against the trait.
+
 ## Open work
 
 1. **Host the VoIP module.** `unwasm host` writes the skeleton; what is left is

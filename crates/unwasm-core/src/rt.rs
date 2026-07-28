@@ -355,6 +355,73 @@ pub fn throw(exception: i32, info: i32) -> ! {
     std::panic::panic_any(GuestException { exception, info });
 }
 
+/// What an import is given besides its arguments.
+///
+/// A wasm import receives numbers, and almost every interesting one is a
+/// number *into* linear memory: `fd_write` is handed the address of an iovec
+/// array, `__assert_fail` the address of a string. Without the memory a host
+/// cannot answer any of them, so every import method takes one of these.
+///
+/// It is a struct rather than a bare `&mut Memory` because it is the place the
+/// next capability goes — the table, the globals, a way back into an export —
+/// and adding a field costs nothing, while adding a parameter changes every
+/// host ever written.
+#[derive(Debug)]
+pub struct Caller<'a> {
+    /// The instance's linear memory.
+    pub memory: &'a mut Memory,
+}
+
+impl Caller<'_> {
+    /// The `len` bytes at `addr`.
+    ///
+    /// # Panics
+    ///
+    /// Traps if the range leaves the memory, exactly as a guest load would:
+    /// a host reading past the end is the same mistake with the same answer.
+    #[must_use]
+    pub fn bytes(&self, addr: i32, len: i32) -> &[u8] {
+        let start = u64::from(addr as u32);
+        let end = start + u64::from(len as u32);
+        if end > self.memory.data.len() as u64 {
+            trap("out of bounds memory access");
+        }
+        &self.memory.data[start as usize..end as usize]
+    }
+
+    /// Writes `bytes` at `addr`.
+    ///
+    /// # Panics
+    ///
+    /// Traps if the range leaves the memory.
+    pub fn write(&mut self, addr: i32, bytes: &[u8]) {
+        let start = u64::from(addr as u32);
+        let end = start + bytes.len() as u64;
+        if end > self.memory.data.len() as u64 {
+            trap("out of bounds memory access");
+        }
+        self.memory.data[start as usize..end as usize].copy_from_slice(bytes);
+    }
+
+    /// The NUL-terminated string at `addr`, without its terminator.
+    ///
+    /// # Panics
+    ///
+    /// Traps if there is no NUL before the end of memory. Returning what was
+    /// found instead would hand the host a string the guest never wrote.
+    #[must_use]
+    pub fn cstring(&self, addr: i32) -> &[u8] {
+        let start = u64::from(addr as u32) as usize;
+        if start > self.memory.data.len() {
+            trap("out of bounds memory access");
+        }
+        match self.memory.data[start..].iter().position(|byte| *byte == 0) {
+            Some(length) => &self.memory.data[start..start + length],
+            None => trap("unterminated string"),
+        }
+    }
+}
+
 /// Which read-modify-write an atomic performs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rmw {
@@ -572,6 +639,62 @@ pub fn f64_nearest(value: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_caller_reads_and_writes_what_the_guest_can() {
+        let mut memory = Memory::new(1, None);
+        let mut caller = Caller {
+            memory: &mut memory,
+        };
+        caller.write(16, b"hello\0world");
+        assert_eq!(caller.bytes(16, 5), b"hello");
+        assert_eq!(caller.cstring(16), b"hello");
+        // An empty string is a NUL at the address, not an absent one.
+        caller.write(16, b"\0");
+        assert_eq!(caller.cstring(16), b"");
+        assert_eq!(caller.bytes(0, 0), b"");
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds memory access")]
+    fn a_caller_reading_past_the_end_traps() {
+        let mut memory = Memory::new(1, None);
+        let caller = Caller {
+            memory: &mut memory,
+        };
+        let _ = caller.bytes((PAGE_SIZE - 4) as i32, 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds memory access")]
+    fn a_caller_writing_past_the_end_traps() {
+        let mut memory = Memory::new(1, None);
+        let mut caller = Caller {
+            memory: &mut memory,
+        };
+        caller.write((PAGE_SIZE - 2) as i32, b"four");
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds memory access")]
+    fn a_string_outside_memory_traps_rather_than_slicing() {
+        let mut memory = Memory::new(1, None);
+        let caller = Caller {
+            memory: &mut memory,
+        };
+        let _ = caller.cstring(PAGE_SIZE as i32 + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "unterminated string")]
+    fn a_string_with_no_terminator_traps() {
+        let mut memory = Memory::new(1, None);
+        memory.data.iter_mut().for_each(|byte| *byte = b'x');
+        let caller = Caller {
+            memory: &mut memory,
+        };
+        let _ = caller.cstring(0);
+    }
 
     #[test]
     fn memory_starts_zeroed_and_sized_in_pages() {

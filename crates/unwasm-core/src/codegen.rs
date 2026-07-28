@@ -239,7 +239,7 @@ pub fn generate_host(module: &Module) -> Result<String> {
         "// apart from an answer.
 
 ",
-        "use crate::generated::{self, Imports};
+        "use crate::generated::{self, rt, Imports};
 
 ",
         "/// State the host needs. Start empty and add as the imports need it.
@@ -284,7 +284,7 @@ pub fn generate_host(module: &Module) -> Result<String> {
             let result = ty.map_or_else(String::new, return_type);
             let _ = writeln!(
                 out,
-                "\n    fn {}(&mut self{signature}) {result} {{\n        todo!(\"{}::{}\")\n    }}",
+                "\n    fn {}(&mut self, _caller: &mut rt::Caller<'_>{signature}) {result} {{\n        todo!(\"{}::{}\")\n    }}",
                 import_ident(import.module.as_str(), import.field.as_str()),
                 import.module,
                 import.field
@@ -702,7 +702,7 @@ impl<'a> Generator<'a> {
             let result = ty.map_or_else(String::new, return_type);
             let _ = writeln!(
                 self.out,
-                "    /// `{}::{}`\n    fn {}(&mut self{signature}) {result};",
+                "    /// `{}::{}`\n    fn {}(&mut self, caller: &mut rt::Caller<'_>{signature}) {result};",
                 import.module,
                 import.field,
                 import_ident(import.module.as_str(), import.field.as_str())
@@ -729,7 +729,7 @@ impl<'a> Generator<'a> {
             let result = ty.map_or_else(String::new, return_type);
             let _ = writeln!(
                 self.out,
-                "    fn {}(&mut self{signature}) {result} {{\n        rt::trap(\"unimplemented import: {}::{}\");\n    }}",
+                "    fn {}(&mut self, _caller: &mut rt::Caller<'_>{signature}) {result} {{\n        rt::trap(\"unimplemented import: {}::{}\");\n    }}",
                 import_ident(import.module.as_str(), import.field.as_str()),
                 import.module,
                 import.field
@@ -1031,15 +1031,22 @@ impl<'a> Generator<'a> {
                 continue;
             }
             let args: Vec<String> = (0..ty.params.len()).map(|at| format!("p{at}")).collect();
+            // The caller is the first argument, so the rest need the comma the
+            // trait signature already carries.
+            let rest = if args.is_empty() {
+                String::new()
+            } else {
+                format!(", {}", args.join(", "))
+            };
             let _ = writeln!(
                 self.out,
-                "    /// Imported from `{}::{}`.\n    pub(crate) fn f{index}(&mut self{}) {} {{\n        self.host.{}({})\n    }}\n",
+                "    /// Imported from `{}::{}`.\n    pub(crate) fn f{index}(&mut self{}) {} {{\n        let mut caller = rt::Caller {{\n            memory: &mut self.memory,\n        }};\n        self.host.{}(&mut caller{})\n    }}\n",
                 import.module,
                 import.field,
                 signature_of(ty),
                 return_type(ty),
                 import_ident(import.module.as_str(), import.field.as_str()),
-                args.join(", ")
+                rest
             );
         }
     }
@@ -3011,6 +3018,9 @@ mod ir_tests {
             ..Module::default()
         };
         let code = generate(&module).expect("it generates");
-        assert!(code.contains("fn env_mystery(&mut self)"), "{code}");
+        assert!(
+            code.contains("fn env_mystery(&mut self, caller: &mut rt::Caller<'_>)"),
+            "{code}"
+        );
     }
 }
