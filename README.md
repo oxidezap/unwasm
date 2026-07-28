@@ -154,6 +154,13 @@ the data segments, and where the code passes a pointer with a length beside it
 (how Rust passes `&str`) the length is used, so an unterminated string stops
 where it actually stops instead of running into the next one.
 
+An address that holds no text but that dozens of functions reference is pointed
+out too: `1352840i32 /* address, in 72 functions */`. A context pointer reads as
+noise in each function separately and as shared state once you notice it is the
+same number everywhere. What counts as an address is decided by the span the
+module's own data segments occupy — otherwise `2147483647` comes out as the
+most widely shared address in the module, and it is arithmetic.
+
 On the mozjpeg capture that recovers 247 strings, including the Rust panic
 messages that name the failing function — which is how `wa-wasm-oracle` worked
 out that module's calling convention in the first place.
@@ -171,15 +178,29 @@ it does have is its own log messages, and a function that logs
 pub(crate) fn f458_fill_user_info_from_participant(&mut self, ..)
 ```
 
-**2654 of its 13347 functions get a name this way.** Two rules keep it from
-inventing them:
+**3313 of its 13347 functions get a name this way**, from two sources:
 
-- **The message must belong to one function.** A message in fifty functions
-  distinguishes none of them — `index out of bounds` is in most of a Rust
-  module. Uniqueness is what makes the guess worth making.
-- **The identifier must look like one.** A lowercase token with an underscore,
-  at the start of the message. Anything looser turns `error while parsing` into
-  a function called `error`.
+- **`__assert_fail(expr, file, line, func)`**, whose last argument is
+  `__func__` — the compiler writing the name into the binary. That is not a
+  guess, and it beats everything else. 17 functions in the VoIP module.
+- **The messages the function logs**, ranked by *how often* it references them.
+
+Frequency rather than uniqueness, because of inlining. A function assembled out
+of several inlined ones references all of their strings, and the one message
+that belongs to nobody else is often the one about a callee that *failed*:
+`..._create_participant: wa_vid_quality_manager_create error: %d` names the
+callee. Function #10532 was named after that callee until the rule became "a
+message it logs eleven times is about this function; one it logs once may be
+about anything".
+
+Three things are refused outright: an identifier that is a Rust module path
+(`call_control::…` names a module, and appears in every function of it), a
+message logged once by more than one function (nothing there tells them apart),
+and anything not shaped like an identifier.
+
+The runners-up go in the doc comment. A function built from several inlined ones
+has several plausible names, and seeing the ones that lost is what stops a
+reader trusting the winner more than it deserves.
 
 The index stays in the name, which is what makes the guess safe: a reader
 tracing `call 4213` finds `f4213_parse_xmpp_offer` either way, and a wrong guess
@@ -276,15 +297,45 @@ and "these 35 are yours" is a plan. Every body is `todo!()` — a skeleton
 returning zero would compile, run, and be wrong, and the module could not tell
 "not written yet" from "answered 0".
 
+### Reading a module rather than translating it
+
+Decompiling the VoIP module gives 365 MB of Rust. Looking at three functions in
+it should not, and there are three affordances for that:
+
+```console
+$ unwasm decompile voip.wasm -o out/ --only 10532,12114,458
+wrote out/ (42 Rust files plus names.json, 281573 lines, 13347 functions)
+```
+
+The functions asked for come out in full; the rest keep their signatures and
+their names and become `unimplemented!()`, so the result still compiles and an
+editor can still follow a call.
+
+**`names.json`** comes with any directory output: every function's index, name,
+file, line, how it was named, and which table slots reach it. That is the thing
+to look a function up in, rather than `grep -n` over two million lines.
+
+**`unwasm table`** answers the question a call site cannot: `call_indirect`
+takes a *table* index, not a function index.
+
+```console
+$ unwasm table voip.wasm --type "(i32,i32,i32) -> ()"
+414 of 9290 slots matching (i32,i32,i32)->()
+  slot 18     f336    (i32,i32,i32) -> ()
+```
+
+Each function also says where it sits: `/// In the function table at slot 7897`.
+
 ## Usage
 
 ```console
 $ unwasm inspect module.wasm      # what the module contains
+$ unwasm table module.wasm        # what each table slot holds
 $ unwasm host module.wasm         # the skeleton of what a host must answer
 $ unwasm decompile module.wasm    # to stdout
 $ unwasm decompile module.wasm -o out.rs      # one file
-$ unwasm decompile module.wasm -o out/        # mod.rs plus parts
-$ unwasm decompile module.wasm -o out/ --split 64
+$ unwasm decompile module.wasm -o out/        # mod.rs, parts, names.json
+$ unwasm decompile module.wasm -o out/ --only 10532,12114
 ```
 
 The output is a self-contained Rust module — no dependencies, runtime embedded:
@@ -368,7 +419,7 @@ shells started afterwards.
 
 ### Coverage
 
-**99.5% of lines.** Every file is complete except `module.rs`, and the twenty
+**99.6% of lines.** Every file is complete except `module.rs`, and the twenty
 lines left there are unreachable rather than untested:
 
 - the `other =>` arms over wasmparser's `#[non_exhaustive]` enums. The compiler

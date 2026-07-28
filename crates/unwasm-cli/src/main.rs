@@ -13,8 +13,9 @@ const USAGE: &str = "\
 unwasm — a WebAssembly decompiler whose output compiles
 
 usage:
-  unwasm decompile <module.wasm> [-o <out>] [--split <n>]
+  unwasm decompile <module.wasm> [-o <out>] [--split <n>] [--only <indices>]
   unwasm host      <module.wasm> [-o <host.rs>]
+  unwasm table     <module.wasm> [--type <signature>]
   unwasm inspect   <module.wasm>
 
   -o <out>       a path ending in .rs writes one file; any other path is a
@@ -23,6 +24,19 @@ usage:
   --split <n>    roughly how many lines to put in each part file. Implies a
                  directory. Without it, a directory gets the layout the
                  module's size calls for.
+  --only <list>  decompile only these function indices, comma-separated. The
+                 rest keep their signatures and become `unimplemented!()`, so
+                 the result still compiles - for reading three functions out of
+                 thirteen thousand without producing 365 MB.
+
+A directory output also gets `names.json`: every function's index, name, file,
+line and table slots. That is the index to look things up in rather than
+grepping the output.
+
+`table` lists what the function table holds, slot by slot, with each entry's
+signature. `call_indirect` takes a table index rather than a function index, so
+this is what says which slot a call site reaches — and which slot a callback
+has to go into. `--type \"(i32,i32,i32)->()\"` narrows it to one signature.
 
 `host` writes a skeleton `impl Imports`: every import the module still needs,
 grouped by where it comes from, each one a `todo!()`. Emscripten's `invoke_*`
@@ -40,7 +54,11 @@ fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     match run(&arguments) {
         Ok(output) => {
-            print!("{output}");
+            // Written rather than printed: `unwasm table … | head` closes the
+            // pipe, and `print!` panics on that. A tool whose output is meant
+            // to be filtered should not fall over when it is.
+            use std::io::Write as _;
+            let _ = std::io::stdout().write_all(output.as_bytes());
             ExitCode::SUCCESS
         }
         Err(message) => {
@@ -54,6 +72,7 @@ fn run(arguments: &[String]) -> Result<String, String> {
     match arguments.first().map(String::as_str) {
         Some("decompile") => decompile(&arguments[1..]),
         Some("host") => host(&arguments[1..]),
+        Some("table") => table(&arguments[1..]),
         Some("inspect") => inspect(&arguments[1..]),
         Some("-h" | "--help" | "help") | None => Ok(USAGE.to_string()),
         Some(other) => Err(format!("unknown command `{other}`\n\n{USAGE}")),
@@ -64,6 +83,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
     let path = arguments.first().ok_or("decompile needs a module path")?;
     let mut destination = None;
     let mut split = None;
+    let mut only: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let mut rest = arguments[1..].iter();
     while let Some(argument) = rest.next() {
         match argument.as_str() {
@@ -78,6 +98,19 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
                         .map_err(|_| format!("--split needs a number, not `{value}`"))?,
                 );
             }
+            "--only" => {
+                let value = rest.next().ok_or("--only needs a list of indices")?;
+                for part in value.split(',').filter(|part| !part.is_empty()) {
+                    only.insert(
+                        part.trim()
+                            .parse::<u32>()
+                            .map_err(|_| format!("--only takes indices, not `{part}`"))?,
+                    );
+                }
+                if only.is_empty() {
+                    return Err("--only needs at least one index".to_string());
+                }
+            }
             other => return Err(format!("unexpected argument `{other}`")),
         }
     }
@@ -86,6 +119,11 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
     let Some(destination) = destination else {
         if split.is_some() {
             return Err("--split writes several files, so it needs -o <directory>".to_string());
+        }
+        if !only.is_empty() {
+            let files = codegen::generate_only(&module, codegen::Layout::Single, &only)
+                .map_err(|error| error.to_string())?;
+            return Ok(files[0].contents.clone());
         }
         return codegen::generate(&module).map_err(|error| error.to_string());
     };
@@ -103,14 +141,22 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
         }
     };
 
-    let files = codegen::generate_files(&module, layout).map_err(|error| error.to_string())?;
+    let files = if only.is_empty() {
+        codegen::generate_files(&module, layout)
+    } else {
+        codegen::generate_only(&module, layout, &only)
+    }
+    .map_err(|error| error.to_string())?;
     let lines: usize = files.iter().map(|file| file.contents.lines().count()).sum();
 
-    if files.len() == 1 && single_file {
+    // A single-file destination gets the Rust; the index needs a directory to
+    // live beside it.
+    if single_file {
         std::fs::write(&destination, &files[0].contents)
             .map_err(|error| format!("writing {destination}: {error}"))?;
         return Ok(format!(
-            "wrote {destination} ({lines} lines, {} functions)\n",
+            "wrote {destination} ({} lines, {} functions)\n",
+            files[0].contents.lines().count(),
             module.funcs.len()
         ));
     }
@@ -124,8 +170,8 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
             .map_err(|error| format!("writing {}: {error}", at.display()))?;
     }
     Ok(format!(
-        "wrote {destination}/ ({} files, {lines} lines, {} functions)\n",
-        files.len(),
+        "wrote {destination}/ ({} Rust files plus names.json, {lines} lines, {} functions)\n",
+        files.len() - 1,
         module.funcs.len()
     ))
 }
@@ -156,6 +202,70 @@ fn host(arguments: &[String]) -> Result<String, String> {
         }
         None => Ok(skeleton),
     }
+}
+
+/// A signature as this prints it: `(i32,i32) -> i32`, `() -> ()`.
+fn signature_text(ty: &unwasm_core::module::FuncType) -> String {
+    let params: Vec<&str> = ty.params.iter().map(|param| param.rust_name()).collect();
+    let results: Vec<&str> = ty.results.iter().map(|result| result.rust_name()).collect();
+    format!("({}) -> ({})", params.join(","), results.join(","))
+}
+
+fn table(arguments: &[String]) -> Result<String, String> {
+    let path = arguments.first().ok_or("table needs a module path")?;
+    let mut wanted = None;
+    let mut rest = arguments[1..].iter();
+    while let Some(argument) = rest.next() {
+        match argument.as_str() {
+            "--type" => wanted = Some(rest.next().ok_or("--type needs a signature")?.clone()),
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+    }
+
+    let module = read(path)?;
+    let analysis = unwasm_core::analysis::analyse(&module);
+    if analysis.table.is_empty() {
+        return Ok("the table is empty: no element segment puts anything in it\n".to_string());
+    }
+
+    // Matching ignores spaces, so `(i32, i32) -> ()` and `(i32,i32)->()` are
+    // the same request.
+    let tidy = |text: &str| text.replace(' ', "");
+    let wanted = wanted.map(|signature| tidy(&signature));
+
+    let mut out = String::new();
+    let mut shown = 0usize;
+    for (slot, func) in &analysis.table {
+        let signature = module
+            .func_type(*func)
+            .map_or_else(|| "?".to_string(), signature_text);
+        if let Some(wanted) = &wanted
+            && tidy(&signature) != *wanted
+        {
+            continue;
+        }
+        let name = module
+            .func_name(*func)
+            .map(str::to_string)
+            .or_else(|| {
+                analysis
+                    .derived_names
+                    .get(func)
+                    .map(|derived| format!("{} (guessed)", derived.name))
+            })
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "  slot {slot:<6} f{func:<6} {signature}{}{name}\n",
+            if name.is_empty() { "" } else { "  " }
+        ));
+        shown += 1;
+    }
+    Ok(format!(
+        "{} of {} slots{}\n{out}",
+        shown,
+        analysis.table.len(),
+        wanted.map_or(String::new(), |signature| format!(" matching {signature}"))
+    ))
 }
 
 fn inspect(arguments: &[String]) -> Result<String, String> {

@@ -149,6 +149,33 @@ pub struct DerivedName {
     pub name: String,
     /// The message it came from, in full.
     pub evidence: String,
+    /// Where the name came from, which is how much to trust it.
+    pub source: NameSource,
+    /// The names that lost, with why. A function built out of several inlined
+    /// ones references all of their messages, so the runners-up are worth
+    /// seeing — a reader who knows the code can tell at a glance when the
+    /// wrong one won.
+    pub rejected: Vec<String>,
+}
+
+/// How a name was arrived at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameSource {
+    /// From `__assert_fail(expr, file, line, func)`, whose last argument is
+    /// literally `__func__`. This is the compiler naming the function, not a
+    /// guess about it, so it beats everything else.
+    Assert,
+    /// From a message the function logs.
+    Message {
+        /// How many times this function references it. A message it logs
+        /// eleven times is about this function; one it logs once is often
+        /// about a callee that failed.
+        references: usize,
+        /// Whether any other function references it too. Inlining spreads a
+        /// message across every function it was inlined into, so this is
+        /// weaker evidence than it looks.
+        unique: bool,
+    },
 }
 
 /// Something the module registers with embind at startup.
@@ -189,6 +216,19 @@ pub struct Analysis {
     pub derived_names: std::collections::BTreeMap<u32, DerivedName>,
     /// What the module registers with embind, in the order it registers it.
     pub registrations: Vec<Registration>,
+    /// Addresses that many functions reference and that hold no text: the
+    /// module's shared state. Address to the number of functions using it.
+    ///
+    /// A pointer to a context struct appears as a bare number in dozens of
+    /// functions, and every one of them reads as noise until you notice it is
+    /// the same number. Counting is what makes it noticeable.
+    pub hot_addresses: std::collections::BTreeMap<i32, usize>,
+    /// What the function table holds: slot to function index.
+    ///
+    /// `call_indirect` takes a *table* index, not a function index, so reading
+    /// a call site means knowing which function is in which slot — and
+    /// installing a callback means knowing which slot to put it in.
+    pub table: std::collections::BTreeMap<u32, u32>,
 }
 
 /// Reads a module for the things worth naming.
@@ -215,7 +255,91 @@ pub fn analyse(module: &Module) -> Analysis {
         placements: placements.clone(),
         derived_names: derive_names(module, &placements),
         registrations: find_registrations(module, &placements),
+        table: read_table(module),
+        hot_addresses: find_hot_addresses(module, &placements),
     }
+}
+
+/// How many functions must share an address before it is worth pointing out.
+///
+/// Low enough to catch a context pointer, high enough that a constant two
+/// functions happen to share is not called shared state.
+pub const HOT_ADDRESS_FUNCTIONS: usize = 8;
+
+/// Finds the addresses that many functions reference and that are not text.
+///
+/// "Address" is decided by the module's own layout rather than by size: a
+/// constant counts only if it falls inside the span its data segments occupy.
+/// Without that, `2147483647` and `4096` come out as the module's most widely
+/// shared addresses, and they are arithmetic.
+fn find_hot_addresses(
+    module: &Module,
+    placements: &std::collections::BTreeMap<u32, Placement>,
+) -> std::collections::BTreeMap<i32, usize> {
+    let Some((low, high)) = static_data_span(module, placements) else {
+        return Default::default();
+    };
+
+    let mut counts: std::collections::BTreeMap<i32, usize> = Default::default();
+    for func in &module.funcs {
+        let mut seen: std::collections::BTreeSet<i32> = Default::default();
+        for (position, op) in func.body.iter().enumerate() {
+            let Op::I32Const(value) = op else { continue };
+            // A `memory.init` destination is a placement, not a use of what is
+            // there.
+            if *value < low
+                || *value > high
+                || matches!(func.body.get(position + 3), Some(Op::MemoryInit(_)))
+            {
+                continue;
+            }
+            seen.insert(*value);
+        }
+        for value in seen {
+            *counts.entry(value).or_default() += 1;
+        }
+    }
+    counts.retain(|address, functions| {
+        *functions >= HOT_ADDRESS_FUNCTIONS
+            // Text has a better annotation already.
+            && placed_text(module, placements, *address, None).is_none()
+    });
+    counts
+}
+
+/// The span of memory the module's data segments occupy, if it has any.
+fn static_data_span(
+    module: &Module,
+    placements: &std::collections::BTreeMap<u32, Placement>,
+) -> Option<(i32, i32)> {
+    let mut low = i32::MAX;
+    let mut high = i32::MIN;
+    for (index, segment) in module.datas.iter().enumerate() {
+        let base = match segment.offset {
+            Some(ConstExpr::I32(base)) => base,
+            Some(_) => continue,
+            None => placements.get(&(index as u32))?.address,
+        };
+        low = low.min(base);
+        high = high.max(base + segment.bytes.len() as i32);
+    }
+    (low <= high).then_some((low, high))
+}
+
+/// Reads the function table's contents from the element segments.
+fn read_table(module: &Module) -> std::collections::BTreeMap<u32, u32> {
+    let mut table = std::collections::BTreeMap::new();
+    for segment in &module.elems {
+        // A passive or declared segment is not in the table until something
+        // puts it there, and nothing here models `table.init`.
+        let Some(ConstExpr::I32(base)) = segment.offset else {
+            continue;
+        };
+        for (offset, func) in segment.funcs.iter().enumerate() {
+            table.insert(base as u32 + offset as u32, *func);
+        }
+    }
+    table
 }
 
 /// Which argument of each `_embind_register_*` holds the name.
@@ -308,35 +432,58 @@ fn find_registrations(
     registrations
 }
 
-/// Guesses names for unnamed functions from the messages they log.
+/// Guesses names for unnamed functions from what they say about themselves.
 ///
-/// Two rules keep this from inventing things:
+/// Two sources, in order of how much they are worth:
 ///
-/// - **The string must belong to one function.** A message in fifty functions
-///   distinguishes none of them, and `index out of bounds` is in most of a Rust
-///   module. Uniqueness is what makes the guess worth making.
-/// - **The identifier must look like one.** A lowercase token with an
-///   underscore in it, at the start of the message, followed by `:` or a space
-///   — which is how a C or Rust log line names its function. Anything looser
-///   would turn `error while parsing` into a function called `error`.
+/// 1. **`__assert_fail(expr, file, line, func)`.** Its last argument is
+///    `__func__` — the compiler writing the function's name into the binary.
+///    That is not a guess and beats anything else.
+/// 2. **The messages it logs.** A function that logs
+///    `parse_xmpp_offer: invalid jid` is very probably `parse_xmpp_offer`.
+///
+/// For the second, how *often* a message is referenced matters more than
+/// whether it is unique. Inlining is why: a function built out of several
+/// inlined ones references all of their strings, and the one message that
+/// belongs to nobody else is often the one about a callee that failed —
+/// `..._create_participant: wa_vid_quality_manager_create error: %d` names the
+/// callee, not the caller. A message the function logs eleven times is about
+/// that function; one it logs once may be about anything.
 fn derive_names(
     module: &Module,
     placements: &std::collections::BTreeMap<u32, Placement>,
 ) -> std::collections::BTreeMap<u32, DerivedName> {
     let import_count = module.func_imports.len() as u32;
+    let assert_fail = module
+        .func_imports
+        .iter()
+        .position(|import| import.field.contains("assert_fail"))
+        .map(|index| index as u32);
 
-    // Which functions reference each candidate message.
-    let mut owners: std::collections::BTreeMap<String, Vec<u32>> = Default::default();
+    // What each function references, and how often.
+    let mut per_function: Vec<std::collections::BTreeMap<String, usize>> =
+        vec![Default::default(); module.funcs.len()];
+    let mut asserted: std::collections::BTreeMap<u32, String> = Default::default();
+
     for (at, func) in module.funcs.iter().enumerate() {
         let index = import_count + at as u32;
-        let mut seen: std::collections::BTreeSet<String> = Default::default();
         for (position, op) in func.body.iter().enumerate() {
+            // The name an `__assert_fail` carries, which settles the question.
+            if let (Some(assert_fail), Op::Call(callee)) = (assert_fail, op)
+                && *callee == assert_fail
+                && let Some(Op::I32Const(address)) =
+                    position.checked_sub(1).and_then(|at| func.body.get(at))
+                && let Some(text) = placed_text(module, placements, *address, None)
+                && is_c_identifier(&text)
+            {
+                asserted.entry(index).or_insert(text);
+            }
+
             let Op::I32Const(address) = op else { continue };
             // The address a `memory.init` copies *to* is not a reference to the
             // text — it is the placement itself. Counting it would make every
             // string at the start of a segment look like it belonged to the
-            // initialiser as well as to its real user, and a string in two
-            // functions names neither.
+            // initialiser as well as to its real user.
             if matches!(func.body.get(position + 3), Some(Op::MemoryInit(_))) {
                 continue;
             }
@@ -349,43 +496,123 @@ fn derive_names(
                 .or_else(|| placed_text(module, placements, *address, None));
             let Some(text) = text else { continue };
             if identifier_in(&text).is_some() {
-                seen.insert(text);
+                *per_function[at].entry(text).or_default() += 1;
             }
         }
-        for text in seen {
-            owners.entry(text).or_default().push(index);
+    }
+
+    // How many functions reference each message at all.
+    let mut owners: std::collections::BTreeMap<&str, usize> = Default::default();
+    for messages in &per_function {
+        for text in messages.keys() {
+            *owners.entry(text.as_str()).or_default() += 1;
         }
     }
 
     let mut names: std::collections::BTreeMap<u32, DerivedName> = Default::default();
-    for (text, functions) in owners {
-        // Shared by two functions is not evidence about either of them.
-        let [function] = functions[..] else { continue };
-        if module.func_name(function).is_some() {
+    for (at, messages) in per_function.iter().enumerate() {
+        let index = import_count + at as u32;
+        if module.func_name(index).is_some() {
             continue;
         }
-        // `identifier_in` already accepted this text on the way in.
-        let name = identifier_in(&text).unwrap_or_default();
-        // A function referencing several unique messages keeps the first by
-        // address order, which is stable across runs; a longer identifier is
-        // preferred when they differ, being the more specific of the two.
-        let candidate = DerivedName {
-            name: name.to_string(),
-            evidence: text,
-        };
-        match names.get(&function) {
-            Some(existing) if existing.name.len() >= candidate.name.len() => {}
-            _ => {
-                names.insert(function, candidate);
-            }
+
+        if let Some(name) = asserted.get(&index) {
+            names.insert(
+                index,
+                DerivedName {
+                    name: name.clone(),
+                    evidence: format!("__assert_fail(.., \"{name}\")"),
+                    source: NameSource::Assert,
+                    rejected: best_messages(messages, &owners, 3)
+                        .into_iter()
+                        .filter(|candidate| candidate.0 != *name)
+                        .map(|candidate| candidate.0)
+                        .collect(),
+                },
+            );
+            continue;
         }
+
+        let mut ranked = best_messages(messages, &owners, 4).into_iter();
+        let Some((name, text, references, unique)) = ranked.next() else {
+            continue;
+        };
+        names.insert(
+            index,
+            DerivedName {
+                name,
+                evidence: text,
+                source: NameSource::Message { references, unique },
+                rejected: ranked.map(|candidate| candidate.0).collect(),
+            },
+        );
     }
     names
+}
+
+/// The best candidate names a function's messages offer, strongest first.
+///
+/// Ordered by how often the function references the message, then by whether
+/// anything else references it, then by how specific the identifier is. The
+/// first of those is the one that matters: it is what tells a message about
+/// this function from a message about something it called.
+fn best_messages(
+    messages: &std::collections::BTreeMap<String, usize>,
+    owners: &std::collections::BTreeMap<&str, usize>,
+    most: usize,
+) -> Vec<(String, String, usize, bool)> {
+    let mut candidates: Vec<(String, String, usize, bool)> = messages
+        .iter()
+        .filter_map(|(text, references)| {
+            let name = identifier_in(text)?;
+            let unique = owners.get(text.as_str()).copied().unwrap_or(0) <= 1;
+            // Referenced once, by more than one function: there is nothing here
+            // to tell those functions apart, and naming both after it would
+            // give two functions the same name for no reason.
+            if *references == 1 && !unique {
+                return None;
+            }
+            Some((name.to_string(), text.clone(), *references, unique))
+        })
+        .collect();
+    candidates.sort_by(|left, right| {
+        right
+            .2
+            .cmp(&left.2)
+            .then(right.3.cmp(&left.3))
+            .then(right.0.len().cmp(&left.0.len()))
+            .then(left.0.cmp(&right.0))
+    });
+    // Several messages can yield the same identifier — a bare
+    // `wa_call_group_create_participant` and one with a suffix after it. As
+    // candidates they are the same answer twice.
+    let mut seen: std::collections::BTreeSet<String> = Default::default();
+    candidates.retain(|candidate| seen.insert(candidate.0.clone()));
+    candidates.truncate(most);
+    candidates
+}
+
+/// Whether text is a plain C identifier, as `__func__` always is.
+fn is_c_identifier(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 120
+        && text.starts_with(|ch: char| ch.is_ascii_alphabetic() || ch == '_')
+        && text
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 /// The function name a log message starts with, if it starts with one.
 fn identifier_in(text: &str) -> Option<&str> {
     let first = text.split([':', ' ', '(', ',']).next()?;
+    // A Rust module path is not a function name. `call_control::ffi` is the
+    // crate saying where it is, and taking `call_control` from it names a
+    // function after its module — which, once messages are ranked by how often
+    // they appear, is the mistake that wins, because a path appears everywhere
+    // in its own module.
+    if text[first.len()..].starts_with("::") {
+        return None;
+    }
     let long_enough = first.len() >= 6 && first.len() <= 60;
     let shaped_like_an_identifier = first.contains('_')
         && first

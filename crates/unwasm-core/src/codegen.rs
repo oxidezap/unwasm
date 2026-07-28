@@ -31,7 +31,7 @@ use std::fmt::Write as _;
 // `Frame` is taken in this file by the control-flow frame, which is a
 // different thing entirely: one is a `block` being emitted, the other is the C
 // stack frame the module carved out of linear memory.
-use crate::analysis::{self, Analysis, Evidence, Frame as StackFrame};
+use crate::analysis::{self, Analysis, Evidence, Frame as StackFrame, HOT_ADDRESS_FUNCTIONS};
 use crate::error::{Error, Result};
 use crate::module::{
     BlockType, ConstExpr, ExportKind, Func, LoadKind, Module, Op, StoreKind, ValType,
@@ -311,7 +311,8 @@ pub fn generate(module: &Module) -> Result<String> {
 
 /// Generates the output in the requested layout.
 ///
-/// The first file is always `mod.rs`; the rest, if any, are its parts.
+/// The first file is always `mod.rs`; the rest are its parts, and the last is
+/// `names.json` — an index of where every function ended up.
 ///
 /// # Errors
 ///
@@ -320,12 +321,36 @@ pub fn generate_files(module: &Module, layout: Layout) -> Result<Vec<GeneratedFi
     Generator::new(module, layout).run()
 }
 
+/// Generates only the named functions, leaving the rest as stubs.
+///
+/// For reading rather than running: three functions out of thirteen thousand
+/// is a different task from decompiling a module, and it should not cost 365
+/// megabytes to do. The functions left out keep their signatures and their
+/// names, so the result still compiles — it just cannot run past one of them.
+///
+/// # Errors
+///
+/// As [`generate`].
+pub fn generate_only(
+    module: &Module,
+    layout: Layout,
+    only: &std::collections::BTreeSet<u32>,
+) -> Result<Vec<GeneratedFile>> {
+    let mut generator = Generator::new(module, layout);
+    generator.only = Some(only.clone());
+    generator.run()
+}
+
 struct Generator<'a> {
     module: &'a Module,
     layout: Layout,
     analysis: Analysis,
     out: String,
     parts: Vec<GeneratedFile>,
+    /// Which functions to decompile, when only some were asked for.
+    only: Option<std::collections::BTreeSet<u32>>,
+    /// Where each function ended up, for the index.
+    located: Vec<(u32, String, String, usize)>,
 }
 
 impl<'a> Generator<'a> {
@@ -336,23 +361,67 @@ impl<'a> Generator<'a> {
             analysis: analysis::analyse(module),
             out: String::new(),
             parts: Vec::new(),
+            only: None,
+            located: Vec::new(),
         }
     }
 
     fn run(mut self) -> Result<Vec<GeneratedFile>> {
         self.header();
         self.registered_api();
+        self.shared_state();
         self.embed_runtime();
         self.data_constants();
         self.imports_trait();
         self.instance_struct();
         self.instance_impl()?;
+        let index = self.index_json();
         let mut files = vec![GeneratedFile {
             name: "mod.rs".to_string(),
             contents: self.out,
         }];
         files.append(&mut self.parts);
+        files.push(GeneratedFile {
+            name: "names.json".to_string(),
+            contents: index,
+        });
         Ok(files)
+    }
+
+    /// An index of every function: what it is called, and where it is.
+    ///
+    /// Hand-written JSON rather than a dependency — it has four fields and no
+    /// nesting. What it buys is not having to `grep -n` through two million
+    /// lines to find the function you already know the number of.
+    fn index_json(&self) -> String {
+        let mut out = String::from("{\n  \"functions\": [\n");
+        for (at, (index, name, file, line)) in self.located.iter().enumerate() {
+            let slots: Vec<String> = self
+                .analysis
+                .table
+                .iter()
+                .filter(|(_, func)| *func == index)
+                .map(|(slot, _)| slot.to_string())
+                .collect();
+            let source = match self.analysis.derived_names.get(index).map(|d| d.source) {
+                Some(crate::analysis::NameSource::Assert) => "assert",
+                Some(crate::analysis::NameSource::Message { .. }) => "message",
+                None if self.module.func_name(*index).is_some() => "name section",
+                None => "none",
+            };
+            let _ = writeln!(
+                out,
+                "    {{\"index\": {index}, \"name\": \"{name}\", \"file\": \"{file}\", \"line\": {line}, \"named_by\": \"{source}\", \"table_slots\": [{}]}}{}",
+                slots.join(", "),
+                if at + 1 == self.located.len() {
+                    ""
+                } else {
+                    ","
+                }
+            );
+        }
+        out.push_str("  ]\n}\n");
+        out
     }
 
     fn header(&mut self) {
@@ -411,6 +480,27 @@ impl<'a> Generator<'a> {
                 "//   {kind}: {}",
                 escape_doc(registration.name.as_deref().unwrap_or_default())
             );
+        }
+        self.out.push('\n');
+    }
+
+    /// The addresses the module shares most widely, at the top.
+    ///
+    /// Individually each one is annotated where it is used; together they are
+    /// a map of the module's shared state, which is worth having in one place.
+    fn shared_state(&mut self) {
+        if self.analysis.hot_addresses.is_empty() {
+            return;
+        }
+        let mut by_use: Vec<(&i32, &usize)> = self.analysis.hot_addresses.iter().collect();
+        by_use.sort_by_key(|(address, functions)| (std::cmp::Reverse(**functions), **address));
+        let _ = writeln!(
+            self.out,
+            "// Addresses shared across the module — {} of them, each referenced by at\n// least {HOT_ADDRESS_FUNCTIONS} functions and holding no text. The widest twenty:\n//",
+            by_use.len()
+        );
+        for (address, functions) in by_use.iter().take(20) {
+            let _ = writeln!(self.out, "//   {address:<10} {functions} functions");
         }
         self.out.push('\n');
     }
@@ -643,6 +733,12 @@ impl<'a> Generator<'a> {
                 for (at, func) in self.module.funcs.iter().enumerate() {
                     let index = import_count + at as u32;
                     let body = self.function(index, func)?;
+                    self.located.push((
+                        index,
+                        function_ident(index, &self.analysis),
+                        "mod.rs".to_string(),
+                        self.out.lines().count() + 1,
+                    ));
                     self.out.push_str(&body);
                 }
                 self.out.push_str("}\n\n");
@@ -669,6 +765,15 @@ impl<'a> Generator<'a> {
                 self.push_part(std::mem::take(&mut current));
                 lines = 0;
             }
+            // Four lines of part header and `impl` opening come before the
+            // first function in a part.
+            let file = format!("part{}.rs", self.parts.len());
+            self.located.push((
+                index,
+                function_ident(index, &self.analysis),
+                file,
+                lines + 5,
+            ));
             current.push_str(&body);
             lines += body_lines;
         }
@@ -939,15 +1044,70 @@ impl<'a> Generator<'a> {
             // The name is a guess, so the reason travels with it. Without the
             // evidence a reader has to take `parse_xmpp_offer` on trust, and
             // there is nothing else in a stripped module to check it against.
-            let _ = writeln!(
-                out,
-                "    /// Function #{index}. The module names nothing; this one references\n    /// {}, a message no other function\n    /// references — so it is probably `{}`.",
-                escape_comment(&derived.evidence),
-                escape_doc(&derived.name)
-            );
+            match derived.source {
+                crate::analysis::NameSource::Assert => {
+                    let _ = writeln!(
+                        out,
+                        "    /// Function #{index}, named `{}` by its own `__assert_fail`: the\n    /// last argument of that call is `__func__`, so this is the compiler\n    /// writing the name down rather than anything guessing at it.",
+                        escape_doc(&derived.name)
+                    );
+                }
+                crate::analysis::NameSource::Message { references, unique } => {
+                    let shared = if unique {
+                        "and no other function references it".to_string()
+                    } else {
+                        "though other functions reference it too — inlining spreads a\n    /// message across everything it was inlined into".to_string()
+                    };
+                    let _ = writeln!(
+                        out,
+                        "    /// Function #{index}. The module names nothing; this one references\n    /// {}\n    /// {references} time(s), {shared} — so it is probably `{}`.",
+                        escape_comment(&derived.evidence),
+                        escape_doc(&derived.name)
+                    );
+                }
+            }
+            if !derived.rejected.is_empty() {
+                // What else it could have been. A function assembled out of
+                // several inlined ones references all of their messages, and
+                // seeing the runners-up is what stops a reader trusting the
+                // winner more than it deserves.
+                let _ = writeln!(
+                    out,
+                    "    /// Other candidates, in order: {}.",
+                    derived
+                        .rejected
+                        .iter()
+                        .map(|name| format!("`{}`", escape_doc(name)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
         } else {
             let _ = writeln!(out, "    /// Function #{index}, unnamed in the module.");
         }
+        // Where a `call_indirect` would find it. The table index is not the
+        // function index, and the difference is what stands between reading a
+        // call site and knowing what it calls.
+        let slots: Vec<u32> = self
+            .analysis
+            .table
+            .iter()
+            .filter(|(_, func)| **func == index)
+            .map(|(slot, _)| *slot)
+            .collect();
+        if !slots.is_empty() {
+            let _ = writeln!(
+                out,
+                "    ///\n    /// In the function table at slot{} {} — this is what a\n    /// `call_indirect` with that index reaches.",
+                if slots.len() == 1 { "" } else { "s" },
+                slots
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
         let frame = self.analysis.frames.get(&index);
         if let Some(frame) = frame {
             out.push_str(&frame_summary(frame));
@@ -963,7 +1123,18 @@ impl<'a> Generator<'a> {
             return_type(ty)
         );
 
-        out.push_str(&Body::new(self.module, &self.analysis, func, ty, index).emit()?);
+        let asked_for = self.only.as_ref().is_none_or(|only| only.contains(&index));
+        if asked_for {
+            out.push_str(&Body::new(self.module, &self.analysis, func, ty, index).emit()?);
+        } else {
+            // Not decompiled, and saying so rather than looking decompiled. The
+            // signature and the name stay, so callers still compile and the
+            // index still finds it.
+            let _ = writeln!(
+                out,
+                "        unimplemented!(\"function #{index} was not decompiled: --only\")"
+            );
+        }
         out.push_str("    }\n\n");
         Ok(out)
     }
@@ -1532,7 +1703,19 @@ impl<'a> Body<'a> {
                 };
                 let code = match text {
                     Some(text) => format!("{} /* {} */", format_i32(*value), escape_comment(&text)),
-                    None => format_i32(*value),
+                    // Not text, but shared: a bare number that dozens of
+                    // functions reference is state they have in common, and
+                    // saying how many is what makes that visible at the call
+                    // site rather than only in aggregate.
+                    None => match self.analysis.hot_addresses.get(value) {
+                        Some(functions) => {
+                            format!(
+                                "{} /* address, in {functions} functions */",
+                                format_i32(*value)
+                            )
+                        }
+                        None => format_i32(*value),
+                    },
                 };
                 self.push(code, ValType::I32, true);
             }

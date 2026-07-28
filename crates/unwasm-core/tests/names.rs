@@ -39,9 +39,10 @@ fn a_function_is_named_after_the_message_only_it_logs() {
 }
 
 #[test]
-fn a_message_two_functions_log_names_neither() {
-    // The rule that makes the guess worth making: a shared message
-    // distinguishes nothing. `index out of bounds` is in most of a Rust module.
+fn a_message_two_functions_log_once_each_names_neither() {
+    // Nothing here tells the two apart, so naming both after it would hand two
+    // functions the same name for no reason. A message logged *repeatedly* by
+    // one of them is a different matter — see the frequency test below.
     let (_, analysis) = analyse(
         "shared-message",
         r#"(module
@@ -117,7 +118,7 @@ fn the_name_keeps_the_index_and_the_evidence_reaches_the_output() {
     );
     assert!(code.contains("so it is probably `handle_incoming_offer`"));
     assert!(
-        code.contains("a message no other function"),
+        code.contains("and no other function references it"),
         "the evidence has to say why it is evidence"
     );
     // The export still reaches it.
@@ -289,4 +290,177 @@ fn the_voip_module_names_a_fifth_of_its_functions() {
         analysis.derived_names.len(),
         module.funcs.len()
     );
+}
+
+/// What a function logs *often* is about that function; what it logs once may
+/// be about something it called.
+#[test]
+fn a_message_logged_many_times_beats_one_logged_once() {
+    // The shape that made this necessary, from the VoIP module: a function
+    // whose one unique message is `..._create_participant: wa_vid_quality_
+    // manager_create error: %d` — a report that its callee failed. Inlining
+    // put the caller's own message in several functions, so uniqueness alone
+    // picked the callee's name.
+    let wasm = common::assemble(
+        "frequency",
+        r#"(module
+            (import "env" "log" (func $log (param i32)))
+            (memory 1)
+            (data (i32.const 100) "wa_call_group_create_participant\00")
+            (data (i32.const 200) "wa_vid_quality_manager_create error\00")
+            (func (export "the_caller")
+                i32.const 100 call $log
+                i32.const 100 call $log
+                i32.const 100 call $log
+                i32.const 200 call $log)
+            ;; Another function references the frequent message too — inlining.
+            (func (export "inlined_elsewhere")
+                i32.const 100 call $log))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let derived = analysis::analyse(&module).derived_names;
+    assert_eq!(
+        derived[&1].name, "wa_call_group_create_participant",
+        "three references beat one, even though the one is unique: {derived:?}"
+    );
+}
+
+#[test]
+fn a_name_from_an_assert_beats_every_message() {
+    // `__assert_fail(expr, file, line, func)`: the last argument is `__func__`,
+    // which is the compiler writing the name down.
+    let wasm = common::assemble(
+        "assert-name",
+        r#"(module
+            (import "env" "__assert_fail" (func $assert (param i32 i32 i32 i32)))
+            (import "env" "log" (func $log (param i32)))
+            (memory 1)
+            (data (i32.const 100) "some_other_message: happens a lot\00")
+            (data (i32.const 200) "x != 0\00")
+            (data (i32.const 300) "call_membership.cc\00")
+            (data (i32.const 400) "futex_wait_main_browser_thread\00")
+            (func (export "f")
+                i32.const 100 call $log
+                i32.const 100 call $log
+                i32.const 100 call $log
+                i32.const 200 i32.const 300 i32.const 55 i32.const 400
+                call $assert))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let derived = analysis::analyse(&module).derived_names;
+    let name = &derived[&2];
+    assert_eq!(name.name, "futex_wait_main_browser_thread");
+    assert_eq!(name.source, analysis::NameSource::Assert);
+    assert!(name.evidence.contains("__assert_fail"));
+    // And the message it beat is still on record.
+    assert!(
+        name.rejected.contains(&"some_other_message".to_string()),
+        "{:?}",
+        name.rejected
+    );
+}
+
+#[test]
+fn a_rust_module_path_is_not_a_function_name() {
+    // `call_control::stanza_deserializer::…` appears in every function of its
+    // module, so by frequency it wins — and names all of them after the module.
+    let wasm = common::assemble(
+        "module-path",
+        r#"(module
+            (import "env" "log" (func $log (param i32)))
+            (memory 1)
+            (data (i32.const 100) "call_control::stanza_deserializer::shared\00")
+            (data (i32.const 200) "fill_user_info_from_participant failed\00")
+            (func (export "f")
+                i32.const 100 call $log
+                i32.const 100 call $log
+                i32.const 100 call $log
+                i32.const 200 call $log))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let derived = analysis::analyse(&module).derived_names;
+    assert_eq!(derived[&1].name, "fill_user_info_from_participant");
+}
+
+#[test]
+fn the_runners_up_reach_the_output() {
+    let wasm = common::assemble(
+        "runners-up",
+        r#"(module
+            (import "env" "log" (func $log (param i32)))
+            (memory 1)
+            (data (i32.const 100) "handle_offer: got one\00")
+            (data (i32.const 200) "parse_jid: failed\00")
+            (func (export "f")
+                i32.const 100 call $log
+                i32.const 100 call $log
+                i32.const 200 call $log))"#,
+    );
+    let code = common::decompile(&wasm);
+    assert!(code.contains("fn f1_handle_offer("), "{code}");
+    assert!(
+        code.contains("Other candidates, in order: `parse_jid`"),
+        "the conflict is worth seeing:\n{code}"
+    );
+}
+
+#[test]
+fn a_name_from_an_assert_says_so_in_the_output_and_in_the_index() {
+    let wasm = common::assemble(
+        "assert-output",
+        r#"(module
+            (import "env" "__assert_fail" (func $assert (param i32 i32 i32 i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 100) "x != 0\00")
+            (data (i32.const 200) "membership.cc\00")
+            (data (i32.const 300) "wa_call_membership_add\00")
+            (func (export "checked") (param i32)
+                local.get 0
+                if
+                    i32.const 100 i32.const 200 i32.const 42 i32.const 300
+                    call $assert
+                end))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let files = codegen::generate_files(&module, codegen::Layout::Single).expect("generates");
+    let code = &files[0].contents;
+    assert!(code.contains("fn f1_wa_call_membership_add("), "{code}");
+    assert!(
+        code.contains("by its own `__assert_fail`"),
+        "the output has to say the name came from the compiler:\n{code}"
+    );
+    assert!(code.contains("`__func__`"));
+
+    let index = &files
+        .iter()
+        .find(|file| file.name == "names.json")
+        .expect("present")
+        .contents;
+    assert!(index.contains(r#""named_by": "assert""#), "{index}");
+}
+
+#[test]
+fn a_shared_message_says_that_inlining_is_why() {
+    // Referenced twice here and once elsewhere: enough to name this one, and
+    // worth saying that the evidence is weaker than a message nobody else has.
+    let wasm = common::assemble(
+        "shared-output",
+        r#"(module
+            (import "env" "log" (func $log (param i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 100) "wa_call_shared_helper: happened\00")
+            (func (export "owner")
+                i32.const 100 call $log
+                i32.const 100 call $log)
+            (func (export "inlined_into")
+                i32.const 100 call $log
+                i32.const 100 call $log
+                i32.const 100 call $log))"#,
+    );
+    let code = common::decompile(&wasm);
+    assert!(
+        code.contains("though other functions reference it too"),
+        "{code}"
+    );
+    assert!(code.contains("inlining spreads a"), "{code}");
 }

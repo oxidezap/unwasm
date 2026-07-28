@@ -180,7 +180,7 @@ fn a_destination_that_is_not_a_rust_file_becomes_a_directory() {
         "1",
     ]);
     assert!(ok, "{stderr}");
-    assert!(stdout.contains("2 files"), "{stdout}");
+    assert!(stdout.contains("2 Rust files plus names.json"), "{stdout}");
     let root = std::fs::read_to_string(destination.join("mod.rs")).expect("mod.rs exists");
     assert!(root.contains("mod part0;"), "{root}");
     let part = std::fs::read_to_string(destination.join("part0.rs")).expect("part0.rs exists");
@@ -201,7 +201,7 @@ fn a_small_module_written_to_a_directory_still_gets_one_file() {
         destination.to_str().expect("utf-8 path"),
     ]);
     assert!(ok, "{stderr}");
-    assert!(stdout.contains("1 files"), "{stdout}");
+    assert!(stdout.contains("1 Rust files plus names.json"), "{stdout}");
     assert!(destination.join("mod.rs").exists());
     assert!(!destination.join("part0.rs").exists());
 }
@@ -431,5 +431,145 @@ fn inspect_reports_a_stack_pointer_found_by_its_use() {
     assert!(
         stdout.contains("stack pointer: global #0 (by 2 prologues)"),
         "{stdout}"
+    );
+}
+
+#[test]
+fn table_lists_what_each_slot_holds_and_filters_by_signature() {
+    let path = fixture(
+        "sample-table",
+        r#"(module
+            (type $unary (func (param i32) (result i32)))
+            (type $sink (func (param i32)))
+            (func (export "double") (param i32) (result i32) local.get 0 i32.const 2 i32.mul)
+            (func (export "sink") (param i32))
+            (table 4 funcref)
+            (elem (i32.const 1) func 0 1))"#,
+    );
+    let (ok, stdout, stderr) = run(&["table", path.to_str().expect("utf-8 path")]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("2 of 2 slots"), "{stdout}");
+    assert!(stdout.contains("slot 1"), "{stdout}");
+    assert!(stdout.contains("(i32) -> (i32)"), "{stdout}");
+
+    // The question that is otherwise hard: which slot holds this signature?
+    let (ok, stdout, _) = run(&[
+        "table",
+        path.to_str().expect("utf-8 path"),
+        "--type",
+        "(i32) -> ()",
+    ]);
+    assert!(ok);
+    assert!(stdout.contains("1 of 2 slots matching"), "{stdout}");
+    assert!(stdout.contains("slot 2"), "{stdout}");
+    assert!(!stdout.contains("slot 1  "), "{stdout}");
+}
+
+#[test]
+fn table_says_when_there_is_nothing_in_it() {
+    let path = fixture(
+        "sample-emptytable",
+        "(module (table 4 funcref) (func (export \"f\")))",
+    );
+    let (ok, stdout, _) = run(&["table", path.to_str().expect("utf-8 path")]);
+    assert!(ok);
+    assert!(stdout.contains("the table is empty"), "{stdout}");
+}
+
+#[test]
+fn table_rejects_arguments_it_does_not_understand() {
+    let (ok, _, stderr) = run(&["table"]);
+    assert!(!ok);
+    assert!(stderr.contains("table needs a module path"), "{stderr}");
+
+    let path = fixture("sample-tableargs", SAMPLE);
+    let (ok, _, stderr) = run(&["table", path.to_str().expect("utf-8 path"), "--type"]);
+    assert!(!ok);
+    assert!(stderr.contains("--type needs a signature"), "{stderr}");
+
+    let (ok, _, stderr) = run(&["table", path.to_str().expect("utf-8 path"), "--split", "4"]);
+    assert!(!ok);
+    assert!(stderr.contains("unexpected argument `--split`"), "{stderr}");
+}
+
+#[test]
+fn only_decompiles_the_functions_named_and_writes_the_index() {
+    let path = fixture(
+        "sample-only",
+        r#"(module
+            (func (export "a") (result i32) i32.const 111)
+            (func (export "b") (result i32) i32.const 222))"#,
+    );
+    let destination = scratch().join("only-out");
+    let _ = std::fs::remove_dir_all(&destination);
+    let (ok, stdout, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "-o",
+        destination.to_str().expect("utf-8 path"),
+        "--only",
+        "1",
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("names.json"), "{stdout}");
+
+    let written = std::fs::read_to_string(destination.join("mod.rs")).expect("mod.rs");
+    assert!(written.contains("222i32"), "the one asked for:\n{written}");
+    assert!(written.contains("was not decompiled: --only"), "{written}");
+
+    let index = std::fs::read_to_string(destination.join("names.json")).expect("names.json");
+    assert!(index.contains(r#""index": 0"#), "{index}");
+    assert!(index.contains(r#""index": 1"#), "{index}");
+}
+
+#[test]
+fn only_needs_indices_it_can_parse() {
+    let path = fixture("sample-onlyargs", SAMPLE);
+    let (ok, _, stderr) = run(&["decompile", path.to_str().expect("utf-8 path"), "--only"]);
+    assert!(!ok);
+    assert!(
+        stderr.contains("--only needs a list of indices"),
+        "{stderr}"
+    );
+
+    let (ok, _, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--only",
+        "first",
+    ]);
+    assert!(!ok);
+    assert!(
+        stderr.contains("--only takes indices, not `first`"),
+        "{stderr}"
+    );
+
+    let (ok, _, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--only",
+        ",",
+    ]);
+    assert!(!ok);
+    assert!(
+        stderr.contains("--only needs at least one index"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn only_to_stdout_writes_just_the_rust() {
+    let path = fixture("sample-onlystdout", SAMPLE);
+    let (ok, stdout, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--only",
+        "1",
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("pub struct Instance"), "{stdout}");
+    assert!(
+        !stdout.contains("\"functions\":"),
+        "the index needs a directory"
     );
 }

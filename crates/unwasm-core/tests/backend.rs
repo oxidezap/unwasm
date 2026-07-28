@@ -693,9 +693,15 @@ fn a_split_layout_produces_a_mod_file_and_one_part_per_group() {
     assert_eq!(
         names,
         [
-            "mod.rs", "part0.rs", "part1.rs", "part2.rs", "part3.rs", "part4.rs"
+            "mod.rs",
+            "part0.rs",
+            "part1.rs",
+            "part2.rs",
+            "part3.rs",
+            "part4.rs",
+            "names.json"
         ],
-        "five functions, none of which fits with another"
+        "five functions, none of which fits with another, plus the index"
     );
 
     let root = &files[0].contents;
@@ -703,7 +709,7 @@ fn a_split_layout_produces_a_mod_file_and_one_part_per_group() {
     assert!(root.contains("pub fn a("), "the exports stay in mod.rs");
     assert!(!root.contains("pub(crate) fn f0("), "the functions do not");
 
-    for part in &files[1..] {
+    for part in files[1..].iter().filter(|file| file.name.ends_with(".rs")) {
         assert!(part.contents.contains("use super::*;"), "{}", part.name);
         assert!(part.contents.contains("impl<H: Imports> Instance<H> {"));
         // Each part carries its own lint allowances: they are per-file.
@@ -742,11 +748,11 @@ fn the_layout_a_module_gets_by_default_follows_its_size() {
     );
     let files =
         codegen::generate_files(&module, codegen::Layout::for_module(&module)).expect("generating");
-    assert!(files.len() > 1, "a large module splits");
+    assert!(files.len() > 2, "a large module splits");
     // No part is much over the budget — that is what the budget is for. The
     // exception is a single function larger than the whole budget, which
     // cannot be divided any further.
-    for part in &files[1..] {
+    for part in files[1..].iter().filter(|file| file.name.ends_with(".rs")) {
         let lines = part.contents.lines().count();
         let functions = part.contents.matches("pub(crate) fn f").count();
         assert!(
@@ -769,7 +775,11 @@ fn a_zero_sized_split_still_produces_one_function_per_file() {
     let module = Module::parse(&wasm).expect("valid");
     let files = codegen::generate_files(&module, codegen::Layout::Split { lines_per_file: 0 })
         .expect("generating");
-    assert_eq!(files.len(), 3, "mod.rs plus one part per function");
+    assert_eq!(
+        files.len(),
+        4,
+        "mod.rs, one part per function, and the index"
+    );
 }
 
 #[test]
@@ -778,7 +788,7 @@ fn a_module_with_no_functions_splits_into_just_a_mod_file() {
     let module = Module::parse(&wasm).expect("valid");
     let files = codegen::generate_files(&module, codegen::Layout::Split { lines_per_file: 4 })
         .expect("generating");
-    assert_eq!(files.len(), 1);
+    assert_eq!(files.len(), 2, "mod.rs and the index");
     assert!(!files[0].contents.contains("mod part"));
 }
 

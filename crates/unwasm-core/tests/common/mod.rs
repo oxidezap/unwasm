@@ -543,6 +543,62 @@ pub fn run_with_driver_in_layout(
     String::from_utf8_lossy(&run.stdout).to_string()
 }
 
+/// Compiles a driver against Rust the caller already generated.
+///
+/// For the layouts `run_with_driver` does not produce — a partial
+/// decompilation, say — where the point is that what came out still builds.
+pub fn run_with_generated(name: &str, generated: &str, driver: &str) -> String {
+    let scratch = workspace_scratch(name);
+    let single = scratch.join("generated.rs");
+    let _ = std::fs::remove_dir_all(scratch.join("generated"));
+    write_atomically(&single, generated.as_bytes());
+    write_atomically(&scratch.join("main.rs"), driver.as_bytes());
+
+    let binary = scratch.join("driver");
+    let output = tool("rustc")
+        .args(["--edition", "2024"])
+        .arg("-o")
+        .arg(&binary)
+        .arg(scratch.join("main.rs"))
+        .output()
+        .expect("running rustc");
+    assert!(
+        output.status.success(),
+        "the generated Rust does not compile:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run = Command::new(&binary).output().expect("running the driver");
+    assert!(
+        run.status.success(),
+        "the driver failed:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    String::from_utf8_lossy(&run.stdout).to_string()
+}
+
+/// Checks that text parses as JSON, using something that is not us.
+///
+/// node is already required by the harness, and its parser is not one we could
+/// have accidentally written to agree with.
+pub fn assert_valid_json(text: &str) {
+    let scratch = workspace_scratch("json");
+    let file = scratch.join(format!("{}.json", digest(text)));
+    write_atomically(&file, text.as_bytes());
+    let output = tool("node")
+        .arg("-e")
+        .arg(format!(
+            "JSON.parse(require('fs').readFileSync({:?}, 'utf8'))",
+            file.to_string_lossy()
+        ))
+        .output()
+        .expect("running node");
+    assert!(
+        output.status.success(),
+        "not valid JSON:\n{}\n{text}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Decompiles a module to Rust, for tests that read the output rather than run
 /// it.
 pub fn decompile(wasm: &[u8]) -> String {
