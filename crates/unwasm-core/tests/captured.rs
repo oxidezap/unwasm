@@ -109,7 +109,7 @@ fn a_capture_compiles_in_the_split_layout() {
     };
     let module = Module::parse(&bytes).expect("it parses");
     let layout = codegen::Layout::Split {
-        functions_per_file: 64,
+        lines_per_file: 400,
     };
     let files = codegen::generate_files(&module, layout).expect("it generates");
     assert!(

@@ -19,8 +19,9 @@ usage:
   -o <out>       a path ending in .rs writes one file; any other path is a
                  directory, written as mod.rs plus part0.rs, part1.rs, …
                  Without -o, the Rust goes to stdout.
-  --split <n>    functions per part file. Implies a directory. Without it, a
-                 directory gets the layout the module's size calls for.
+  --split <n>    roughly how many lines to put in each part file. Implies a
+                 directory. Without it, a directory gets the layout the
+                 module's size calls for.
 
 A large module wants the split: rustc partitions codegen units along module
 boundaries, so half a million lines in one file becomes one enormous unit.
@@ -91,7 +92,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
         codegen::Layout::Single
     } else {
         match split {
-            Some(functions_per_file) => codegen::Layout::Split { functions_per_file },
+            Some(lines_per_file) => codegen::Layout::Split { lines_per_file },
             None => codegen::Layout::for_module(&module),
         }
     };

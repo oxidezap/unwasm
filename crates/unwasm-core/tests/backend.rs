@@ -669,9 +669,7 @@ fn a_split_layout_behaves_exactly_like_a_single_file() {
         "split",
         &wasm,
         &calls,
-        unwasm_core::codegen::Layout::Split {
-            functions_per_file: 1,
-        },
+        unwasm_core::codegen::Layout::Split { lines_per_file: 1 },
     );
 }
 
@@ -687,23 +685,21 @@ fn a_split_layout_produces_a_mod_file_and_one_part_per_group() {
             (func (export "e") (result i32) i32.const 5))"#,
     );
     let module = Module::parse(&wasm).expect("valid");
-    let files = codegen::generate_files(
-        &module,
-        codegen::Layout::Split {
-            functions_per_file: 2,
-        },
-    )
-    .expect("generating");
+    // A budget below the size of a single function puts each in its own file.
+    let files = codegen::generate_files(&module, codegen::Layout::Split { lines_per_file: 2 })
+        .expect("generating");
 
-    // Five functions in groups of two: three parts, the last one short.
     let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
-    assert_eq!(names, ["mod.rs", "part0.rs", "part1.rs", "part2.rs"]);
+    assert_eq!(
+        names,
+        [
+            "mod.rs", "part0.rs", "part1.rs", "part2.rs", "part3.rs", "part4.rs"
+        ],
+        "five functions, none of which fits with another"
+    );
 
     let root = &files[0].contents;
-    assert!(
-        root.contains("mod part0;\nmod part1;\nmod part2;"),
-        "{root}"
-    );
+    assert!(root.contains("mod part0;\nmod part1;\n"), "{root}");
     assert!(root.contains("pub fn a("), "the exports stay in mod.rs");
     assert!(!root.contains("pub(crate) fn f0("), "the functions do not");
 
@@ -741,16 +737,24 @@ fn the_layout_a_module_gets_by_default_follows_its_size() {
     assert_eq!(
         codegen::Layout::for_module(&module),
         codegen::Layout::Split {
-            functions_per_file: codegen::Layout::FUNCTIONS_PER_FILE
+            lines_per_file: codegen::Layout::LINES_PER_FILE
         }
     );
     let files =
         codegen::generate_files(&module, codegen::Layout::for_module(&module)).expect("generating");
-    assert_eq!(
-        files.len(),
-        600usize.div_ceil(codegen::Layout::FUNCTIONS_PER_FILE) + 1,
-        "one mod.rs plus a part per group"
-    );
+    assert!(files.len() > 1, "a large module splits");
+    // No part is much over the budget — that is what the budget is for. The
+    // exception is a single function larger than the whole budget, which
+    // cannot be divided any further.
+    for part in &files[1..] {
+        let lines = part.contents.lines().count();
+        let functions = part.contents.matches("pub(crate) fn f").count();
+        assert!(
+            lines <= codegen::Layout::LINES_PER_FILE * 2 || functions == 1,
+            "{} has {lines} lines across {functions} functions",
+            part.name
+        );
+    }
 }
 
 #[test]
@@ -763,13 +767,8 @@ fn a_zero_sized_split_still_produces_one_function_per_file() {
                  (func (export \"b\") (result i32) i32.const 2))",
     );
     let module = Module::parse(&wasm).expect("valid");
-    let files = codegen::generate_files(
-        &module,
-        codegen::Layout::Split {
-            functions_per_file: 0,
-        },
-    )
-    .expect("generating");
+    let files = codegen::generate_files(&module, codegen::Layout::Split { lines_per_file: 0 })
+        .expect("generating");
     assert_eq!(files.len(), 3, "mod.rs plus one part per function");
 }
 
@@ -777,13 +776,8 @@ fn a_zero_sized_split_still_produces_one_function_per_file() {
 fn a_module_with_no_functions_splits_into_just_a_mod_file() {
     let wasm = common::assemble("split-empty", "(module (memory (export \"memory\") 1))");
     let module = Module::parse(&wasm).expect("valid");
-    let files = codegen::generate_files(
-        &module,
-        codegen::Layout::Split {
-            functions_per_file: 4,
-        },
-    )
-    .expect("generating");
+    let files = codegen::generate_files(&module, codegen::Layout::Split { lines_per_file: 4 })
+        .expect("generating");
     assert_eq!(files.len(), 1);
     assert!(!files[0].contents.contains("mod part"));
 }

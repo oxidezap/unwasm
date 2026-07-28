@@ -96,13 +96,21 @@ pub enum Layout {
     /// makes a multi-megabyte module compile in a reasonable time — see the
     /// measurement in `README.md`.
     Split {
-        /// Functions per file.
-        functions_per_file: usize,
+        /// Roughly how many lines to put in each file.
+        ///
+        /// Lines rather than functions, because functions are not the same
+        /// size. The VoIP module has one function that decompiles to 453
+        /// thousand lines and another to 158 thousand; sixteen functions per
+        /// file put them in a part of 1.1 million lines, which is the single
+        /// enormous compilation unit the split exists to avoid. A function
+        /// larger than the budget gets a file to itself — that is as far as
+        /// this can go, since a function cannot span modules.
+        lines_per_file: usize,
     },
 }
 
 impl Layout {
-    /// Functions per file when a module is large enough to want splitting.
+    /// Lines per file when a module is large enough to want splitting.
     ///
     /// Chosen by measurement, not by taste. The 2.0 MiB capture — 3055
     /// functions, 655k lines — compiled by rustc:
@@ -115,12 +123,10 @@ impl Layout {
     /// | 16             | 192   | 25.7s    |
     /// | 4              | 764   | 10.4s    |
     ///
-    /// Sixteen is where the curve flattens against something a person still has
-    /// to navigate: it is 53× faster than one file, and going four times finer
-    /// buys only another 2.5× for four times the files. The system time is the
-    /// tell — 1102s for one file against 12.6s for 192, which is a single
-    /// enormous codegen unit thrashing rather than any real work.
-    pub const FUNCTIONS_PER_FILE: usize = 16;
+    /// That run averaged about 3400 lines per file at its sweet spot, which is
+    /// where this budget comes from. It is stated in lines because the same
+    /// count of functions can be any size at all.
+    pub const LINES_PER_FILE: usize = 4000;
 
     /// Below this, one file. A 478-function capture compiles in about 2.5
     /// seconds whole, and one file is easier to read and to drop into a
@@ -134,7 +140,7 @@ impl Layout {
             Self::Single
         } else {
             Self::Split {
-                functions_per_file: Self::FUNCTIONS_PER_FILE,
+                lines_per_file: Self::LINES_PER_FILE,
             }
         }
     }
@@ -449,7 +455,7 @@ impl<'a> Generator<'a> {
     /// gives rustc the module boundaries it partitions codegen units along.
     fn functions(&mut self) -> Result<()> {
         let import_count = self.module.func_imports.len() as u32;
-        let per_file = match self.layout {
+        let budget = match self.layout {
             Layout::Single => {
                 for (at, func) in self.module.funcs.iter().enumerate() {
                     let index = import_count + at as u32;
@@ -459,36 +465,49 @@ impl<'a> Generator<'a> {
                 self.out.push_str("}\n\n");
                 return Ok(());
             }
-            // A zero would be an infinite number of empty files; one function
-            // per file is the smallest thing that can be meant.
-            Layout::Split { functions_per_file } => functions_per_file.max(1),
+            // A zero budget would put every function in a file of its own, and
+            // that is the most it can mean.
+            Layout::Split { lines_per_file } => lines_per_file.max(1),
         };
 
         self.out.push_str("}\n\n");
-        let part_count = self.module.funcs.len().div_ceil(per_file);
-        for part in 0..part_count {
+
+        // Fill each part up to the budget. A function larger than the whole
+        // budget still goes in one piece — a function cannot span modules — so
+        // it lands in a file of its own rather than dragging fifteen others
+        // into a million-line compilation unit with it.
+        let mut current = String::new();
+        let mut lines = 0usize;
+        for (at, func) in self.module.funcs.iter().enumerate() {
+            let index = import_count + at as u32;
+            let body = self.function(index, func)?;
+            let body_lines = body.lines().count();
+            if lines > 0 && lines + body_lines > budget {
+                self.push_part(std::mem::take(&mut current));
+                lines = 0;
+            }
+            current.push_str(&body);
+            lines += body_lines;
+        }
+        if !current.is_empty() {
+            self.push_part(current);
+        }
+
+        for part in 0..self.parts.len() {
             let _ = writeln!(self.out, "mod part{part};");
         }
         self.out.push('\n');
-
-        for part in 0..part_count {
-            let mut contents = String::new();
-            contents.push_str(PART_HEADER);
-            contents.push_str("use super::*;\n\nimpl<H: Imports> Instance<H> {\n");
-            let first = part * per_file;
-            let last = ((part + 1) * per_file).min(self.module.funcs.len());
-            for at in first..last {
-                let index = import_count + at as u32;
-                let body = self.function(index, &self.module.funcs[at])?;
-                contents.push_str(&body);
-            }
-            contents.push_str("}\n");
-            self.parts.push(GeneratedFile {
-                name: format!("part{part}.rs"),
-                contents,
-            });
-        }
         Ok(())
+    }
+
+    fn push_part(&mut self, functions: String) {
+        let mut contents = String::new();
+        contents.push_str(PART_HEADER);
+        contents.push_str("use super::*;\n\nimpl<H: Imports> Instance<H> {\n");
+        contents.push_str(&functions);
+        contents.push_str("}\n");
+        let name = format!("part{}.rs", self.parts.len());
+        self.parts.push(GeneratedFile { name, contents });
     }
 
     /// The doc comment a global carries when the analysis recognised it.
