@@ -512,3 +512,115 @@ fn the_skeleton_does_not_warn_about_the_arguments_it_does_not_use() {
         "{skeleton}"
     );
 }
+
+#[test]
+fn defaults_answer_what_nothing_can_and_say_that_they_did() {
+    // A stub returning zero is a hypothesis. This does not make it safe — it
+    // makes it visible: the run comes with the list of what it rested on.
+    let wasm = common::assemble("host-defaults", SAMPLE);
+    let module = Module::parse(&wasm).expect("valid");
+
+    let strict = codegen::generate_host(&module).expect("generates");
+    assert!(
+        strict.contains(r#"todo!("env::on_call_event")"#),
+        "{strict}"
+    );
+
+    let lenient = codegen::generate_host_with(&module, true).expect("generates");
+    let body = trait_body(&lenient).to_string();
+    assert!(!body.contains("todo!(\""), "{body}");
+    assert!(
+        body.contains(
+            r#"self.unanswered.record("env::on_call_event", &[i64::from(p0), i64::from(p1)]);"#
+        ),
+        "the name and the arguments it was given:\n{body}"
+    );
+    // One that returns something answers with the zero of its type, after
+    // recording — not instead of it.
+    assert!(
+        body.contains(r#"record("env::_embind_register_class""#),
+        "{body}"
+    );
+    assert!(
+        lenient.contains("pub unanswered: runtime::Unanswered"),
+        "and the host has somewhere to keep it:\n{lenient}"
+    );
+}
+
+#[test]
+fn a_threaded_module_records_its_defaults_through_the_lock() {
+    // The record is shared like the rest of a threaded host's state: a thread
+    // that fell back to a default has to tell the thread that reads the list.
+    // Threaded means the module creates threads — a shared memory alone does
+    // not, and asking every host of one to be `Clone + Send` would be a
+    // constraint nothing needs.
+    let wasm = common::assemble(
+        "host-defaults-threaded",
+        r#"(module
+            (import "env" "__pthread_create_js"
+                (func (param i32 i32 i32 i32) (result i32)))
+            (import "env" "memory" (memory 1 4 shared))
+            (import "env" "callback" (func (param i32)))
+            (global $sp (export "__stack_pointer") (mut i32) (i32.const 65536))
+            (type $entry (func (param i32) (result i32)))
+            (func (export "_emscripten_thread_init") (param i32 i32 i32 i32 i32 i32))
+            (func (type $entry) local.get 0)
+            (func (export "go") i32.const 1 call 1)
+            (table 1 funcref)
+            (elem (i32.const 0) func 3))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let host = codegen::generate_host_with(&module, true).expect("generates");
+    assert!(
+        host.contains(
+            r#"self.unanswered.lock().unwrap_or_else(|held| held.into_inner()).record("env::callback""#
+        ),
+        "{host}"
+    );
+    assert!(
+        host.contains("pub unanswered: std::sync::Arc<std::sync::Mutex<runtime::Unanswered>>"),
+        "{host}"
+    );
+}
+
+#[test]
+fn a_run_on_defaults_reports_what_it_rested_on() {
+    let wasm = common::assemble(
+        "host-defaults-run",
+        r#"(module
+            (import "env" "ask" (func $ask (param i32) (result i32)))
+            (import "env" "tell" (func $tell (param i32 i32)))
+            (memory (export "memory") 1)
+            (func (export "go") (result i32)
+                i32.const 7 i32.const 8 call $tell
+                i32.const 9 i32.const 10 call $tell
+                i32.const 3 call $ask))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let generated = codegen::generate(&module).expect("generates");
+    let host = codegen::generate_host_with(&module, true).expect("generates");
+
+    const DRIVER: &str = r#"
+mod generated;
+mod host;
+fn main() {
+    let mut instance = generated::Instance::with_host(host::Host::default());
+    println!("go returned {}", instance.go());
+    print!("{}", instance.host.unanswered.report());
+}
+"#;
+    let output = common::run_with_host("host-defaults-run", &generated, &host, DRIVER);
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines[0], "go returned 0",
+        "the default is the zero of the type, and it is a hypothesis"
+    );
+    assert_eq!(
+        lines[1],
+        "2 imports were answered with a default rather than an answer:"
+    );
+    // In the order they were reached, with the arguments of the first call —
+    // which is usually the story.
+    assert_eq!(lines[2], "  env::tell  2x, first (7, 8)");
+    assert_eq!(lines[3], "  env::ask  1x, first (3)");
+}

@@ -819,6 +819,73 @@ impl Emscripten {
     }
 }
 
+/// The imports a run answered with a default rather than with an answer.
+///
+/// A stub that returns zero is a hypothesis — the module cannot tell it from a
+/// real answer, and neither can a reader. This does not make it safe; it makes
+/// it *visible*. Every default is counted and the arguments of the first call
+/// are kept, so a run that produced something interesting comes with the list
+/// of assumptions it rests on, and the reader can decide whether the
+/// interesting thing survives them.
+///
+/// The rule stays what it was: `unwasm host` writes `todo!()` unless asked for
+/// this. What this is for is the case where a path has to be *reached* before
+/// it can be studied, and the imports in the way are ones nobody outside the
+/// application can answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Unanswered {
+    /// Each import that was answered with a default: how many times, and the
+    /// arguments it was given the first time.
+    pub calls: std::collections::BTreeMap<String, (usize, Vec<i64>)>,
+    /// The order they were first reached in, which is usually the story.
+    pub order: Vec<String>,
+}
+
+impl Unanswered {
+    /// Records one call answered with a default.
+    pub fn record(&mut self, import: &str, arguments: &[i64]) {
+        match self.calls.get_mut(import) {
+            Some((count, _)) => *count += 1,
+            None => {
+                self.calls
+                    .insert(import.to_string(), (1, arguments.to_vec()));
+                self.order.push(import.to_string());
+            }
+        }
+    }
+
+    /// Whether anything was.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.calls.is_empty()
+    }
+
+    /// What a run rested on, in the order it reached them.
+    ///
+    /// Print this beside any result from such a run. A conclusion drawn under
+    /// forty invented answers is a conclusion about forty invented answers.
+    #[must_use]
+    pub fn report(&self) -> String {
+        if self.calls.is_empty() {
+            return "nothing was answered with a default\n".to_string();
+        }
+        let mut out = format!(
+            "{} imports were answered with a default rather than an answer:\n",
+            self.calls.len()
+        );
+        for import in &self.order {
+            if let Some((count, arguments)) = self.calls.get(import) {
+                let shown: Vec<String> = arguments.iter().map(i64::to_string).collect();
+                out.push_str(&format!(
+                    "  {import}  {count}x, first ({})\n",
+                    shown.join(", ")
+                ));
+            }
+        }
+        out
+    }
+}
+
 // ---- embind, and emval ----
 
 /// One `_embind_register_*` call, as it happened.
@@ -1574,6 +1641,33 @@ mod tests {
         assert_ne!(first, second, "two files are not one file");
         wasi.stat_path(&mut caller, 64, 256);
         assert_eq!(caller.read_i32(256 + 88), first, "and one file is one file");
+    }
+
+    #[test]
+    fn a_default_is_counted_the_first_time_and_every_time() {
+        let mut unanswered = Unanswered::default();
+        assert!(unanswered.is_empty());
+        assert_eq!(unanswered.report(), "nothing was answered with a default\n");
+
+        unanswered.record("env::tell", &[7, 8]);
+        unanswered.record("env::ask", &[3]);
+        // The arguments kept are the *first* call's: the tenth is rarely the
+        // one that explains anything.
+        unanswered.record("env::tell", &[99, 99]);
+
+        assert!(!unanswered.is_empty());
+        assert_eq!(unanswered.calls["env::tell"], (2, vec![7, 8]));
+        let report = unanswered.report();
+        assert!(
+            report.starts_with("2 imports were answered with a default"),
+            "{report}"
+        );
+        // In the order they were reached, which is usually the story.
+        let tell = report.find("env::tell").expect("present");
+        let ask = report.find("env::ask").expect("present");
+        assert!(tell < ask, "{report}");
+        assert!(report.contains("env::tell  2x, first (7, 8)"), "{report}");
+        assert!(report.contains("env::ask  1x, first (3)"), "{report}");
     }
 
     #[test]

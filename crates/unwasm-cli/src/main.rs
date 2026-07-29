@@ -15,7 +15,7 @@ unwasm — a WebAssembly decompiler whose output compiles
 
 usage:
   unwasm decompile <module.wasm> [-o <out>] [--split <n>] [--only <indices>]
-  unwasm host      <module.wasm> [-o <host.rs>]
+  unwasm host      <module.wasm> [-o <host.rs>] [--defaults]
   unwasm table     <module.wasm> [--type <signature>]
   unwasm calls     <module.wasm> <index>
   unwasm signatures <module.wasm> [-o <sigs.txt>]
@@ -72,6 +72,11 @@ nine is guessing.
 length so nothing else in the module moves. The SLEB arithmetic is where a
 hand-written patch goes wrong — `775533` is `ed aa 2f`, and assuming `ad aa 2f`
 finds nothing, which looks exactly like the code having changed.
+
+`host --defaults` answers what nothing here can with the zero of its type and
+records that it did. It is for *reaching* a path — the imports in the way are
+often ones only the application can answer — and `Host::unanswered.report()`
+prints the list any result from such a run has to be read against.
 
 `frames --outside` lists the functions whose stores land past the end of their
 own stack frame — an overrun of a local array writes into the caller's frame,
@@ -321,6 +326,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
 }
 
 fn host(arguments: &[String]) -> Result<String, String> {
+    let mut defaults = false;
     let path = arguments.first().ok_or("host needs a module path")?;
     let mut destination = None;
     let mut rest = arguments[1..].iter();
@@ -329,12 +335,14 @@ fn host(arguments: &[String]) -> Result<String, String> {
             "-o" | "--output" => {
                 destination = Some(rest.next().ok_or("-o needs a path")?.clone());
             }
+            "--defaults" => defaults = true,
             other => return Err(format!("unexpected argument `{other}`")),
         }
     }
 
     let module = read(path)?;
-    let skeleton = codegen::generate_host(&module).map_err(|error| error.to_string())?;
+    let skeleton =
+        codegen::generate_host_with(&module, defaults).map_err(|error| error.to_string())?;
     match destination {
         Some(destination) => {
             std::fs::write(&destination, &skeleton)

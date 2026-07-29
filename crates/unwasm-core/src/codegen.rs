@@ -415,6 +415,26 @@ fn known_registration(field: &str, ty: &crate::module::FuncType) -> Option<Strin
 ///
 /// As [`generate`].
 pub fn generate_host(module: &Module) -> Result<String> {
+    generate_host_with(module, false)
+}
+
+/// Generates a host skeleton, optionally answering the rest with defaults.
+///
+/// With `defaults`, an import nothing here can answer returns the zero of its
+/// result type and records that it did, rather than stopping the run. The rule
+/// this bends is the project's own — a stub returning zero is a hypothesis —
+/// and it bends it in the one way that keeps it honest: the hypothesis is
+/// counted, its first arguments are kept, and `Host::unanswered.report()`
+/// prints the list a result has to be read against.
+///
+/// It is for reaching a path, not for studying one. A run that got somewhere
+/// interesting under forty invented answers has to be repeated with the ones
+/// that mattered answered properly.
+///
+/// # Errors
+///
+/// As [`generate`].
+pub fn generate_host_with(module: &Module, defaults: bool) -> Result<String> {
     let analysis = analysis::analyse(module);
     // A threaded module hands its imports the memory every thread shares, and
     // a host written for the other one would be reading a memory the guest is
@@ -486,6 +506,8 @@ pub fn generate_host(module: &Module) -> Result<String> {
             "    pub emscripten: std::sync::Arc<std::sync::Mutex<runtime::Emscripten>>,\n",
             "    /// What embind registered, and what emval is holding.\n",
             "    pub embind: std::sync::Arc<std::sync::Mutex<runtime::Embind>>,\n",
+            "    /// Imports answered with a default rather than an answer.\n",
+            "    pub unanswered: std::sync::Arc<std::sync::Mutex<runtime::Unanswered>>,\n",
             "}\n\n",
         ));
     } else {
@@ -499,6 +521,8 @@ pub fn generate_host(module: &Module) -> Result<String> {
             "    /// Emscripten's runtime state.\n    pub emscripten: runtime::Emscripten,\n",
             "    /// What embind registered, and what emval is holding.\n",
             "    pub embind: runtime::Embind,\n",
+            "    /// Imports answered with a default rather than an answer.\n",
+            "    pub unanswered: runtime::Unanswered,\n",
             "}\n\n",
         ));
     }
@@ -568,6 +592,37 @@ pub fn generate_host(module: &Module) -> Result<String> {
             });
             let (name, body) = match body {
                 Some(body) => ("caller", body),
+                // Answering with the zero of the type, and recording that it
+                // did: the hypothesis is not hidden, it is counted.
+                None if defaults => {
+                    let arguments: Vec<String> = ty
+                        .map(|ty| {
+                            (0..ty.params.len())
+                                .map(|at| format!("i64::from(p{at})"))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let lock = if threaded {
+                        ".lock().unwrap_or_else(|held| held.into_inner())"
+                    } else {
+                        ""
+                    };
+                    let record = format!(
+                        "self.unanswered{lock}.record(\"{}::{}\", &[{}]);",
+                        import.module,
+                        import.field,
+                        arguments.join(", ")
+                    );
+                    let zero = ty
+                        .and_then(|ty| ty.results.first().map(|result| result.zero().to_string()))
+                        .unwrap_or_default();
+                    let body = if zero.is_empty() {
+                        record
+                    } else {
+                        format!("{record}\n        {zero}")
+                    };
+                    ("_caller", body)
+                }
                 None => (
                     "_caller",
                     format!("todo!(\"{}::{}\")", import.module, import.field),
