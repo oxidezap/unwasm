@@ -591,6 +591,9 @@ pub struct SharedMemory {
     atomics: std::sync::Arc<std::sync::Mutex<()>>,
     /// Threads parked in `memory.atomic.wait`.
     waiters: std::sync::Arc<Waiters>,
+    /// How many grows were refused by the reservation rather than by the
+    /// module's own declared maximum.
+    refused: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Watchpoints, shared so a hit from any thread lands in one list.
     watch: std::sync::Arc<std::sync::Mutex<Watchpoints>>,
 }
@@ -644,6 +647,7 @@ impl SharedMemory {
             max_pages,
             atomics: std::sync::Arc::default(),
             waiters: std::sync::Arc::default(),
+            refused: std::sync::Arc::default(),
             watch: std::sync::Arc::default(),
         }
     }
@@ -652,6 +656,18 @@ impl SharedMemory {
     #[must_use]
     pub fn reserved_pages(&self) -> u32 {
         (self.cells.len() / PAGE_SIZE) as u32
+    }
+
+    /// How many grows this host refused that the module's own maximum allowed.
+    ///
+    /// A guest sees one `-1` and cannot tell "the module said this is as big
+    /// as it gets" from "the host reserved less than that". The first is the
+    /// program; the second is a setting, and a `malloc` that fails for it is a
+    /// run to throw away — so ask this before believing what such a run did.
+    /// `Instance::with_host_and_reservation` is where to change it.
+    #[must_use]
+    pub fn grows_refused_by_the_reservation(&self) -> u32 {
+        self.refused.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// `memory.size`.
@@ -668,12 +684,21 @@ impl SharedMemory {
     /// and one page appear — which a guest allocator turns into two allocations
     /// at the same address.
     pub fn grow(&mut self, delta_pages: u32) -> i32 {
-        let ceiling =
-            u64::from(self.max_pages.unwrap_or(65536)).min(u64::from(self.reserved_pages()));
+        let declared = u64::from(self.max_pages.unwrap_or(65536));
+        let reserved = u64::from(self.reserved_pages());
         let mut old = self.pages.load(std::sync::atomic::Ordering::Acquire);
         loop {
             let new = u64::from(old) + u64::from(delta_pages);
-            if new > ceiling {
+            if new > declared.min(reserved) {
+                // Two refusals that look identical to the guest and are not
+                // the same thing at all. Past what the module declared is the
+                // module's own limit; past the reservation is this host's, and
+                // a guest whose `malloc` fails for that reason would otherwise
+                // have no way to say so.
+                if new <= declared {
+                    self.refused
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 return -1;
             }
             match self.pages.compare_exchange_weak(
@@ -1931,6 +1956,32 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "and within its own bound rather than being restarted: {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn a_grow_the_host_refused_is_not_a_grow_the_module_refused() {
+        // The guest sees one -1 either way. A host that reserved too little
+        // has to be able to tell, or a run whose `malloc` failed for that
+        // reason reads as a run that found something out.
+        let mut memory = SharedMemory::new(1, Some(64), 4);
+        assert_eq!(memory.grow(2), 1);
+        assert_eq!(memory.grows_refused_by_the_reservation(), 0);
+
+        // Past the reservation, inside what the module declared: the host's
+        // limit, and counted.
+        assert_eq!(memory.grow(8), -1);
+        assert_eq!(memory.grows_refused_by_the_reservation(), 1);
+
+        // Past what the module declared: the module's own limit, and not.
+        let mut small = SharedMemory::new(1, Some(2), 64);
+        assert_eq!(small.grow(8), -1);
+        assert_eq!(small.grows_refused_by_the_reservation(), 0);
+
+        // The count is shared, like everything else about this memory: a
+        // thread that hit the ceiling tells the thread that reads it.
+        let mut other = memory.clone();
+        assert_eq!(other.grow(8), -1);
+        assert_eq!(memory.grows_refused_by_the_reservation(), 2);
     }
 
     #[test]

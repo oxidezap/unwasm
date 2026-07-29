@@ -801,6 +801,14 @@ reallocated while other threads hold handles to it. The default is 64 MiB;
 `with_host_and_reservation` says otherwise, and growing past it returns `-1`,
 which the spec allows and which says exactly what happened.
 
+A thread needs a stack of its own, and that is the host's job: the globals are
+per instance, so `__stack_pointer` is the thread's own — but only if somebody
+sets it. Measured on an Emscripten `-pthread` build, four threads left on the
+module's initial stack pointer destroyed each other's frames completely (the
+worst came back with **0 of its 64 fields intact**); with 64 KiB each, every
+frame survived every round. `tests/emscripten.rs` asserts the second half,
+because "a race must happen" is not something a test can demand.
+
 The table is copied into each thread rather than shared, and that is not the
 divergence it looks like: this decompiler has no `table.set`, `table.grow`,
 `table.fill` or `table.copy`, and an opcode it does not model is refused by

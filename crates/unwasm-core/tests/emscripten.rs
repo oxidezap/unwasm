@@ -269,3 +269,145 @@ fn main() {
         "the guest's own libc formatted every one of those"
     );
 }
+
+/// The thread model, against the toolchain rather than against a fixture.
+///
+/// Everything about `SharedMemory` and `Instance::spawn` was tested with wat
+/// written by hand. This is a C program Emscripten compiled with `-pthread`:
+/// its atomics are the ones its own libc uses, its memory is the shared one
+/// the toolchain declares, and the threads are OS threads over one instance
+/// each — which is exactly what an Emscripten pthread is.
+///
+/// It does not use the guest's `pthread_create`: that is an import, and
+/// answering it needs a way back into the instance from a host. This drives
+/// the threads from the Rust side, which is the half that exists.
+#[test]
+#[ignore = "needs emcc"]
+fn threads_over_one_shared_memory_agree_with_the_toolchains_own_atomics() {
+    let wasm = compile_emscripten(
+        "em-threads",
+        r#"#include <stdatomic.h>
+           _Atomic int counter = 0;
+           __attribute__((export_name("bump")))
+           void bump(int times) {
+               for (int i = 0; i < times; i++) atomic_fetch_add(&counter, 1);
+           }
+           __attribute__((export_name("read")))
+           int read_counter(void) { return atomic_load(&counter); }
+           // A frame worth colliding over: an array the compiler must put in
+           // the shadow stack, written, left alone for a while, and checked.
+           __attribute__((export_name("frame_survives")))
+           int frame_survives(int seed, int spins) {
+               volatile int scratch[64];
+               for (int i = 0; i < 64; i++) scratch[i] = seed + i;
+               for (volatile int s = 0; s < spins; s++) { }
+               int intact = 0;
+               for (int i = 0; i < 64; i++) intact += (scratch[i] == seed + i);
+               return intact;
+           }
+        "#,
+        "c",
+        &["-O1", "-pthread"],
+    );
+    let module = Module::parse(&wasm).expect("the module decodes");
+    assert!(
+        module.memory.as_ref().is_some_and(|memory| memory.shared),
+        "`-pthread` gives a shared memory, which is what makes this a thread test"
+    );
+    let generated = codegen::generate(&module).expect("generates");
+    assert!(generated.contains("pub memory: rt::SharedMemory"), "shared");
+
+    const DRIVER: &str = r#"
+mod generated;
+fn main() {
+    let mut main_thread = generated::Instance::new();
+    // Each worker gets a stack of its own, 64 KiB apart. Leaving them all on
+    // the module's initial stack pointer is the bug this model exists to make
+    // visible: they would write over each other's frames.
+    let workers: Vec<_> = (0..4)
+        .map(|index| {
+            let mut worker = main_thread.spawn(generated::NoImports);
+            worker.g0_stack_pointer = 0x200000 + index * 0x10000;
+            std::thread::spawn(move || worker.bump(2000))
+        })
+        .collect();
+    for worker in workers {
+        worker.join().expect("each thread finishes");
+    }
+    println!("{}", main_thread.read());
+}
+"#;
+    let output = common::run_with_generated("em-threads", &generated, DRIVER);
+    assert_eq!(
+        output.trim(),
+        "8000",
+        "four threads, two thousand atomic increments each, through the \
+         toolchain's own `atomic_fetch_add` — nothing lost"
+    );
+}
+
+/// A thread needs its own stack, and this is what happens when it has one.
+///
+/// The globals are per instance and the memory is not, so a thread's
+/// `__stack_pointer` is its own — but only if somebody sets it. Left at the
+/// module's initial value every thread carves its frame out of the same bytes,
+/// and a local array in one is overwritten by another. That failure is
+/// non-deterministic, so what this asserts is the other side of it: with a
+/// stack each, a frame survives every time.
+#[test]
+#[ignore = "needs emcc"]
+fn a_thread_with_its_own_stack_keeps_its_frame() {
+    let wasm = compile_emscripten(
+        "em-threads",
+        r#"#include <stdatomic.h>
+           _Atomic int counter = 0;
+           __attribute__((export_name("bump")))
+           void bump(int times) {
+               for (int i = 0; i < times; i++) atomic_fetch_add(&counter, 1);
+           }
+           __attribute__((export_name("read")))
+           int read_counter(void) { return atomic_load(&counter); }
+           __attribute__((export_name("frame_survives")))
+           int frame_survives(int seed, int spins) {
+               volatile int scratch[64];
+               for (int i = 0; i < 64; i++) scratch[i] = seed + i;
+               for (volatile int s = 0; s < spins; s++) { }
+               int intact = 0;
+               for (int i = 0; i < 64; i++) intact += (scratch[i] == seed + i);
+               return intact;
+           }
+        "#,
+        "c",
+        &["-O1", "-pthread"],
+    );
+    let module = Module::parse(&wasm).expect("the module decodes");
+    let generated = codegen::generate(&module).expect("generates");
+
+    const DRIVER: &str = r#"
+mod generated;
+fn main() {
+    let main_thread = generated::Instance::new();
+    let mut worst = 64;
+    for round in 0..20 {
+        let workers: Vec<_> = (0..4)
+            .map(|index| {
+                let mut worker = main_thread.spawn(generated::NoImports);
+                // 64 KiB apart, which is more than this frame needs.
+                worker.g0_stack_pointer = 0x300000 + index * 0x10000;
+                std::thread::spawn(move || worker.frame_survives(round * 100 + index, 20000))
+            })
+            .collect();
+        for worker in workers {
+            worst = worst.min(worker.join().expect("each thread finishes"));
+        }
+    }
+    println!("{worst}");
+}
+"#;
+    let output = common::run_with_generated("em-threads-stack", &generated, DRIVER);
+    assert_eq!(
+        output.trim(),
+        "64",
+        "eighty frames, four at a time, none of them touched by another thread"
+    );
+}
