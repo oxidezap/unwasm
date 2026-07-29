@@ -340,6 +340,16 @@ fn known_import(field: &str, ty: &crate::module::FuncType) -> Option<&'static st
             "self.wasi.now_milliseconds"
         }
         ("_emscripten_get_now_is_monotonic", "->i") => "1",
+        // The clock, as C sees it. UTC throughout: the host supplies the time
+        // and nothing reads the machine's timezone, so a run does not depend
+        // on where it ran.
+        ("_localtime_js", "ji->i") | ("_gmtime_js", "ji->i") => "runtime::write_tm(caller, p1, p0)",
+        // Older builds return nothing from it.
+        ("_localtime_js", "ji->") | ("_gmtime_js", "ji->") => {
+            "let _ = runtime::write_tm(caller, p1, p0);"
+        }
+        ("_tzset_js", "iiii->") => "runtime::tzset(caller, p0, p1, p2, p3)",
+        ("_tzset_js", "iii->") => "runtime::tzset(caller, p0, p1, p2, 0)",
         ("emscripten_num_logical_cores", "->i") => "self.emscripten.cores",
         ("emscripten_console_error", "i->") => {
             "self.emscripten.console_error(caller, &mut self.wasi, p0)"

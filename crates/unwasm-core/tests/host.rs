@@ -437,6 +437,10 @@ fn the_whole_mechanical_set_is_answered_with_the_real_signatures() {
             (import "env" "__syscall_lstat64" (func (param i32 i32) (result i32)))
             (import "env" "__syscall_fstat64" (func (param i32 i32) (result i32)))
             (import "env" "__syscall_newfstatat" (func (param i32 i32 i32 i32) (result i32)))
+            (import "env" "_localtime_js" (func (param i64 i32)))
+            (import "env" "_gmtime_js" (func (param i64 i32) (result i32)))
+            (import "env" "_tzset_js" (func (param i32 i32 i32 i32)))
+            (import "other" "_tzset_js" (func (param i32 i32 i32)))
             (import "env" "_emval_decref" (func (param i32)))
             (import "env" "_emval_take_value" (func (param i32 i32) (result i32)))
             (import "env" "on_frame" (func (param f32 f64)))
@@ -489,6 +493,11 @@ fn the_whole_mechanical_set_is_answered_with_the_real_signatures() {
         "self.wasi.stat_path(caller, p0, p1)",
         "self.wasi.stat_fd(caller, p0, p1)",
         "self.wasi.stat_path(caller, p1, p2)",
+        "let _ = runtime::write_tm(caller, p1, p0);",
+        "runtime::write_tm(caller, p1, p0)",
+        "runtime::tzset(caller, p0, p1, p2, p3)",
+        // The older three-argument spelling, which has no second name.
+        "runtime::tzset(caller, p0, p1, p2, 0)",
         "self.wasi.unlinkat(caller, p1)",
         "-runtime::errno::NOTTY",
         "self.embind.decref(p0)",

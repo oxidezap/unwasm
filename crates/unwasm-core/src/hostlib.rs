@@ -886,6 +886,95 @@ impl Unanswered {
     }
 }
 
+// ---- the clock, as C sees it ----
+
+/// `struct tm`, at the offsets Emscripten's own `C_STRUCTS.tm` gives.
+///
+/// 44 bytes: seconds at 0, then minute, hour, day, month, year, weekday, day
+/// of the year, `isdst` at 32 and `gmtoff` at 36. Like `struct stat`, this is
+/// a layout rather than something the wasm says, and it is the only kind of
+/// thing in this file that a different toolchain could move.
+///
+/// Everything is UTC. The host supplies the clock and nothing here reads the
+/// machine's — a run whose result depends on which timezone it happened to be
+/// in is a run nobody can repeat.
+pub fn write_tm<M: rt::Access>(caller: &mut rt::Caller<'_, M>, at: i32, seconds: i64) -> i32 {
+    let days = seconds.div_euclid(86_400);
+    let rest = seconds.rem_euclid(86_400);
+    let (year, month, day, yday) = civil_from_days(days);
+
+    caller.write(at, &[0u8; 44]);
+    caller.write_i32(at, (rest % 60) as i32); // tm_sec
+    caller.write_i32(at + 4, ((rest / 60) % 60) as i32); // tm_min
+    caller.write_i32(at + 8, (rest / 3600) as i32); // tm_hour
+    caller.write_i32(at + 12, day); // tm_mday
+    caller.write_i32(at + 16, month - 1); // tm_mon, zero-based
+    caller.write_i32(at + 20, year - 1900); // tm_year
+    // 1970-01-01 was a Thursday, which is what anchors the weekday.
+    caller.write_i32(at + 24, (days + 4).rem_euclid(7) as i32); // tm_wday
+    caller.write_i32(at + 28, yday); // tm_yday
+    caller.write_i32(at + 32, 0); // tm_isdst: UTC has none
+    caller.write_i32(at + 36, 0); // tm_gmtoff
+    0
+}
+
+/// The civil date of a day count from 1970-01-01, and the day of its year.
+///
+/// Howard Hinnant's algorithm, which is the one every C library uses and which
+/// is exact for every year a `time_t` can hold — no month tables, no leap-year
+/// special cases to get wrong.
+fn civil_from_days(days: i64) -> (i32, i32, i32, i32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    // The day of the year, counted from the first of January of that year.
+    let january_first = days_from_civil(year, 1, 1);
+    (
+        year as i32,
+        month as i32,
+        day as i32,
+        (days - january_first) as i32,
+    )
+}
+
+/// The inverse, for the one thing the day-of-year needs.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let yoe = year - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// `_tzset_js(timezone, daylight, std_name, dst_name)`.
+///
+/// UTC, for the same reason `write_tm` is: the host supplies the clock, and a
+/// timezone read from the machine makes a run depend on where it ran.
+pub fn tzset<M: rt::Access>(
+    caller: &mut rt::Caller<'_, M>,
+    timezone: i32,
+    daylight: i32,
+    std_name: i32,
+    dst_name: i32,
+) {
+    caller.write_i32(timezone, 0);
+    caller.write_i32(daylight, 0);
+    for name in [std_name, dst_name] {
+        if name != 0 {
+            caller.write(name, b"UTC\0");
+        }
+    }
+}
+
 // ---- embind, and emval ----
 
 /// One `_embind_register_*` call, as it happened.
@@ -1558,6 +1647,84 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_time_becomes_the_struct_c_expects() {
+        let mut memory = memory();
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
+        // 2026-07-28 00:28:16 UTC, a Tuesday and the 209th day of the year.
+        let seconds = 1_785_198_496;
+        assert_eq!(write_tm(&mut caller, 256, seconds), 0);
+        assert_eq!(caller.read_i32(256), 16, "tm_sec");
+        assert_eq!(caller.read_i32(256 + 4), 28, "tm_min");
+        assert_eq!(caller.read_i32(256 + 8), 0, "tm_hour");
+        assert_eq!(caller.read_i32(256 + 12), 28, "tm_mday");
+        assert_eq!(caller.read_i32(256 + 16), 6, "tm_mon is zero-based");
+        assert_eq!(caller.read_i32(256 + 20), 126, "tm_year is since 1900");
+        assert_eq!(caller.read_i32(256 + 24), 2, "tm_wday: Tuesday");
+        assert_eq!(caller.read_i32(256 + 28), 208, "tm_yday, from zero");
+        assert_eq!(caller.read_i32(256 + 32), 0, "UTC has no daylight saving");
+        assert_eq!(caller.read_i32(256 + 36), 0, "and no offset");
+    }
+
+    #[test]
+    fn the_epoch_and_the_dates_around_it_are_right() {
+        let mut memory = memory();
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
+        // The epoch itself: a Thursday, which is what anchors every weekday.
+        write_tm(&mut caller, 0, 0);
+        assert_eq!(caller.read_i32(20), 70, "1970");
+        assert_eq!(caller.read_i32(12), 1, "the first");
+        assert_eq!(caller.read_i32(24), 4, "a Thursday");
+        assert_eq!(caller.read_i32(28), 0, "day zero of the year");
+
+        // A second before it, which is where a naive division goes wrong.
+        write_tm(&mut caller, 64, -1);
+        assert_eq!(caller.read_i32(64 + 20), 69, "1969");
+        assert_eq!(caller.read_i32(64 + 16), 11, "December");
+        assert_eq!(caller.read_i32(64 + 12), 31);
+        assert_eq!(caller.read_i32(64 + 8), 23, "23:59:59");
+        assert_eq!(caller.read_i32(64 + 4), 59);
+        assert_eq!(caller.read_i32(64), 59);
+
+        // The 29th of February in a leap year, and the day after.
+        write_tm(&mut caller, 128, 1_709_164_800);
+        assert_eq!(caller.read_i32(128 + 12), 29);
+        assert_eq!(caller.read_i32(128 + 16), 1, "February");
+        assert_eq!(caller.read_i32(128 + 28), 59, "the 60th day");
+        write_tm(&mut caller, 192, 1_709_164_800 + 86_400);
+        assert_eq!(caller.read_i32(192 + 12), 1);
+        assert_eq!(caller.read_i32(192 + 16), 2, "March");
+
+        // And a century year that is not a leap year, which is the case a
+        // simpler algorithm gets wrong: 2100-03-01.
+        write_tm(&mut caller, 256, 4_107_542_400);
+        assert_eq!(caller.read_i32(256 + 20), 200, "2100");
+        assert_eq!(caller.read_i32(256 + 16), 2, "March");
+        assert_eq!(caller.read_i32(256 + 12), 1);
+    }
+
+    #[test]
+    fn tzset_says_utc_rather_than_wherever_this_ran() {
+        let mut memory = memory();
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
+        caller.write(64, b"xxxx");
+        caller.write(96, b"xxxx");
+        tzset(&mut caller, 0, 4, 64, 96);
+        assert_eq!(caller.read_i32(0), 0, "no offset from UTC");
+        assert_eq!(caller.read_i32(4), 0, "and no daylight saving");
+        assert_eq!(caller.cstring(64), b"UTC");
+        assert_eq!(caller.cstring(96), b"UTC");
+        // A build that passes no second name gets nothing written at 0.
+        tzset(&mut caller, 0, 4, 64, 0);
+        assert_eq!(caller.cstring(64), b"UTC");
     }
 
     #[test]
