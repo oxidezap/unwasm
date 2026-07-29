@@ -484,3 +484,70 @@ fn static_memory_is_read_out_of_a_placed_segment_too() {
         Some("std::string placed_call(std::string)")
     );
 }
+
+/// Registered, then called — from outside, through what the registration said.
+///
+/// This is the whole point of reading the registrations: a module built with
+/// embind exports almost nothing directly, and what it does export is the
+/// bindings' own machinery. The API it means to publish is a list of table
+/// slots, and this is that list being used.
+#[test]
+fn something_the_module_registers_can_then_be_called() {
+    let wasm = common::assemble(
+        "embind-call",
+        r#"(module
+            (import "env" "_embind_register_function"
+                (func $register (param i32 i32 i32 i32 i32 i32 i32 i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 64) "doubler\00")
+            (type $invoker (func (param i32 i32) (result i32)))
+            (type $target (func (param i32) (result i32)))
+            ;; What embind generates: an invoker that takes the function
+            ;; pointer and the arguments, and calls through the table.
+            (func $invoke (type $invoker)
+                local.get 1 local.get 0 call_indirect (type $target))
+            (func $double (type $target) local.get 0 i32.const 2 i32.mul)
+            (func (export "register")
+                i32.const 64   ;; name
+                i32.const 2    ;; argCount, counting the return type
+                i32.const 0    ;; argTypes
+                i32.const 0    ;; signature
+                i32.const 1    ;; invoker: table slot 1
+                i32.const 2    ;; function: table slot 2
+                i32.const 0 i32.const 0
+                call $register)
+            (table 3 funcref)
+            ;; The import is function 0, so the two defined ones are 1 and 2.
+            (elem (i32.const 1) func 1 2))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let generated = codegen::generate(&module).expect("generates");
+    let host = codegen::generate_host(&module).expect("generates a host");
+
+    const DRIVER: &str = r#"
+mod generated;
+mod host;
+fn main() {
+    let mut instance = generated::Instance::with_host(host::Host::default());
+    instance.register();
+
+    // Everything from here on is the module describing itself: the name it
+    // published, the slot to call, and what to pass first.
+    let call = {
+        let embind = &instance.host.embind;
+        let registered = embind.function("doubler").expect("the module registered it");
+        registered.call().expect("a function is callable")
+    };
+    println!("invoker {} context {} arity {}", call.invoker, call.context, call.arity);
+    let answer = instance.invoke_slot(call.invoker, &[i64::from(call.context), 21]);
+    println!("{answer:?}");
+}
+"#;
+    let output = common::run_with_host("embind-call", &generated, &host, DRIVER);
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "invoker 1 context 2 arity 2");
+    assert_eq!(
+        lines[1], "Ok(Some(42))",
+        "twice 21, through a function this side only ever knew as a number"
+    );
+}

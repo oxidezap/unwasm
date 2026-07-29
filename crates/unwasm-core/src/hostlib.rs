@@ -917,6 +917,54 @@ pub struct Embind {
     pub next_handle: i32,
 }
 
+impl Registration {
+    /// The invoker and the context of a registration that has them.
+    ///
+    /// An embind registration is a pair of function pointers and a name: the
+    /// invoker unpacks the arguments and calls the second, so reaching the
+    /// registered function from outside is `invoke_slot(invoker, [context,
+    /// …args])`. Which arguments hold which is embind's own C signature:
+    ///
+    /// ```c
+    /// _embind_register_function(name, argCount, argTypes, signature,
+    ///                           invoker, function, isAsync, isNonnullReturn);
+    /// _embind_register_class_function(classType, methodName, argCount, argTypes,
+    ///                                 signature, invoker, context, …);
+    /// ```
+    ///
+    /// The name is not in [`Self::arguments`] — it is [`Self::name`] — so the
+    /// positions here are the rest, in order.
+    #[must_use]
+    pub fn call(&self) -> Option<Call> {
+        let (invoker, context) = match self.kind.as_str() {
+            // argCount, argTypes, signature, invoker, function, …
+            "function" => (3, 4),
+            // classType, argCount, argTypes, signature, invoker, context, …
+            "class_function" | "class_class_function" => (4, 5),
+            // classType, argCount, argTypes, signature, invoker, …
+            "class_constructor" => (4, 5),
+            _ => return None,
+        };
+        Some(Call {
+            invoker: *self.arguments.get(invoker)?,
+            context: *self.arguments.get(context)?,
+            arity: *self.arguments.first()?,
+        })
+    }
+}
+
+/// What it takes to call something the module registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Call {
+    /// The table slot of the invoker, which unpacks the arguments.
+    pub invoker: i32,
+    /// The function the invoker calls, as its first argument.
+    pub context: i32,
+    /// How many arguments the registration says it takes, counting the return
+    /// type — embind's `argCount` includes it.
+    pub arity: i32,
+}
+
 impl Embind {
     /// Records a registration whose second argument is its name.
     pub fn register<M: rt::Access>(
@@ -940,6 +988,27 @@ impl Embind {
             name: String::new(),
             arguments: arguments.to_vec(),
         });
+    }
+
+    /// The registration of a free function by that name.
+    #[must_use]
+    pub fn function(&self, name: &str) -> Option<&Registration> {
+        self.registrations
+            .iter()
+            .find(|entry| entry.kind == "function" && entry.name == name)
+    }
+
+    /// The registration of a method by that name, whatever class it is on.
+    ///
+    /// A method's registration does not carry its class's *name*, only the
+    /// type id — so this is by method name, and a module with two classes
+    /// sharing one is ambiguous. It returns the first, and there is no way to
+    /// do better without resolving type ids.
+    #[must_use]
+    pub fn method(&self, name: &str) -> Option<&Registration> {
+        self.registrations
+            .iter()
+            .find(|entry| entry.kind.ends_with("class_function") && entry.name == name)
     }
 
     /// `_emval_take_value`: a new handle, with one reference.
@@ -1489,6 +1558,59 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_registration_says_what_it_takes_to_call_it() {
+        // embind's own C signature decides which argument is which, and
+        // getting it wrong means calling a table slot that is not an invoker.
+        let mut memory = memory();
+        let mut embind = Embind::default();
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
+        caller.write(64, b"initVoipStack\0");
+        // `_embind_register_function(name, argCount, argTypes, signature,
+        //                            invoker, function, isAsync, isNonnull)`
+        embind.register(&caller, "function", 64, &[1, 200, 300, 4173, 8000, 0, 0]);
+        let registered = embind.function("initVoipStack").expect("registered");
+        let call = registered.call().expect("a function is callable");
+        assert_eq!(call.invoker, 4173);
+        assert_eq!(call.context, 8000);
+        assert_eq!(call.arity, 1, "embind counts the return type");
+
+        // A method's invoker and context sit one further along, because the
+        // class type comes first.
+        caller.write(128, b"push_back\0");
+        embind.register(
+            &caller,
+            "class_function",
+            128,
+            &[9, 2, 200, 300, 5000, 9000, 0, 0, 0],
+        );
+        let method = embind.method("push_back").expect("registered");
+        assert_eq!(
+            method.call(),
+            Some(Call {
+                invoker: 5000,
+                context: 9000,
+                arity: 9
+            })
+        );
+
+        // A registration that is a *type* rather than something to call says
+        // so rather than pointing at whatever happens to be in that position.
+        embind.register(&caller, "integer", 64, &[1, 2, 3, 4]);
+        assert!(
+            embind
+                .registrations
+                .last()
+                .expect("present")
+                .call()
+                .is_none()
+        );
+        assert!(embind.function("nothing").is_none());
+        assert!(embind.method("nothing").is_none());
     }
 
     #[test]

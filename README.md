@@ -776,6 +776,29 @@ import stays the host's to implement.
 - **Level 0 only.** Linear memory is bytes; a C local that lived in the shadow
   stack is still an address, and a struct is still an offset.
 
+### Calling what a module only published by number
+
+A module built with embind exports almost nothing directly — its API is a list
+of registrations, and each one is a pair of table slots. Running it produces
+that list, and `invoke_slot` uses it:
+
+```rust
+instance.__wasm_call_ctors();          // where the registrations happen
+let call = instance.host.embind.function("startVoipCall").unwrap().call().unwrap();
+instance.invoke_slot(call.invoker, &[i64::from(call.context), argument]);
+```
+
+On the VoIP module that list is **328 entries** — `initVoipStack`,
+`setHideMyIp`, `class Uint8List`, `class_function push_back` — read from the
+module as it registers them. The static reader finds 78 of the same
+registrations without running anything, which is the subset whose arguments are
+constants sitting immediately before the call; the two can be checked against
+each other.
+
+Which argument of a registration is the invoker and which is the context comes
+from embind's own C signatures, not from guessing, and `Registration::call()`
+answers `None` for a registration that is a type rather than something to call.
+
 ### Threads
 
 A module built with pthreads declares a `shared` memory, and its threads are
