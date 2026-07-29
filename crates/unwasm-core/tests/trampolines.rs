@@ -300,6 +300,7 @@ fn the_voip_module_generates_all_of_its_trampolines() {
 /// the test can see it.
 const THREADED: &str = r#"(module
     (import "env" "__pthread_create_js" (func $create (param i32 i32 i32 i32) (result i32)))
+    (import "env" "__emscripten_init_main_thread_js" (func $init_main (param i32)))
     (import "wasi_snapshot_preview1" "fd_write"
         (func $fd_write (param i32 i32 i32 i32) (result i32)))
     (import "env" "memory" (memory 1 4 shared))
@@ -320,8 +321,9 @@ const THREADED: &str = r#"(module
         local.get 0 i32.const 0 i32.const 0 i32.const 7 call $create)
     (func (export "write") (result i32)
         i32.const 1 i32.const 64 i32.const 1 i32.const 80 call $fd_write)
+    (func (export "init_main") (param i32) local.get 0 call $init_main)
     (table 1 funcref)
-    (elem (i32.const 0) func 5))"#;
+    (elem (i32.const 0) func 6))"#;
 
 #[test]
 fn the_pthread_glue_is_recognised_when_all_of_it_is_there() {
@@ -332,6 +334,11 @@ fn the_pthread_glue_is_recognised_when_all_of_it_is_there() {
         .expect("every part of it is present");
     assert_eq!(spawn.import, 0);
     assert_eq!(spawn.thread_init_arity, 6);
+    // The main thread's own setup is the same shape and the same reason.
+    let init = analysis::analyse(&module)
+        .init_main_thread
+        .expect("the module asks for it");
+    assert_eq!(init.thread_init, spawn.thread_init);
     assert!(spawn.stack_set_limits.is_some());
     assert!(spawn.thread_exit.is_some());
 }
@@ -483,6 +490,67 @@ fn a_thread_init_that_is_not_the_one_this_knows_is_refused() {
     let wasm = common::assemble("pthread-odd-init", &wat);
     let module = Module::parse(&wasm).expect("valid");
     assert!(analysis::analyse(&module).spawn.is_none());
+}
+
+#[test]
+fn the_main_thread_initialises_itself_through_the_module() {
+    // The glue answers `__emscripten_init_main_thread_js` by calling the
+    // module's own `_emscripten_thread_init` with `is_main` set. It reaches
+    // back into the instance, so a host cannot do it — and until it was
+    // generated it was the one import a run of the VoIP module had to answer
+    // with a default.
+    let wasm = common::assemble("pthread-main", THREADED);
+    let module = Module::parse(&wasm).expect("valid");
+    let host = codegen::generate_host(&module).expect("generates");
+    assert!(
+        !host.contains("__emscripten_init_main_thread_js"),
+        "generated, not asked for:\n{host}"
+    );
+
+    const DRIVER: &str = r#"
+mod generated;
+fn main() {
+    let mut instance = generated::Instance::with_host(generated::NoImports);
+    instance.init_main(4096);
+    // `_emscripten_thread_init` here records its `is_main` argument, which the
+    // glue passes as 1 for the main thread and 0 for a worker.
+    println!("is_main {}", instance.memory.load32(16, 0));
+}
+"#;
+    let output = common::run_with_driver("pthread-main", &wasm, DRIVER);
+    assert_eq!(output.trim(), "is_main 1");
+}
+
+#[test]
+fn an_init_main_thread_of_another_shape_is_left_to_the_host() {
+    // The name is right and the signature is not: passing a pthread pointer to
+    // something that takes two arguments would be a guess about a different
+    // function.
+    let wat = THREADED
+        .replace(
+            r#"(func $init_main (param i32))"#,
+            r#"(func $init_main (param i32 i32))"#,
+        )
+        .replace(
+            "(func (export \"init_main\") (param i32) local.get 0 call $init_main)",
+            "(func (export \"init_main\") (param i32) local.get 0 local.get 0 call $init_main)",
+        );
+    let wasm = common::assemble("pthread-main-shape", &wat);
+    let module = Module::parse(&wasm).expect("valid");
+    assert!(analysis::analyse(&module).init_main_thread.is_none());
+}
+
+#[test]
+fn an_init_main_thread_without_the_module_half_is_left_to_the_host() {
+    let wat = THREADED.replace(r#"(export "_emscripten_thread_init") "#, "");
+    let wasm = common::assemble("pthread-main-none", &wat);
+    let module = Module::parse(&wasm).expect("valid");
+    assert!(analysis::analyse(&module).init_main_thread.is_none());
+    let host = codegen::generate_host(&module).expect("generates");
+    assert!(
+        host.contains(r#"todo!("env::__emscripten_init_main_thread_js")"#),
+        "{host}"
+    );
 }
 
 #[test]

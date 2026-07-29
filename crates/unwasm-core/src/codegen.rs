@@ -541,6 +541,9 @@ pub fn generate_host_with(module: &Module, defaults: bool) -> Result<String> {
             || analysis
                 .spawn
                 .is_some_and(|spawn| spawn.import == index as u32)
+            || analysis
+                .init_main_thread
+                .is_some_and(|init| init.import == index as u32)
         {
             continue;
         }
@@ -1223,6 +1226,10 @@ impl<'a> Generator<'a> {
                 .analysis
                 .spawn
                 .is_some_and(|spawn| spawn.import == index as u32)
+            || self
+                .analysis
+                .init_main_thread
+                .is_some_and(|init| init.import == index as u32)
     }
 
     fn imports_trait(&mut self) {
@@ -1675,6 +1682,14 @@ impl<'a> Generator<'a> {
                 self.spawn_trampoline(spawn);
                 continue;
             }
+            if let Some(init) = self
+                .analysis
+                .init_main_thread
+                .filter(|init| init.import == index as u32)
+            {
+                self.init_main_thread_trampoline(init);
+                continue;
+            }
             let args: Vec<String> = (0..ty.params.len()).map(|at| format!("p{at}")).collect();
             // The caller is the first argument, so the rest need the comma the
             // trait signature already carries.
@@ -1797,6 +1812,37 @@ impl<'a> Generator<'a> {
         lines.push("        0".to_string());
         lines.push("    }".to_string());
         lines.push(String::new());
+        let _ = writeln!(self.out, "{}", lines.join("\n"));
+    }
+
+    /// Emits `__emscripten_init_main_thread_js`, the main thread's own setup.
+    ///
+    /// The glue answers it by calling the module's `_emscripten_thread_init`
+    /// with `is_main` and `is_runtime` set, which reaches back into the
+    /// instance — so it is generated for the same reason `__pthread_create_js`
+    /// is. The stack size argument is 0 because that is what the glue passes
+    /// unless a build overrode `DEFAULT_PTHREAD_STACK_SIZE`, and 0 there means
+    /// "use the module's own".
+    fn init_main_thread_trampoline(&mut self, init: crate::analysis::InitMainThread) {
+        let index = init.import;
+        let name = function_ident_with(init.thread_init, &self.analysis, &self.recognised);
+        let arguments = ["p0", "1", "1", "1", "0", "0"]
+            .iter()
+            .take(init.thread_init_arity.max(1))
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let lines = [
+            "    /// `env::__emscripten_init_main_thread_js`, generated: the glue answers"
+                .to_string(),
+            "    /// it with the module's own `_emscripten_thread_init`, and only this side"
+                .to_string(),
+            "    /// can call that.".to_string(),
+            format!("    pub(crate) fn f{index}(&mut self, p0: i32) {{"),
+            format!("        self.{name}({arguments});"),
+            "    }".to_string(),
+            String::new(),
+        ];
         let _ = writeln!(self.out, "{}", lines.join("\n"));
     }
 

@@ -192,6 +192,46 @@ pub struct Spawn {
     pub entry_type: u32,
 }
 
+/// `__emscripten_init_main_thread_js`, which is the main thread's version of
+/// what a worker does before it runs anything.
+///
+/// The glue answers it by calling the module's own `_emscripten_thread_init`
+/// with `is_main` and `is_runtime` set — so it reaches back into the instance,
+/// which is what makes it something to generate rather than to ask a host for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitMainThread {
+    /// The import.
+    pub import: u32,
+    /// The exported `_emscripten_thread_init` it calls.
+    pub thread_init: u32,
+    /// How many arguments that takes.
+    pub thread_init_arity: usize,
+}
+
+/// Finds it, if the module has both halves.
+fn find_init_main_thread(module: &Module) -> Option<InitMainThread> {
+    let import = module.func_imports.iter().position(|import| {
+        import.field == "__emscripten_init_main_thread_js"
+            || import.field == "_emscripten_init_main_thread_js"
+    })? as u32;
+    let ty = module
+        .types
+        .get(module.func_imports[import as usize].type_index as usize)?;
+    if ty.params != vec![ValType::I32] || !ty.results.is_empty() {
+        return None;
+    }
+    let thread_init = find_export(module, &["_emscripten_thread_init"])?;
+    let init_type = func_type_of(module, thread_init)?;
+    if init_type.params.is_empty() || init_type.params.iter().any(|param| *param != ValType::I32) {
+        return None;
+    }
+    Some(InitMainThread {
+        import,
+        thread_init,
+        thread_init_arity: init_type.params.len(),
+    })
+}
+
 /// Finds the pthread glue, if all of it is there.
 fn find_spawn(module: &Module) -> Option<Spawn> {
     // A thread is another instance over the same memory. Without a shared one
@@ -412,6 +452,8 @@ pub struct Analysis {
     pub set_threw: Option<u32>,
     /// The pthread glue, when every part of it is present.
     pub spawn: Option<Spawn>,
+    /// The main thread's own initialisation, when the module asks for it.
+    pub init_main_thread: Option<InitMainThread>,
     /// Where each passive data segment is placed, by segment index, when the
     /// module places it at a constant address.
     pub placements: std::collections::BTreeMap<u32, Placement>,
@@ -524,6 +566,7 @@ pub fn analyse(module: &Module) -> Analysis {
         derived_names: derive_names(module, &placements),
         registrations: find_registrations(module, &placements),
         spawn: find_spawn(module),
+        init_main_thread: find_init_main_thread(module),
         table: read_table(module),
         hot_addresses: find_hot_addresses(module, &placements),
         call_graph: read_call_graph(module),
