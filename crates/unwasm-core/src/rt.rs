@@ -26,6 +26,28 @@ pub fn trap(message: &str) -> ! {
 /// Bytes in a wasm page.
 pub const PAGE_SIZE: usize = 65536;
 
+/// The trap an access outside the memory raises, with the numbers that say
+/// which kind of mistake it was.
+///
+/// The message an engine gives is just "out of bounds memory access", and it
+/// is the same whether the address was one byte past the end or a pointer read
+/// out of uninitialised memory. Those are different bugs, and the address tells
+/// them apart at a glance — a decompilation is something you are running to
+/// find out what it does, and this is the moment it has most to say.
+///
+/// # Panics
+///
+/// Always. It is a trap.
+#[cold]
+#[inline(never)]
+pub fn out_of_bounds(at: u64, size: u64, memory: usize) -> ! {
+    panic!(
+        "wasm trap: out of bounds memory access: {size} bytes at {at:#x}, \
+         and the memory is {memory} bytes ({:.1} MiB)",
+        memory as f64 / (1024.0 * 1024.0)
+    );
+}
+
 /// One write to a watched address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hit {
@@ -299,11 +321,11 @@ impl Memory {
     /// Resolves `addr + offset` and checks `size` bytes fit, in `u64` so the
     /// sum itself cannot wrap into a valid-looking address.
     fn range(&self, addr: i32, offset: u64, size: u64) -> usize {
-        let end = u64::from(addr as u32) + offset + size;
-        if end > self.data.len() as u64 {
-            trap("out of bounds memory access");
+        let at = u64::from(addr as u32) + offset;
+        if at + size > self.data.len() as u64 {
+            out_of_bounds(at, size, self.data.len());
         }
-        (u64::from(addr as u32) + offset) as usize
+        at as usize
     }
 
     /// Reads `N` bytes. The width is the type's, not the address's.
@@ -720,11 +742,11 @@ impl SharedMemory {
     }
 
     fn range(&self, addr: i32, offset: u64, size: u64) -> usize {
-        let end = u64::from(addr as u32) + offset + size;
-        if end > self.byte_len() as u64 {
-            trap("out of bounds memory access");
+        let at = u64::from(addr as u32) + offset;
+        if at + size > self.byte_len() as u64 {
+            out_of_bounds(at, size, self.byte_len());
         }
-        (u64::from(addr as u32) + offset) as usize
+        at as usize
     }
 
     fn get(&self, at: usize) -> u8 {
@@ -1685,6 +1707,33 @@ mod tests {
         caller.write(16, b"\0");
         assert_eq!(caller.cstring(16), b"");
         assert_eq!(caller.bytes(0, 0), b"");
+    }
+
+    #[test]
+    fn an_out_of_bounds_trap_says_which_kind_of_mistake_it_was() {
+        // One byte past the end and a pointer read out of uninitialised memory
+        // are different bugs with the same message in every engine. The
+        // address tells them apart, and this is the moment a decompilation has
+        // most to say.
+        let memory = Memory::new(1, None);
+        let near = std::panic::catch_unwind(|| memory.load32((PAGE_SIZE - 2) as i32, 0));
+        let message = near
+            .expect_err("it traps")
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(message.contains("out of bounds memory access"), "{message}");
+        assert!(message.contains("4 bytes at 0xfffe"), "{message}");
+        assert!(message.contains("the memory is 65536 bytes"), "{message}");
+        assert!(message.contains("0.1 MiB"), "{message}");
+
+        let wild = std::panic::catch_unwind(|| memory.load32(0x24b_ed0, 0));
+        let message = wild
+            .expect_err("it traps")
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(message.contains("at 0x24bed0"), "{message}");
     }
 
     #[test]
