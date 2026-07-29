@@ -1019,16 +1019,40 @@ impl<'a> Generator<'a> {
         self.out.push_str("}\n\n");
     }
 
+    /// The data segments, as byte-string literals.
+    ///
+    /// `b"..."` rather than `&[0x41, 0x42, …]`, and the difference is not
+    /// cosmetic: an array literal is one expression node per byte, so the VoIP
+    /// module's 1.25 MB of data became 1.25 million nodes and 7.9 MB of source
+    /// for rustc to parse, name-resolve and const-evaluate. A literal is one
+    /// token. Most of these bytes are text, which costs one character each.
     fn data_constants(&mut self) {
         for (index, segment) in self.module.datas.iter().enumerate() {
-            let _ = write!(self.out, "const DATA_{index}: &[u8] = &[");
-            for (at, byte) in segment.bytes.iter().enumerate() {
-                if at % 16 == 0 {
-                    self.out.push_str("\n    ");
+            let _ = write!(self.out, "const DATA_{index}: &[u8] = b\"");
+            let mut column = 0usize;
+            for byte in &segment.bytes {
+                // A byte string takes printable ASCII as itself and everything
+                // else — including every byte above 0x7F — as an escape.
+                let escaped = match byte {
+                    b'"' => "\\\"".to_string(),
+                    b'\\' => "\\\\".to_string(),
+                    b'\n' => "\\n".to_string(),
+                    b'\r' => "\\r".to_string(),
+                    b'\t' => "\\t".to_string(),
+                    0x20..=0x7E => (*byte as char).to_string(),
+                    other => format!("\\x{other:02x}"),
+                };
+                column += escaped.len();
+                self.out.push_str(&escaped);
+                // Wrapped with a line continuation, so the bytes stay exactly
+                // what they were: a bare newline inside the literal would be
+                // one of them.
+                if column >= 100 {
+                    self.out.push_str("\\\n    ");
+                    column = 0;
                 }
-                let _ = write!(self.out, "0x{byte:02x}, ");
             }
-            self.out.push_str("\n];\n\n");
+            self.out.push_str("\";\n\n");
         }
     }
 

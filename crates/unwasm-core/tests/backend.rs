@@ -883,10 +883,26 @@ fn a_string_with_a_length_beside_it_stops_where_the_length_says() {
     );
     let code = common::decompile(&wasm);
     assert!(code.contains(r#"64i32 /* "first message" */"#), "{code}");
+    // Only the annotations: the data segment itself is a byte-string literal
+    // and contains the module's text verbatim, which is the point of it.
+    let annotations = annotations(&code);
     assert!(
-        !code.contains("first messagesecond"),
-        "the length was ignored:\n{code}"
+        !annotations.contains("first messagesecond"),
+        "the length was ignored:\n{annotations}"
     );
+}
+
+/// The annotations: the lines where the emitter quotes the module's own text
+/// back at the reader, which is where it has to be escaped.
+///
+/// Not "every line with a `/*` in it": the data segments are byte-string
+/// literals now and contain the module's text verbatim, which is the point of
+/// them and is not a comment.
+fn annotations(code: &str) -> String {
+    code.lines()
+        .filter(|line| line.trim_start().starts_with("//") || line.contains("i32 /* "))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -901,9 +917,14 @@ fn a_string_containing_a_comment_terminator_cannot_break_the_output() {
             (func (export "at") (result i32) i32.const 32 i32.load8_u))"#,
     );
     let code = common::decompile(&wasm);
+    let annotations = annotations(&code);
     assert!(
-        !code.contains("*/ then"),
-        "the comment was closed early:\n{code}"
+        !annotations.contains("*/ then"),
+        "the comment was closed early:\n{annotations}"
+    );
+    assert!(
+        annotations.contains("∗∕ then"),
+        "the text is still readable, with the terminator disarmed:\n{annotations}"
     );
     // And it still builds and runs, which is the property that matters.
     common::assert_agrees("hostile", &wasm, &[common::call("at", &[])]);
@@ -1276,4 +1297,40 @@ fn a_table_with_both_an_active_and_a_declared_segment_fills_only_the_active_one(
             common::call("through", &[common::Arg::I32(1), common::Arg::I32(21)]),
         ],
     );
+}
+
+#[test]
+fn every_byte_survives_the_data_literal() {
+    // The segments are byte-string literals rather than arrays of `0x41`, and
+    // the whole point of that is speed — so the thing to pin is that it costs
+    // no fidelity. All 256 values, including the quote, the backslash, the
+    // newline and everything above 0x7F.
+    let mut bytes = String::new();
+    for byte in 0u32..256 {
+        bytes.push_str(&format!("\\{byte:02x}"));
+    }
+    let wasm = common::assemble(
+        "every-byte",
+        &format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (data (i32.const 0) "{bytes}")
+                (func (export "at") (param i32) (result i32)
+                    local.get 0 i32.load8_u))"#
+        ),
+    );
+    let code = common::decompile(&wasm);
+    assert!(code.contains(r#"const DATA_0: &[u8] = b""#), "{code}");
+
+    const DRIVER: &str = r#"
+mod generated;
+fn main() {
+    let mut instance = generated::Instance::new();
+    let all: Vec<i32> = (0..256).map(|at| instance.at(at)).collect();
+    println!("{}", all.iter().map(|byte| byte.to_string()).collect::<Vec<_>>().join(","));
+}
+"#;
+    let output = common::run_with_driver("every-byte", &wasm, DRIVER);
+    let expected: Vec<String> = (0..256).map(|byte| byte.to_string()).collect();
+    assert_eq!(output.trim(), expected.join(","));
 }
