@@ -1171,6 +1171,11 @@ impl<'a> Generator<'a> {
         for (index, segment) in self.module.datas.iter().enumerate() {
             let _ = write!(self.out, "const DATA_{index}: &[u8] = b\"");
             let mut column = 0usize;
+            // A line continuation in Rust eats the newline *and every space
+            // after it*, so a data byte that is a space immediately after one
+            // disappears. It cost 626 bytes of one segment of the VoIP module
+            // and did not show up until the module was run.
+            let mut just_wrapped = false;
             for byte in &segment.bytes {
                 // A byte string takes printable ASCII as itself and everything
                 // else — including every byte above 0x7F — as an escape.
@@ -1180,9 +1185,12 @@ impl<'a> Generator<'a> {
                     b'\n' => "\\n".to_string(),
                     b'\r' => "\\r".to_string(),
                     b'\t' => "\\t".to_string(),
+                    // The one byte a continuation would swallow.
+                    b' ' if just_wrapped => "\\x20".to_string(),
                     0x20..=0x7E => (*byte as char).to_string(),
                     other => format!("\\x{other:02x}"),
                 };
+                just_wrapped = false;
                 column += escaped.len();
                 self.out.push_str(&escaped);
                 // Wrapped with a line continuation, so the bytes stay exactly
@@ -1191,6 +1199,7 @@ impl<'a> Generator<'a> {
                 if column >= 100 {
                     self.out.push_str("\\\n    ");
                     column = 0;
+                    just_wrapped = true;
                 }
             }
             self.out.push_str("\";\n\n");

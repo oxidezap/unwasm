@@ -1325,14 +1325,60 @@ fn a_function_with_more_locals_than_the_bitset_holds_is_still_correct() {
 }
 
 #[test]
+fn a_data_segment_of_spaces_keeps_every_one_of_them() {
+    // A line continuation in Rust eats the newline *and every space after it*,
+    // so a data byte that is a space immediately after one disappears. This is
+    // what that looks like from the outside: a segment of nothing but spaces,
+    // long enough to wrap many times.
+    //
+    // It cost 626 bytes of one segment of the VoIP module, and the earlier
+    // all-256-values test passed the whole time — its wrap points happened
+    // never to land before a space.
+    let spaces = " ".repeat(1000);
+    let wasm = common::assemble(
+        "spaces",
+        &format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (data (i32.const 0) "{spaces}")
+                (func (export "at") (param i32) (result i32)
+                    local.get 0 i32.load8_u)
+                (func (export "sum") (result i32)
+                    (local $at i32) (local $total i32)
+                    (loop $next
+                        local.get $total local.get $at i32.load8_u i32.add
+                        local.set $total
+                        local.get $at i32.const 1 i32.add local.set $at
+                        local.get $at i32.const 1000 i32.lt_u br_if $next)
+                    local.get $total))"#
+        ),
+    );
+    // Every one of the thousand is a space, so the sum is 32 * 1000. One eaten
+    // byte shifts the rest and the sum changes.
+    common::assert_agrees(
+        "spaces",
+        &wasm,
+        &[
+            common::call("sum", &[]),
+            common::call("at", &[common::Arg::I32(999)]),
+        ],
+    );
+}
+
+#[test]
 fn every_byte_survives_the_data_literal() {
     // The segments are byte-string literals rather than arrays of `0x41`, and
     // the whole point of that is speed — so the thing to pin is that it costs
     // no fidelity. All 256 values, including the quote, the backslash, the
     // newline and everything above 0x7F.
+    // Every value, and then every value again preceded by a space, so that a
+    // wrap lands before a space whatever the wrap width is.
     let mut bytes = String::new();
     for byte in 0u32..256 {
         bytes.push_str(&format!("\\{byte:02x}"));
+    }
+    for byte in 0u32..256 {
+        bytes.push_str(&format!("\\20\\{byte:02x}"));
     }
     let wasm = common::assemble(
         "every-byte",
@@ -1351,11 +1397,15 @@ fn every_byte_survives_the_data_literal() {
 mod generated;
 fn main() {
     let mut instance = generated::Instance::new();
-    let all: Vec<i32> = (0..256).map(|at| instance.at(at)).collect();
+    let all: Vec<i32> = (0..768).map(|at| instance.at(at)).collect();
     println!("{}", all.iter().map(|byte| byte.to_string()).collect::<Vec<_>>().join(","));
 }
 "#;
     let output = common::run_with_driver("every-byte", &wasm, DRIVER);
-    let expected: Vec<String> = (0..256).map(|byte| byte.to_string()).collect();
+    let mut expected: Vec<String> = (0..256).map(|byte| byte.to_string()).collect();
+    for byte in 0..256 {
+        expected.push("32".to_string());
+        expected.push(byte.to_string());
+    }
     assert_eq!(output.trim(), expected.join(","));
 }
