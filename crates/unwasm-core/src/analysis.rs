@@ -146,6 +146,109 @@ pub struct Invoke {
     pub callee_type: u32,
 }
 
+/// What it takes to answer `__pthread_create_js` without inventing anything.
+///
+/// Emscripten's JavaScript spawns a worker, instantiates the module over the
+/// same memory, and has the worker call `_emscripten_thread_init` and then the
+/// start routine through the table. Every part of that is here — the memory is
+/// shared, the table holds the routine, and `_emscripten_thread_init` is one
+/// of the module's own exports — so it is generated rather than left as one
+/// more thing to write.
+///
+/// The order matters and is the glue's own:
+///
+/// ```js
+/// establishStackSpace(pthread_ptr);                       // the thread's stack
+/// __emscripten_thread_init(pthread_ptr, 0, 0, /*can_block=*/1, 0, 0);
+/// invokeEntryPoint(start_routine, arg);
+/// ```
+///
+/// The stack comes first and does not come from `thread_init`: the guest
+/// allocated it inside `pthread_create` and wrote it into its own pthread
+/// struct, and the glue reads it back out from there. Those two offsets are
+/// the one thing here that is a *layout* — Emscripten's own
+/// `C_STRUCTS.pthread.stack` and `.stack_size`, 48 and 52 — and
+/// [`Analysis::PTHREAD_STACK_OFFSETS`] is where they are written down, so a
+/// build that moved them can be corrected in one place instead of debugged.
+///
+/// Getting the stack wrong is not subtle: measured on a real `-pthread` build,
+/// four threads sharing one left a frame with 0 of its 64 fields intact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Spawn {
+    /// The imported `__pthread_create_js`.
+    pub import: u32,
+    /// The exported `_emscripten_thread_init` the new thread calls.
+    pub thread_init: u32,
+    /// How many arguments that takes.
+    pub thread_init_arity: usize,
+    /// The exported `_emscripten_stack_set_limits`, which the thread calls
+    /// with the stack it found in its own pthread struct.
+    pub stack_set_limits: Option<u32>,
+    /// The exported `_emscripten_thread_exit`, which the thread calls with
+    /// what its start routine returned. Without it a `pthread_join` waits
+    /// forever: nothing else tells the joining thread the thread is done.
+    pub thread_exit: Option<u32>,
+    /// The type of the start routine: `(i32) -> i32`, by index.
+    pub entry_type: u32,
+}
+
+/// Finds the pthread glue, if all of it is there.
+fn find_spawn(module: &Module) -> Option<Spawn> {
+    // A thread is another instance over the same memory. Without a shared one
+    // there is nothing to join.
+    if !module.memory.as_ref().is_some_and(|memory| memory.shared) {
+        return None;
+    }
+    let import = module.func_imports.iter().position(|import| {
+        import.field == "__pthread_create_js" || import.field == "_pthread_create_js"
+    })? as u32;
+    // `(thread, attr, entry, arg) -> errno`, which is the shape every version
+    // that has this import uses. A different one is a different function.
+    let ty = module
+        .types
+        .get(module.func_imports[import as usize].type_index as usize)?;
+    if ty.params.len() != 4
+        || ty.params.iter().any(|param| *param != ValType::I32)
+        || ty.results != vec![ValType::I32]
+    {
+        return None;
+    }
+
+    let thread_init = find_export(module, &["_emscripten_thread_init"])?;
+    let init_type = func_type_of(module, thread_init)?;
+    if init_type.params.is_empty() || init_type.params.iter().any(|param| *param != ValType::I32) {
+        return None;
+    }
+
+    // The start routine is `void *(*)(void *)`, which lowers to `(i32) -> i32`.
+    let entry_type = module
+        .types
+        .iter()
+        .position(|ty| ty.params == vec![ValType::I32] && ty.results == vec![ValType::I32])?
+        as u32;
+
+    Some(Spawn {
+        import,
+        thread_init,
+        thread_init_arity: init_type.params.len(),
+        stack_set_limits: find_export(
+            module,
+            &[
+                "emscripten_stack_set_limits",
+                "_emscripten_stack_set_limits",
+            ],
+        ),
+        thread_exit: find_export(module, &["_emscripten_thread_exit"]),
+        entry_type,
+    })
+}
+
+/// The signature of a function, whether imported or defined.
+fn func_type_of(module: &Module, func: u32) -> Option<crate::module::FuncType> {
+    let index = type_index_of(module, func)?;
+    module.types.get(index as usize).cloned()
+}
+
 /// Where a passive data segment ends up in memory.
 ///
 /// A module built for threads places its data with `memory.init` rather than
@@ -307,6 +410,8 @@ pub struct Analysis {
     /// The module's exported `setThrew`, which a trampoline needs to report a
     /// caught exception back to the guest.
     pub set_threw: Option<u32>,
+    /// The pthread glue, when every part of it is present.
+    pub spawn: Option<Spawn>,
     /// Where each passive data segment is placed, by segment index, when the
     /// module places it at a constant address.
     pub placements: std::collections::BTreeMap<u32, Placement>,
@@ -418,6 +523,7 @@ pub fn analyse(module: &Module) -> Analysis {
         placements: placements.clone(),
         derived_names: derive_names(module, &placements),
         registrations: find_registrations(module, &placements),
+        spawn: find_spawn(module),
         table: read_table(module),
         hot_addresses: find_hot_addresses(module, &placements),
         call_graph: read_call_graph(module),
@@ -452,6 +558,16 @@ fn read_call_graph(module: &Module) -> CallGraph {
 }
 
 impl Analysis {
+    /// Where a pthread struct keeps its stack: `(stack, stack_size)`, in bytes
+    /// from the start of the struct.
+    ///
+    /// Emscripten's own `C_STRUCTS.pthread`, which is what its `establishStackSpace`
+    /// reads. It is a layout rather than something the wasm says, so it is
+    /// version-specific — and it is the number to check first if a threaded
+    /// module misbehaves, since a wrong one puts every thread on a stack that
+    /// is not its own.
+    pub const PTHREAD_STACK_OFFSETS: (u64, u64) = (48, 52);
+
     /// Every function reachable from `start`, including through the table.
     ///
     /// A direct call names its callee; an indirect one names only a type, so

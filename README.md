@@ -801,6 +801,34 @@ reallocated while other threads hold handles to it. The default is 64 MiB;
 `with_host_and_reservation` says otherwise, and growing past it returns `-1`,
 which the spec allows and which says exactly what happened.
 
+**The guest's own `pthread_create` works.** `__pthread_create_js` is generated
+rather than asked of a host, for the same reason the `invoke_*` trampolines
+are: it has to reach back into the instance, and the `Imports` trait cannot.
+What the new thread does is the order the glue does it in, none of it optional:
+
+```rust
+let high = worker.memory.load32(pthread_ptr, 48);   // the stack the guest allocated
+let low  = high - worker.memory.load32(pthread_ptr, 52);
+worker.g0_stack_pointer = high;
+std::thread::spawn(move || {
+    worker.emscripten_stack_set_limits(high, low);
+    worker._emscripten_thread_init(pthread_ptr, 0, 0, 1, 0, 0);
+    let result = worker.call_indirect_7(entry, arg);
+    worker._emscripten_thread_exit(result);        // what a pthread_join waits for
+});
+```
+
+Those two offsets — 48 and 52 — are the one *layout* in this: Emscripten's own
+`C_STRUCTS.pthread.stack` and `.stack_size`, which its `establishStackSpace`
+reads. `Analysis::PTHREAD_STACK_OFFSETS` is where they are written down, so a
+build that moved them is corrected in one place rather than debugged. Leave out
+the stack and threads destroy each other's frames; leave out the exit and
+`pthread_join` never returns — both happened while this was being written.
+
+A threaded module's `Imports` is `Clone + Send + 'static`, and its generated
+host keeps its state behind `Arc<Mutex<_>>`: a copy per thread would be four
+filesystems that agree about nothing.
+
 A thread needs a stack of its own, and that is the host's job: the globals are
 per instance, so `__stack_pointer` is the thread's own — but only if somebody
 sets it. Measured on an Emscripten `-pthread` build, four threads left on the

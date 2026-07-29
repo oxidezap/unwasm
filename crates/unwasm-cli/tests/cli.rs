@@ -1287,3 +1287,225 @@ fn direct_only_leaves_out_what_the_table_could_reach() {
         "the table's target is left out, and the stub names it: {direct}"
     );
 }
+
+#[test]
+fn patch_rewrites_a_constant_without_moving_anything() {
+    // The technique `constants` exists for: give a site a distinct value, run,
+    // and see which one comes back. Doing it by hand means computing a signed
+    // LEB128, which is where it goes wrong.
+    let path = fixture(
+        "patch-cli",
+        r#"(module
+            (func (export "code") (result i32) i32.const 70008)
+            (func (export "other") (result i32) i32.const 70008))"#,
+    );
+    let (ok, stdout, stderr) = run(&["constants", path.to_str().expect("utf-8 path"), "70008"]);
+    assert!(ok, "{stderr}");
+    let offset: usize = stdout
+        .lines()
+        .find_map(|line| line.split("at ").nth(1))
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|number| number.parse().ok())
+        .expect("constants gives an offset");
+
+    let patched = scratch().join("patched.wasm");
+    let (ok, stdout, stderr) = run(&[
+        "patch",
+        path.to_str().expect("utf-8 path"),
+        &offset.to_string(),
+        "200391",
+        "-o",
+        patched.to_str().expect("utf-8 path"),
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("is now i32.const 200391"), "{stdout}");
+    assert!(stdout.contains("unmoved"), "{stdout}");
+
+    // Same size, and only the three bytes of the encoding differ.
+    let before = std::fs::read(&path).expect("read");
+    let after = std::fs::read(&patched).expect("read");
+    assert_eq!(before.len(), after.len(), "nothing moved");
+    let changed = before
+        .iter()
+        .zip(&after)
+        .filter(|(one, two)| one != two)
+        .count();
+    assert_eq!(changed, 3, "the SLEB is three bytes wide either way");
+
+    // And the result is a module, not a pile of bytes that used to be one.
+    let (ok, stdout, _) = run(&["constants", patched.to_str().expect("utf-8 path"), "200391"]);
+    assert!(ok);
+    assert!(stdout.contains("1 site push 200391"), "{stdout}");
+    let (ok, stdout, _) = run(&["constants", patched.to_str().expect("utf-8 path"), "70008"]);
+    assert!(ok);
+    assert!(
+        stdout.contains("1 site push 70008"),
+        "the other one is untouched: {stdout}"
+    );
+}
+
+#[test]
+fn patch_refuses_what_would_move_the_rest_of_the_module() {
+    let path = fixture(
+        "patch-refuse",
+        r#"(module (func (export "code") (result i32) i32.const 70008))"#,
+    );
+    let (_, stdout, _) = run(&["constants", path.to_str().expect("utf-8 path"), "70008"]);
+    let offset: usize = stdout
+        .lines()
+        .find_map(|line| line.split("at ").nth(1))
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|number| number.parse().ok())
+        .expect("an offset");
+    let out = scratch().join("refused.wasm");
+    let out = out.to_str().expect("utf-8 path");
+
+    // A value that encodes shorter would move every byte after it.
+    let (ok, _, stderr) = run(&[
+        "patch",
+        path.to_str().expect("utf-8 path"),
+        &offset.to_string(),
+        "1",
+        "-o",
+        out,
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("encodes to 1 bytes"), "{stderr}");
+    assert!(stderr.contains("moves everything after it"), "{stderr}");
+
+    // An offset that is not an i32.const at all.
+    let (ok, _, stderr) = run(&[
+        "patch",
+        path.to_str().expect("utf-8 path"),
+        "0",
+        "5",
+        "-o",
+        out,
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("not an i32.const"), "{stderr}");
+
+    let (ok, _, stderr) = run(&[
+        "patch",
+        path.to_str().expect("utf-8 path"),
+        "99999",
+        "5",
+        "-o",
+        out,
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("past the end"), "{stderr}");
+
+    // And the arguments themselves.
+    for (arguments, expected) in [
+        (vec!["patch"], "needs a module path"),
+        (vec!["patch", "m.wasm"], "needs the offset"),
+        (vec!["patch", "m.wasm", "0"], "needs the value"),
+        (vec!["patch", "m.wasm", "x", "1"], "offset must be a number"),
+        (vec!["patch", "m.wasm", "0", "y"], "value must be a number"),
+    ] {
+        let (ok, _, stderr) = run(&arguments);
+        assert!(!ok, "{arguments:?}");
+        assert!(stderr.contains(expected), "{arguments:?}: {stderr}");
+    }
+    let (ok, _, stderr) = run(&["patch", path.to_str().expect("utf-8 path"), "0", "5"]);
+    assert!(!ok);
+    assert!(stderr.contains("needs -o <path>"), "{stderr}");
+    let (ok, _, stderr) = run(&[
+        "patch",
+        path.to_str().expect("utf-8 path"),
+        &offset.to_string(),
+        "70009",
+        "-o",
+        out,
+        "--twice",
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("unexpected argument `--twice`"), "{stderr}");
+}
+
+#[test]
+fn patch_handles_the_whole_range_of_a_signed_leb() {
+    // The encoding is the thing that goes wrong by hand, so it is the thing to
+    // pin: negative values, the sign-bit boundaries, and a five-byte constant.
+    for value in [
+        -1i64,
+        63,
+        64,
+        -64,
+        -65,
+        8191,
+        -8192,
+        775_533,
+        70_008,
+        2_147_483_647,
+        -2_147_483_648,
+    ] {
+        let path = fixture(
+            "patch-range",
+            &format!("(module (func (export \"code\") (result i32) i32.const {value}))"),
+        );
+        let (_, stdout, _) = run(&[
+            "constants",
+            path.to_str().expect("utf-8 path"),
+            &value.to_string(),
+        ]);
+        let offset: usize = stdout
+            .lines()
+            .find_map(|line| line.split("at ").nth(1))
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|number| number.parse().ok())
+            .unwrap_or_else(|| panic!("no offset for {value}: {stdout}"));
+        // Rewriting it as itself must produce the same bytes: if the encoder
+        // and the decoder disagree anywhere, this is where it shows.
+        let out = scratch().join("range.wasm");
+        let (ok, _, stderr) = run(&[
+            "patch",
+            path.to_str().expect("utf-8 path"),
+            &offset.to_string(),
+            &value.to_string(),
+            "-o",
+            out.to_str().expect("utf-8 path"),
+        ]);
+        assert!(ok, "{value}: {stderr}");
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            std::fs::read(&out).expect("read"),
+            "re-encoding {value} changed the module"
+        );
+    }
+}
+
+#[test]
+fn patch_refuses_a_constant_that_does_not_decode() {
+    // Not a module: a byte that says i32.const followed by continuation bytes
+    // that never end. `patch` reads raw bytes, so it has to answer for this
+    // rather than assume a decoder already checked it.
+    let path = scratch().join("broken.wasm");
+    let mut bytes = vec![0x41u8];
+    bytes.extend(std::iter::repeat_n(0x80u8, 12));
+    std::fs::write(&path, &bytes).expect("writing");
+    let (ok, _, stderr) = run(&[
+        "patch",
+        path.to_str().expect("utf-8 path"),
+        "0",
+        "1",
+        "-o",
+        scratch().join("out.wasm").to_str().expect("utf-8 path"),
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("does not decode"), "{stderr}");
+
+    // And one that runs off the end of the file.
+    std::fs::write(&path, [0x41u8, 0x80]).expect("writing");
+    let (ok, _, stderr) = run(&[
+        "patch",
+        path.to_str().expect("utf-8 path"),
+        "0",
+        "1",
+        "-o",
+        scratch().join("out.wasm").to_str().expect("utf-8 path"),
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("does not decode"), "{stderr}");
+}

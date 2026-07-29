@@ -212,6 +212,30 @@ impl ImportGroup {
     }
 }
 
+/// The same body, reaching its state through a lock.
+///
+/// A threaded module's host is shared between its threads, so the pieces live
+/// behind a mutex. The bodies are otherwise identical, and rewriting them here
+/// keeps one table of what each import does rather than two that drift.
+///
+/// A poisoned lock is taken anyway: the panic that poisoned it was a guest
+/// trap, and refusing to answer afterwards would turn one thread's failure
+/// into every other thread's.
+fn through_a_lock(body: &str) -> String {
+    let mut out = body.to_string();
+    for field in ["wasi", "cxx", "emscripten", "embind"] {
+        out = out.replace(
+            &format!("&mut self.{field}"),
+            &format!("&mut *self.{field}.lock().unwrap_or_else(|held| held.into_inner())"),
+        );
+        out = out.replace(
+            &format!("self.{field}."),
+            &format!("self.{field}.lock().unwrap_or_else(|held| held.into_inner())."),
+        );
+    }
+    out
+}
+
 /// A wasm signature as a short string: the parameters, then `->`, then the
 /// result. `i` is i32, `j` i64, `f` f32, `d` f64.
 ///
@@ -291,6 +315,20 @@ fn known_import(field: &str, ty: &crate::module::FuncType) -> Option<&'static st
             "self.emscripten.exited_with_live_runtime = true"
         }
         ("emscripten_check_blocking_allowed", "->") => "()",
+        // The thread bookkeeping the glue does for *its* workers, which this
+        // model does not have. Each is a no-op here for a reason that is in
+        // the glue itself rather than in a guess:
+        //
+        // `_emscripten_thread_cleanup` returns a Worker to the pool so it can
+        // be reused; an OS thread that has returned needs nothing.
+        // `_emscripten_thread_set_strongref` keeps a JavaScript reference to a
+        // Worker alive; there is no such reference here.
+        // `_emscripten_thread_mailbox_await` does nothing at all in the glue
+        // when `Atomics.waitAsync` is unavailable — the comment there says so
+        // — and that is the branch this is.
+        ("_emscripten_thread_cleanup", "i->")
+        | ("_emscripten_thread_set_strongref", "i->")
+        | ("_emscripten_thread_mailbox_await", "i->") => "()",
         ("abort", "->") => "rt::trap(\"the module called abort\")",
 
         // ---- the syscalls that are honest over an in-memory filesystem
@@ -428,26 +466,55 @@ pub fn generate_host(module: &Module) -> Result<String> {
         }
     }
     out.push_str("}\n\n");
-    out.push_str(concat!(
-        "/// State the host needs. The four pieces the library answers with, and\n",
-        "/// room for whatever the application's own imports need.\n",
-        "#[derive(Debug, Default)]\n",
-        "pub struct Host {\n",
-        "    /// WASI, and the filesystem it reads.\n    pub wasi: runtime::Wasi,\n",
-        "    /// Exceptions in flight.\n    pub cxx: runtime::Cxx,\n",
-        "    /// Emscripten's runtime state.\n    pub emscripten: runtime::Emscripten,\n",
-        "    /// What embind registered, and what emval is holding.\n",
-        "    pub embind: runtime::Embind,\n",
-        "}\n\n",
-    ));
+    let threaded = analysis.spawn.is_some();
+    if threaded {
+        out.push_str(concat!(
+            "/// State the host needs, behind a lock because this module creates\n",
+            "/// threads.\n",
+            "///\n",
+            "/// Every thread is another instance over the same memory and gets a clone\n",
+            "/// of this — so the pieces are `Arc<Mutex<_>>` rather than owned: a file\n",
+            "/// one thread writes has to be a file the others can read, and a copy per\n",
+            "/// thread would be four filesystems that agree about nothing.\n",
+            "#[derive(Debug, Default, Clone)]\n",
+            "pub struct Host {\n",
+            "    /// WASI, and the filesystem it reads.\n",
+            "    pub wasi: std::sync::Arc<std::sync::Mutex<runtime::Wasi>>,\n",
+            "    /// Exceptions in flight.\n",
+            "    pub cxx: std::sync::Arc<std::sync::Mutex<runtime::Cxx>>,\n",
+            "    /// Emscripten's runtime state.\n",
+            "    pub emscripten: std::sync::Arc<std::sync::Mutex<runtime::Emscripten>>,\n",
+            "    /// What embind registered, and what emval is holding.\n",
+            "    pub embind: std::sync::Arc<std::sync::Mutex<runtime::Embind>>,\n",
+            "}\n\n",
+        ));
+    } else {
+        out.push_str(concat!(
+            "/// State the host needs. The four pieces the library answers with, and\n",
+            "/// room for whatever the application's own imports need.\n",
+            "#[derive(Debug, Default)]\n",
+            "pub struct Host {\n",
+            "    /// WASI, and the filesystem it reads.\n    pub wasi: runtime::Wasi,\n",
+            "    /// Exceptions in flight.\n    pub cxx: runtime::Cxx,\n",
+            "    /// Emscripten's runtime state.\n    pub emscripten: runtime::Emscripten,\n",
+            "    /// What embind registered, and what emval is holding.\n",
+            "    pub embind: runtime::Embind,\n",
+            "}\n\n",
+        ));
+    }
 
     let mut grouped: std::collections::BTreeMap<ImportGroup, Vec<usize>> = Default::default();
     for (index, import) in module.func_imports.iter().enumerate() {
         // The trampolines are generated; they are not the host's to write.
+        // Neither is `__pthread_create_js`, which has to reach back into the
+        // instance and so cannot be a host method at all.
         if analysis
             .invokes
             .iter()
             .any(|invoke| invoke.import == index as u32)
+            || analysis
+                .spawn
+                .is_some_and(|spawn| spawn.import == index as u32)
         {
             continue;
         }
@@ -491,6 +558,13 @@ pub fn generate_host(module: &Module) -> Result<String> {
                 known_import(&import.field, ty)
                     .map(str::to_string)
                     .or_else(|| known_registration(&import.field, ty))
+            });
+            let body = body.map(|body| {
+                if threaded {
+                    through_a_lock(&body)
+                } else {
+                    body
+                }
             });
             let (name, body) = match body {
                 Some(body) => ("caller", body),
@@ -1069,11 +1143,29 @@ impl<'a> Generator<'a> {
             .invokes
             .iter()
             .any(|invoke| invoke.import == index as u32)
+            || self
+                .analysis
+                .spawn
+                .is_some_and(|spawn| spawn.import == index as u32)
     }
 
     fn imports_trait(&mut self) {
-        self.out
-            .push_str("/// What the module needs from its host.\npub trait Imports {\n");
+        if self.analysis.spawn.is_some() {
+            self.out.push_str(concat!(
+                "/// What the module needs from its host.\n",
+                "///\n",
+                "/// `Clone + Send + 'static` because this module creates threads: a new\n",
+                "/// thread is another instance over the same memory, and it needs a host\n",
+                "/// of its own. What `clone` gives it is your decision — a copy, or a\n",
+                "/// handle to one shared host. A copy means a file the thread writes is\n",
+                "/// invisible to the others, which for a filesystem is usually wrong; put\n",
+                "/// the state behind an `Arc<Mutex<_>>` and clone that.\n",
+                "pub trait Imports: Clone + Send + 'static {\n",
+            ));
+        } else {
+            self.out
+                .push_str("/// What the module needs from its host.\npub trait Imports {\n");
+        }
         if !self.analysis.invokes.is_empty() {
             let _ = writeln!(
                 self.out,
@@ -1499,6 +1591,14 @@ impl<'a> Generator<'a> {
                 self.invoke_trampoline(invoke, &ty, import.field.clone());
                 continue;
             }
+            if let Some(spawn) = self
+                .analysis
+                .spawn
+                .filter(|spawn| spawn.import == index as u32)
+            {
+                self.spawn_trampoline(spawn);
+                continue;
+            }
             let args: Vec<String> = (0..ty.params.len()).map(|at| format!("p{at}")).collect();
             // The caller is the first argument, so the rest need the comma the
             // trait signature already carries.
@@ -1518,6 +1618,110 @@ impl<'a> Generator<'a> {
                 rest
             );
         }
+    }
+
+    /// Emits `__pthread_create_js`, which the host cannot answer.
+    ///
+    /// It has to reach back into the instance — spawn a thread, join it to
+    /// this memory, and call the start routine through the table — and the
+    /// `Imports` trait has no way to do that. So it is generated, like the
+    /// `invoke_*` trampolines and for the same reason: every part of it is
+    /// already here.
+    ///
+    /// What the new thread does, in order, is what Emscripten's worker does:
+    ///
+    /// 1. **its stack**, read out of the pthread struct the guest filled in
+    ///    inside `pthread_create`. The glue's `establishStackSpace` does this
+    ///    first and it is not optional: four threads on one stack left a frame
+    ///    with 0 of its 64 fields intact, measured.
+    /// 2. `_emscripten_stack_set_limits(high, low)`, so the module's own
+    ///    overflow checks know where this thread's stack is.
+    /// 3. `_emscripten_thread_init(thread, 0, 0, 1, 0, 0)` — the arguments the
+    ///    glue passes, `can_block` included.
+    /// 4. the start routine, through the table, with its argument.
+    /// 5. `_emscripten_thread_exit(result)`, which is what a `pthread_join`
+    ///    is waiting for.
+    ///
+    /// It returns 0 — the thread was created — and a host that wants to refuse
+    /// a thread has no say, which is the one place this differs from the glue.
+    fn spawn_trampoline(&mut self, spawn: crate::analysis::Spawn) {
+        let index = spawn.import;
+        let init = function_ident_with(spawn.thread_init, &self.analysis, &self.recognised);
+        // `(pthread_ptr, is_main, is_runtime, can_block, default_stacksize,
+        // start_profiling)` in the version that takes six. A version that takes
+        // fewer gets the prefix it takes.
+        let init_arguments = ["p0", "0", "0", "1", "0", "0"]
+            .iter()
+            .take(spawn.thread_init_arity.max(1))
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (stack, size) = crate::analysis::Analysis::PTHREAD_STACK_OFFSETS;
+
+        let mut lines = vec![
+            "    /// `env::__pthread_create_js`, generated rather than asked of the host:"
+                .to_string(),
+            "    /// a thread is another instance over this memory, and only this side can"
+                .to_string(),
+            "    /// make one. The order is the glue's own — the stack out of the pthread"
+                .to_string(),
+            "    /// struct first, then its limits, then `_emscripten_thread_init`, then the"
+                .to_string(),
+            "    /// start routine through the table.".to_string(),
+            format!(
+                "    pub(crate) fn f{index}(&mut self, p0: i32, p1: i32, p2: i32, p3: i32) -> i32 {{"
+            ),
+            "        let _ = p1;".to_string(),
+            "        let mut worker = self.spawn(self.host.clone());".to_string(),
+        ];
+        // The stack the guest allocated for this thread, where the guest wrote
+        // it. Without a stack pointer there is nowhere to put it, and a thread
+        // on another thread's stack destroys its frames.
+        let has_stack = self.analysis.stack_pointer.is_some();
+        if let Some(found) = self.analysis.stack_pointer {
+            let name = global_ident(found.global, &self.analysis);
+            lines.push(format!(
+                "        let high = worker.memory.load32(p0, {stack});"
+            ));
+            lines.push(format!(
+                "        let low = high - worker.memory.load32(p0, {size});"
+            ));
+            lines.push(format!("        worker.{name} = high;"));
+        }
+        lines.push("        std::thread::spawn(move || {".to_string());
+        if has_stack {
+            match spawn.stack_set_limits {
+                Some(func) => lines.push(format!(
+                    "            worker.{}(high, low);",
+                    function_ident_with(func, &self.analysis, &self.recognised)
+                )),
+                None => lines.push("            let _ = low;".to_string()),
+            }
+        }
+        lines.push(format!("            worker.{init}({init_arguments});"));
+        match spawn.thread_exit {
+            // What the glue's `finish` does: the joining thread is waiting for
+            // exactly this, and without it `pthread_join` never returns.
+            Some(func) => {
+                lines.push(format!(
+                    "            let result = worker.call_indirect_{}(p2, p3);",
+                    spawn.entry_type
+                ));
+                lines.push(format!(
+                    "            worker.{}(result);",
+                    function_ident_with(func, &self.analysis, &self.recognised)
+                ));
+            }
+            None => lines.push(format!(
+                "            worker.call_indirect_{}(p2, p3);",
+                spawn.entry_type
+            )),
+        }
+        lines.push("        });".to_string());
+        lines.push("        0".to_string());
+        lines.push("    }".to_string());
+        lines.push(String::new());
+        let _ = writeln!(self.out, "{}", lines.join("\n"));
     }
 
     /// Emits one `invoke_*` trampoline.
@@ -1586,6 +1790,12 @@ impl<'a> Generator<'a> {
         // appear in no `call_indirect` at all.
         for invoke in &self.analysis.invokes {
             signatures.insert(invoke.callee_type);
+        }
+        // A thread's start routine is reached the same way, and in a module
+        // that only ever starts threads there is no `call_indirect` of that
+        // shape anywhere.
+        if let Some(spawn) = self.analysis.spawn {
+            signatures.insert(spawn.entry_type);
         }
         for type_index in signatures {
             let ty = self.module.types.get(type_index as usize).ok_or_else(|| {

@@ -288,3 +288,232 @@ fn the_voip_module_generates_all_of_its_trampolines() {
         module.func_imports.len()
     );
 }
+
+// ---- the pthread trampoline ----
+
+/// A module shaped like an Emscripten `-pthread` one: a shared memory, the
+/// `__pthread_create_js` import, and the three exports the glue calls on a new
+/// thread.
+///
+/// `_emscripten_thread_init` here does what the real one does as far as this
+/// is concerned — it records that it ran — and the start routine writes where
+/// the test can see it.
+const THREADED: &str = r#"(module
+    (import "env" "__pthread_create_js" (func $create (param i32 i32 i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_write"
+        (func $fd_write (param i32 i32 i32 i32) (result i32)))
+    (import "env" "memory" (memory 1 4 shared))
+    (global $sp (export "__stack_pointer") (mut i32) (i32.const 65536))
+    (type $entry (func (param i32) (result i32)))
+    (func (export "_emscripten_thread_init") (param i32 i32 i32 i32 i32 i32)
+        i32.const 16 local.get 1 i32.store)
+    (func (export "emscripten_stack_set_limits") (param i32 i32)
+        i32.const 20 local.get 0 i32.store
+        i32.const 24 local.get 1 i32.store)
+    (func (export "_emscripten_thread_exit") (param i32)
+        i32.const 28 local.get 0 i32.store)
+    (func $routine (type $entry)
+        i32.const 32 local.get 0 i32.store
+        i32.const 36 global.get $sp i32.store
+        local.get 0 i32.const 1 i32.add)
+    (func (export "create") (param i32) (result i32)
+        local.get 0 i32.const 0 i32.const 0 i32.const 7 call $create)
+    (func (export "write") (result i32)
+        i32.const 1 i32.const 64 i32.const 1 i32.const 80 call $fd_write)
+    (table 1 funcref)
+    (elem (i32.const 0) func 5))"#;
+
+#[test]
+fn the_pthread_glue_is_recognised_when_all_of_it_is_there() {
+    let wasm = common::assemble("pthread", THREADED);
+    let module = Module::parse(&wasm).expect("valid");
+    let spawn = analysis::analyse(&module)
+        .spawn
+        .expect("every part of it is present");
+    assert_eq!(spawn.import, 0);
+    assert_eq!(spawn.thread_init_arity, 6);
+    assert!(spawn.stack_set_limits.is_some());
+    assert!(spawn.thread_exit.is_some());
+}
+
+#[test]
+fn the_pthread_glue_is_refused_when_a_part_is_missing() {
+    // Each of these is a module that looks like it has threads and does not,
+    // and generating a trampoline for any of them would be inventing one.
+    let without_shared_memory = THREADED.replace(
+        r#"(import "env" "memory" (memory 1 4 shared))"#,
+        "(memory 1)",
+    );
+    let without_init = THREADED.replace(r#"(export "_emscripten_thread_init") "#, "");
+    let wrong_shape = THREADED.replace(
+        r#"(func $create (param i32 i32 i32 i32) (result i32))"#,
+        r#"(func $create (param i32 i32) (result i32))"#,
+    );
+    for (name, wat) in [
+        ("no-shared", without_shared_memory),
+        ("no-init", without_init),
+        ("wrong-shape", wrong_shape),
+    ] {
+        let wasm = common::assemble(&format!("pthread-{name}"), &wat);
+        let module = Module::parse(&wasm).expect("valid");
+        assert!(
+            analysis::analyse(&module).spawn.is_none(),
+            "{name}: a trampoline here would be invented"
+        );
+        // And what is not generated is asked of the host instead, rather than
+        // quietly disappearing.
+        if name != "wrong-shape" {
+            let host = codegen::generate_host(&module).expect("generates");
+            assert!(
+                host.contains(r#"todo!("env::__pthread_create_js")"#),
+                "{name}: {host}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_thread_the_guest_creates_gets_its_own_stack_and_is_joined() {
+    // The order is the glue's own and none of it is optional: the stack out of
+    // the pthread struct, its limits, `_emscripten_thread_init`, the routine,
+    // and the exit a `pthread_join` is waiting for.
+    let wasm = common::assemble("pthread-run", THREADED);
+    let code = common::decompile(&wasm);
+    assert!(
+        code.contains("let mut worker = self.spawn(self.host.clone());"),
+        "{code}"
+    );
+    assert!(code.contains("worker.g0_stack_pointer = high;"), "{code}");
+
+    const DRIVER: &str = r#"
+mod generated;
+fn main() {
+    let mut instance = generated::Instance::with_host(generated::NoImports);
+    // A pthread struct at 1024: its stack is 8 KiB ending at 0x8000, written
+    // where Emscripten's own `establishStackSpace` reads it.
+    instance.memory.store32(1024, 48, 0x8000);
+    instance.memory.store32(1024, 52, 0x2000);
+    instance.create(1024);
+    // The thread runs on another OS thread; wait for the exit it reports.
+    for _ in 0..1000 {
+        if instance.memory.load32(28, 0) != 0 { break; }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    println!("init ran: {}", instance.memory.load32(16, 0));
+    println!("limits: {:#x} {:#x}", instance.memory.load32(20, 0), instance.memory.load32(24, 0));
+    println!("routine saw arg {} on stack {:#x}", instance.memory.load32(32, 0), instance.memory.load32(36, 0));
+    println!("exit reported {}", instance.memory.load32(28, 0));
+}
+"#;
+    let output = common::run_with_driver("pthread-run", &wasm, DRIVER);
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "init ran: 0", "is_main is 0 for a new thread");
+    assert_eq!(
+        lines[1], "limits: 0x8000 0x6000",
+        "the stack it was given, and its low end"
+    );
+    assert_eq!(
+        lines[2], "routine saw arg 7 on stack 0x8000",
+        "its argument, and a stack pointer of its own rather than the main \
+         thread's 0x10000"
+    );
+    assert_eq!(lines[3], "exit reported 8", "what the routine returned");
+}
+
+#[test]
+fn a_thread_without_the_optional_exports_still_runs() {
+    // `emscripten_stack_set_limits` and `_emscripten_thread_exit` are what the
+    // glue calls when they are there. A module without them still gets a
+    // thread — it just cannot report its limits or release a join, which is
+    // the module's own shape rather than something to refuse over.
+    let wat = THREADED
+        .replace(r#"(export "emscripten_stack_set_limits") "#, "")
+        .replace(r#"(export "_emscripten_thread_exit") "#, "");
+    let wasm = common::assemble("pthread-minimal", &wat);
+    let module = Module::parse(&wasm).expect("valid");
+    let spawn = analysis::analyse(&module).spawn.expect("still recognised");
+    assert!(spawn.stack_set_limits.is_none());
+    assert!(spawn.thread_exit.is_none());
+
+    let code = common::decompile(&wasm);
+    assert!(
+        code.contains("let _ = low;"),
+        "nothing to report it to:\n{code}"
+    );
+    assert!(
+        !code.contains("let result = worker.call_indirect_"),
+        "and nothing to hand the result to"
+    );
+}
+
+#[test]
+fn a_thread_gets_no_stack_when_the_module_names_no_stack_pointer() {
+    // Without one there is nowhere to put the stack the guest allocated, and
+    // the thread runs on whatever the instance started with. The trampoline is
+    // still generated — the alternative is no thread at all — and it simply
+    // does not set what it cannot find.
+    // The global stays; what goes is the export that names it, which is the
+    // only evidence this module offers — its functions have no prologues.
+    let wat = THREADED.replace(
+        r#"(global $sp (export "__stack_pointer") (mut i32)"#,
+        r#"(global $sp (mut i32)"#,
+    );
+    let wasm = common::assemble("pthread-no-sp", &wat);
+    let module = Module::parse(&wasm).expect("valid");
+    let analysis = analysis::analyse(&module);
+    assert!(analysis.stack_pointer.is_none());
+    assert!(analysis.spawn.is_some(), "still a thread");
+
+    let code = common::decompile(&wasm);
+    assert!(code.contains("let mut worker = self.spawn("), "{code}");
+    assert!(
+        !code.contains("let high = worker.memory.load32"),
+        "nothing to read it into:\n{code}"
+    );
+}
+
+#[test]
+fn a_thread_init_that_is_not_the_one_this_knows_is_refused() {
+    // The name is right and the shape is not: passing zeros to something that
+    // takes a float would be a guess about a different function.
+    let wat = THREADED.replace(
+        r#"(func (export "_emscripten_thread_init") (param i32 i32 i32 i32 i32 i32)"#,
+        r#"(func (export "_emscripten_thread_init") (param i32 f64 i32 i32 i32 i32)"#,
+    );
+    let wasm = common::assemble("pthread-odd-init", &wat);
+    let module = Module::parse(&wasm).expect("valid");
+    assert!(analysis::analyse(&module).spawn.is_none());
+}
+
+#[test]
+fn a_threaded_module_asks_its_host_to_cross_threads() {
+    let wasm = common::assemble("pthread-host", THREADED);
+    let module = Module::parse(&wasm).expect("valid");
+    let code = common::decompile(&wasm);
+    assert!(
+        code.contains("pub trait Imports: Clone + Send + 'static"),
+        "a thread needs a host of its own:\n{code}"
+    );
+
+    let host = codegen::generate_host(&module).expect("generates");
+    assert!(
+        host.contains("pub wasi: std::sync::Arc<std::sync::Mutex<runtime::Wasi>>"),
+        "and a copy per thread would be four filesystems that agree about \
+         nothing:\n{host}"
+    );
+    assert!(host.contains("#[derive(Debug, Default, Clone)]"), "{host}");
+    // And a mechanical body reaches that state through the lock, rather than
+    // there being a second table of what each import does.
+    assert!(
+        host.contains(
+            "self.wasi.lock().unwrap_or_else(|held| held.into_inner())\n            .fd_write(caller, p0, p1, p2, p3)"
+        ) || host.contains(
+            "self.wasi.lock().unwrap_or_else(|held| held.into_inner()).fd_write(caller, p0, p1, p2, p3)"
+        ),
+        "{host}"
+    );
+    assert!(
+        !host.contains("__pthread_create_js"),
+        "the trampoline is generated, not asked for"
+    );
+}

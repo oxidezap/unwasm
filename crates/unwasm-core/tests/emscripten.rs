@@ -411,3 +411,80 @@ fn main() {
         "eighty frames, four at a time, none of them touched by another thread"
     );
 }
+
+/// The guest's own `pthread_create`, running.
+///
+/// This is the piece that could not be a host method: `__pthread_create_js`
+/// has to reach back into the instance — spawn a thread, join it to this
+/// memory, give it the stack the guest allocated, and call the start routine
+/// through the table. So it is generated, like the `invoke_*` trampolines and
+/// for the same reason: every part of it is already here.
+///
+/// What the test is really pinning is the order, which is the glue's own and
+/// none of which is optional. Leave out the stack and threads destroy each
+/// other's frames; leave out `_emscripten_thread_exit` and `pthread_join`
+/// waits forever, which is exactly what happened while this was being written.
+#[test]
+#[ignore = "needs emcc"]
+fn a_thread_the_guest_creates_itself_runs_and_joins() {
+    let wasm = compile_emscripten(
+        "em-pthread",
+        r#"#include <pthread.h>
+           #include <stdatomic.h>
+           _Atomic int counter = 0;
+           static void *bump(void *arg) {
+               for (int i = 0; i < 1000; i++) atomic_fetch_add(&counter, 1);
+               return arg;
+           }
+           __attribute__((export_name("go")))
+           int go(void) {
+               pthread_t thread;
+               if (pthread_create(&thread, 0, bump, 0) != 0) return -1;
+               if (pthread_join(thread, 0) != 0) return -2;
+               return atomic_load(&counter);
+           }"#,
+        "c",
+        &["-O1", "-pthread"],
+    );
+    let module = Module::parse(&wasm).expect("the module decodes");
+    let analysis = unwasm_core::analysis::analyse(&module);
+    let spawn = analysis.spawn.expect("the pthread glue is all there");
+    assert!(
+        spawn.thread_exit.is_some(),
+        "without it a join never returns"
+    );
+
+    let generated = codegen::generate(&module).expect("generates");
+    // The stack, then its limits, then thread_init, then the routine, then the
+    // exit that releases the join.
+    assert!(
+        generated.contains("worker.g0_stack_pointer = high;"),
+        "{generated}"
+    );
+    assert!(generated.contains("let mut worker = self.spawn(self.host.clone());"));
+    let host = codegen::generate_host(&module).expect("generates a host");
+    assert!(
+        !host.contains("__pthread_create_js"),
+        "it is generated, not asked of the host:\n{host}"
+    );
+    assert!(
+        host.contains("pub wasi: std::sync::Arc<std::sync::Mutex<runtime::Wasi>>"),
+        "and a threaded module's host is shared between its threads:\n{host}"
+    );
+
+    const DRIVER: &str = r#"
+mod generated;
+mod host;
+fn main() {
+    let mut instance = generated::Instance::with_host(host::Host::default());
+    println!("{}", instance.go());
+}
+"#;
+    let output = common::run_with_host("em-pthread", &generated, &host, DRIVER);
+    assert_eq!(
+        output.trim(),
+        "1000",
+        "the guest created a thread, it ran a thousand atomic increments on a \
+         stack of its own, and the join returned"
+    );
+}

@@ -22,6 +22,7 @@ usage:
   unwasm frames    <module.wasm> [--outside]
   unwasm bytes     <module.wasm> <offset> <length>
   unwasm constants <module.wasm> <value>
+  unwasm patch     <module.wasm> <offset> <value> -o <patched.wasm>
   unwasm inspect   <module.wasm>
 
   -o <out>       a path ending in .rs writes one file; any other path is a
@@ -66,6 +67,11 @@ recognise someone else's.
 encoded length of each — all of them, which a hand-counted subset is not. An
 error code that occurs 481 times is not nine sites, and an account built on the
 nine is guessing.
+
+`patch` rewrites the constant at an offset, keeping the encoding the same
+length so nothing else in the module moves. The SLEB arithmetic is where a
+hand-written patch goes wrong — `775533` is `ed aa 2f`, and assuming `ad aa 2f`
+finds nothing, which looks exactly like the code having changed.
 
 `frames --outside` lists the functions whose stores land past the end of their
 own stack frame — an overrun of a local array writes into the caller's frame,
@@ -114,6 +120,7 @@ fn run(arguments: &[String]) -> Result<String, String> {
         Some("signatures") => signatures(&arguments[1..]),
         Some("frames") => frames(&arguments[1..]),
         Some("bytes") => bytes(&arguments[1..]),
+        Some("patch") => patch(&arguments[1..]),
         Some("constants") => constants(&arguments[1..]),
         Some("inspect") => inspect(&arguments[1..]),
         Some("-h" | "--help" | "help") | None => Ok(USAGE.to_string()),
@@ -344,6 +351,113 @@ fn host(arguments: &[String]) -> Result<String, String> {
             ))
         }
         None => Ok(skeleton),
+    }
+}
+
+/// Rewrites one `i32.const` in place, keeping its encoding the same length.
+///
+/// This is the other half of `constants`: that command lists the sites, and
+/// giving each one a distinct value is how a reader learns which fired. Doing
+/// it by hand means computing a signed LEB128 and counting bytes, which is
+/// exactly where it goes wrong — an encoding one byte short is not found, and
+/// "the pattern is not in the module" reads like the code having changed
+/// rather than like arithmetic.
+///
+/// Same length or nothing: a shorter or longer encoding would move every byte
+/// after it, and every offset anybody had written down with it.
+fn patch(arguments: &[String]) -> Result<String, String> {
+    let path = arguments.first().ok_or("patch needs a module path")?;
+    let offset: usize = arguments
+        .get(1)
+        .ok_or("patch needs the offset of the instruction")?
+        .parse()
+        .map_err(|_| "the offset must be a number".to_string())?;
+    let value: i64 = arguments
+        .get(2)
+        .ok_or("patch needs the value to put there")?
+        .parse()
+        .map_err(|_| "the value must be a number".to_string())?;
+    let mut destination = None;
+    let mut rest = arguments[3..].iter();
+    while let Some(argument) = rest.next() {
+        match argument.as_str() {
+            "-o" | "--output" => {
+                destination = Some(rest.next().ok_or("-o needs a path")?.clone());
+            }
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+    }
+    let destination = destination.ok_or("patch writes a new module, so it needs -o <path>")?;
+
+    let mut raw = std::fs::read(path).map_err(|error| format!("reading {path}: {error}"))?;
+    match raw.get(offset) {
+        Some(0x41) => {}
+        Some(other) => {
+            return Err(format!(
+                "{offset} holds {other:#04x}, not an i32.const (0x41). \
+                 `unwasm constants` gives the offset of one"
+            ));
+        }
+        None => return Err(format!("{offset} is past the end of {path}")),
+    }
+
+    let was = read_signed_leb(&raw[offset + 1..])
+        .ok_or_else(|| format!("the constant at {offset} does not decode"))?;
+    let encoded = signed_leb(value);
+    if encoded.len() != was.1 {
+        return Err(format!(
+            "{value} encodes to {} bytes and the constant there takes {}. \
+             A different length moves everything after it, and every offset \
+             written down with it — pick a value that fits, or patch the \
+             surrounding instruction instead",
+            encoded.len(),
+            was.1
+        ));
+    }
+
+    raw.splice(offset + 1..offset + 1 + was.1, encoded.iter().copied());
+    std::fs::write(&destination, &raw)
+        .map_err(|error| format!("writing {destination}: {error}"))?;
+    Ok(format!(
+        "wrote {destination}: i32.const {} at {offset} is now i32.const {value} \
+         ({} bytes, unmoved)\n",
+        was.0, was.1
+    ))
+}
+
+/// Decodes a signed LEB128, returning the value and how many bytes it took.
+fn read_signed_leb(bytes: &[u8]) -> Option<(i64, usize)> {
+    let mut value: i64 = 0;
+    let mut shift = 0;
+    for (at, byte) in bytes.iter().enumerate() {
+        value |= i64::from(byte & 0x7F) << shift;
+        shift += 7;
+        if byte & 0x80 == 0 {
+            // Sign-extend from the last bit that was written.
+            if shift < 64 && byte & 0x40 != 0 {
+                value |= -1i64 << shift;
+            }
+            return Some((value, at + 1));
+        }
+        if shift >= 64 {
+            return None;
+        }
+    }
+    None
+}
+
+/// Encodes a signed LEB128, in the shortest form — which is what a toolchain
+/// emits, and what a same-length replacement has to match.
+fn signed_leb(mut value: i64) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        let done = (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0);
+        bytes.push(if done { byte } else { byte | 0x80 });
+        if done {
+            return bytes;
+        }
     }
 }
 
