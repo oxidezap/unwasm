@@ -183,6 +183,11 @@ unreachable rather than untested:**
   section, and a body count mismatch — and `malformed.rs` has a test for each,
   asserting the decoder's message rather than ours.
 
+Three more are in `codegen.rs`, in the table-type map: a table entry whose
+function index has no type, a type index past `u16::MAX`, and a signature
+missing from the type section. All three are malformed-module defences that
+`wasm-tools` will not assemble, and the third is unreachable by construction.
+
 Keep them. Deleting a defence to raise a percentage is how a decoder change
 becomes a panic two years later, and the tests record which layer rejects each
 case today, so a change in that answer shows up as a failing test rather than

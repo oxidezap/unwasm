@@ -692,3 +692,86 @@ fn main() {
         "and what was left out says so rather than lying"
     );
 }
+
+// ---- reaching what the module only named by index ----
+
+#[test]
+fn a_module_with_no_table_has_nothing_to_invoke() {
+    let wasm = common::assemble(
+        "invoke-no-table",
+        r#"(module (func (export "f") (result i32) i32.const 1))"#,
+    );
+    let code = common::decompile(&wasm);
+    assert!(!code.contains("TABLE_TYPE"), "{code}");
+    assert!(!code.contains("pub fn invoke_slot"), "{code}");
+}
+
+#[test]
+fn a_table_slot_can_be_called_from_outside() {
+    // An embind registration is a table index and nothing else: the module
+    // tells its host "call slot 4173 to reach `startVoipCall`". A host with
+    // only `call_indirect_7` has to know that 4173 is of type 7, and this is
+    // where that comes from.
+    let wasm = common::assemble(
+        "invoke-slot",
+        r#"(module
+            (memory (export "memory") 1)
+            (type $unary (func (param i32) (result i32)))
+            (type $void (func))
+            (type $floats (func (param f64) (result f64)))
+            (type $single (func (param f32) (result f32)))
+            (type $wide (func (param i64) (result i64)))
+            (func (type $unary) local.get 0 i32.const 2 i32.mul)
+            (func (type $void) i32.const 0 i32.const 42 i32.store)
+            (func (type $floats) local.get 0 f64.const 1.5 f64.add)
+            (func (type $single) local.get 0 f32.const 0.5 f32.add)
+            (func (type $wide) local.get 0 i64.const 1 i64.add)
+            (func (export "read") (result i32) i32.const 0 i32.load)
+            (table 6 funcref)
+            (elem (i32.const 1) func 0 1 2 3 4))"#,
+    );
+    let code = common::decompile(&wasm);
+    assert!(code.contains("const TABLE_TYPE: &[u8] = b\""), "{code}");
+
+    const DRIVER: &str = r#"
+mod generated;
+fn main() {
+    let mut instance = generated::Instance::new();
+    println!("{:?}", instance.slot_type(0));
+    println!("{:?}", instance.invoke_slot(1, &[21]));
+    println!("{:?}", instance.invoke_slot(2, &[]));
+    println!("read {}", instance.read());
+    // A float travels as its bits, because a cast would round it.
+    let answer = instance.invoke_slot(3, &[2.25f64.to_bits() as i64]).unwrap().unwrap();
+    println!("{}", f64::from_bits(answer as u64));
+    let single = instance.invoke_slot(4, &[i64::from(1.25f32.to_bits())]).unwrap().unwrap();
+    println!("{}", f32::from_bits(single as u32));
+    // An i64 travels as itself, which is the whole reason the wire is i64.
+    println!("{:?}", instance.invoke_slot(5, &[i64::MAX - 1]));
+    // The three ways it refuses, rather than guessing at any of them.
+    println!("{:?}", instance.invoke_slot(0, &[]).unwrap_err());
+    println!("{:?}", instance.invoke_slot(1, &[]).unwrap_err());
+    println!("{:?}", instance.invoke_slot(99, &[]).unwrap_err());
+}
+"#;
+    let output = common::run_with_driver("invoke-slot", &wasm, DRIVER);
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "None", "slot 0 was never filled");
+    assert_eq!(lines[1], "Ok(Some(42))", "twice 21");
+    assert_eq!(
+        lines[2], "Ok(None)",
+        "a void call returns nothing, not zero"
+    );
+    assert_eq!(lines[3], "read 42", "and it really ran");
+    assert_eq!(lines[4], "3.75");
+    assert_eq!(lines[5], "1.75", "an f32 travels as its bits too");
+    assert_eq!(
+        lines[6],
+        format!("Ok(Some({}))", i64::MAX),
+        "and an i64 as itself"
+    );
+    // The three ways it refuses, rather than guessing at any of them.
+    assert!(lines[7].contains("slot 0 is empty"), "{}", lines[7]);
+    assert!(lines[8].contains("arity"), "{}", lines[8]);
+    assert!(lines[9].contains("empty"), "{}", lines[9]);
+}

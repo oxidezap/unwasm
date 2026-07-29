@@ -689,7 +689,8 @@ impl Analysis {
 }
 
 /// The type index of a function, whether imported or defined.
-fn type_index_of(module: &Module, func: u32) -> Option<u32> {
+#[must_use]
+pub fn type_index_of(module: &Module, func: u32) -> Option<u32> {
     let imports = module.func_imports.len() as u32;
     if func < imports {
         module.func_imports.get(func as usize).map(|i| i.type_index)

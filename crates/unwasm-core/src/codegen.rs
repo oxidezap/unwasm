@@ -238,6 +238,41 @@ fn through_a_lock(body: &str) -> String {
     out
 }
 
+/// Bytes as a Rust byte-string literal, wrapped so a line stays readable.
+///
+/// A `\` at the end of a line skips the newline *and every space after it*,
+/// so a data byte that is a space immediately after a wrap has to be escaped
+/// or it disappears. That cost 626 bytes of one segment of the VoIP module and
+/// only showed up when the module was run.
+fn byte_string(bytes: impl Iterator<Item = u8>) -> String {
+    let mut out = String::from("b\"");
+    let mut column = 0usize;
+    let mut just_wrapped = false;
+    for byte in bytes {
+        let escaped = match byte {
+            b'"' => "\\\"".to_string(),
+            b'\\' => "\\\\".to_string(),
+            b'\n' => "\\n".to_string(),
+            b'\r' => "\\r".to_string(),
+            b'\t' => "\\t".to_string(),
+            // The one byte a line continuation would swallow.
+            b' ' if just_wrapped => "\\x20".to_string(),
+            0x20..=0x7E => (byte as char).to_string(),
+            other => format!("\\x{other:02x}"),
+        };
+        just_wrapped = false;
+        column += escaped.len();
+        out.push_str(&escaped);
+        if column >= 100 {
+            out.push_str("\\\n    ");
+            column = 0;
+            just_wrapped = true;
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// A wasm signature as a short string: the parameters, then `->`, then the
 /// result. `i` is i32, `j` i64, `f` f32, `d` f64.
 ///
@@ -925,6 +960,7 @@ impl<'a> Generator<'a> {
         self.shared_state();
         self.embed_runtime();
         self.data_constants();
+        self.table_types()?;
         self.imports_trait();
         self.instance_struct();
         self.instance_impl()?;
@@ -1172,40 +1208,11 @@ impl<'a> Generator<'a> {
     /// token. Most of these bytes are text, which costs one character each.
     fn data_constants(&mut self) {
         for (index, segment) in self.module.datas.iter().enumerate() {
-            let _ = write!(self.out, "const DATA_{index}: &[u8] = b\"");
-            let mut column = 0usize;
-            // A line continuation in Rust eats the newline *and every space
-            // after it*, so a data byte that is a space immediately after one
-            // disappears. It cost 626 bytes of one segment of the VoIP module
-            // and did not show up until the module was run.
-            let mut just_wrapped = false;
-            for byte in &segment.bytes {
-                // A byte string takes printable ASCII as itself and everything
-                // else — including every byte above 0x7F — as an escape.
-                let escaped = match byte {
-                    b'"' => "\\\"".to_string(),
-                    b'\\' => "\\\\".to_string(),
-                    b'\n' => "\\n".to_string(),
-                    b'\r' => "\\r".to_string(),
-                    b'\t' => "\\t".to_string(),
-                    // The one byte a continuation would swallow.
-                    b' ' if just_wrapped => "\\x20".to_string(),
-                    0x20..=0x7E => (*byte as char).to_string(),
-                    other => format!("\\x{other:02x}"),
-                };
-                just_wrapped = false;
-                column += escaped.len();
-                self.out.push_str(&escaped);
-                // Wrapped with a line continuation, so the bytes stay exactly
-                // what they were: a bare newline inside the literal would be
-                // one of them.
-                if column >= 100 {
-                    self.out.push_str("\\\n    ");
-                    column = 0;
-                    just_wrapped = true;
-                }
-            }
-            self.out.push_str("\";\n\n");
+            let _ = writeln!(
+                self.out,
+                "const DATA_{index}: &[u8] = {};\n",
+                byte_string(segment.bytes.iter().copied())
+            );
         }
     }
 
@@ -1899,6 +1906,124 @@ impl<'a> Generator<'a> {
     /// signature. The type check wasm does at run time is the match arm's
     /// guard: a slot holding a function of another signature falls through to
     /// the trap, exactly as the engine would.
+    /// What the table holds, by type, and a way to call it from outside.
+    ///
+    /// An embind registration is a table index and nothing else: the module
+    /// tells its host "call slot 4173 to reach `startVoipCall`", and a host
+    /// with only `call_indirect_7` has to know that 4173 is of type 7. This
+    /// emits the map and the call that uses it, so a driver can invoke
+    /// anything the module registered without knowing its shape in advance.
+    ///
+    /// The map is a byte string of two bytes per slot, because 9290 numbers
+    /// written out are 9290 expressions for the compiler to fold.
+    fn table_types(&mut self) -> Result<()> {
+        let size = self.table_size();
+        if size == 0 {
+            return Ok(());
+        }
+        let mut types = vec![u16::MAX; size];
+        for (slot, func) in &self.analysis.table {
+            let Some(index) = crate::analysis::type_index_of(self.module, *func) else {
+                continue;
+            };
+            let Ok(index) = u16::try_from(index) else {
+                // More than 65535 types is not a module anybody has; saying so
+                // is better than truncating an index into a wrong signature.
+                return Ok(());
+            };
+            if let Some(slot) = types.get_mut(*slot as usize) {
+                *slot = index;
+            }
+        }
+        let _ = writeln!(
+            self.out,
+            "/// The type of what each table slot holds, two bytes a slot, big-endian.\n\
+             /// `u16::MAX` marks a slot the module left empty.\n\
+             const TABLE_TYPE: &[u8] = {};\n",
+            byte_string(types.iter().flat_map(|value| value.to_be_bytes()))
+        );
+        Ok(())
+    }
+
+    /// Emits the call that turns a table slot into an invocation.
+    ///
+    /// Arguments and results travel as `i64` because that is the only shape
+    /// that holds every wasm value: an f64 goes as its bits rather than as a
+    /// cast, which would round it. The same convention the default-answer
+    /// record uses.
+    fn invoke_by_slot(&mut self, signatures: &BTreeSet<u32>) {
+        if self.table_size() == 0 {
+            return;
+        }
+        self.out.push_str(concat!(
+            "    /// The type of what a table slot holds, or `None` if it is empty.\n",
+            "    #[must_use]\n",
+            "    pub fn slot_type(&self, slot: i32) -> Option<u32> {\n",
+            "        let at = slot as u32 as usize * 2;\n",
+            "        let bytes = TABLE_TYPE.get(at..at + 2)?;\n",
+            "        let ty = u32::from(u16::from_be_bytes([bytes[0], bytes[1]]));\n",
+            "        (ty != u32::from(u16::MAX)).then_some(ty)\n",
+            "    }\n\n",
+            "    /// Calls whatever the table holds at `slot`.\n",
+            "    ///\n",
+            "    /// This is how a host reaches something the module only ever named by\n",
+            "    /// index — an embind registration is a table slot and nothing else.\n",
+            "    /// Values travel as `i64`, floats as their bits; `Err` says the slot is\n",
+            "    /// empty, its type is one nothing dispatches, or the arguments do not\n",
+            "    /// match the signature, rather than guessing at any of the three.\n",
+            "    ///\n",
+            "    /// # Errors\n",
+            "    ///\n",
+            "    /// As above.\n",
+            "    pub fn invoke_slot(&mut self, slot: i32, args: &[i64]) -> Result<Option<i64>, String> {\n",
+            "        let ty = self\n",
+            "            .slot_type(slot)\n",
+            "            .ok_or_else(|| format!(\"table slot {slot} is empty\"))?;\n",
+            "        match ty {\n",
+        ));
+        for type_index in signatures {
+            let Some(ty) = self.module.types.get(*type_index as usize) else {
+                continue;
+            };
+            let arity = ty.params.len();
+            let arguments: Vec<String> = ty
+                .params
+                .iter()
+                .enumerate()
+                .map(|(at, param)| match param {
+                    ValType::I32 => format!("args[{at}] as i32"),
+                    ValType::I64 => format!("args[{at}]"),
+                    ValType::F32 => format!("f32::from_bits(args[{at}] as u32)"),
+                    ValType::F64 => format!("f64::from_bits(args[{at}] as u64)"),
+                })
+                .collect();
+            let call = format!(
+                "self.call_indirect_{type_index}(slot{}{})",
+                if arguments.is_empty() { "" } else { ", " },
+                arguments.join(", ")
+            );
+            let result = match ty.results.first() {
+                None => format!("{{ {call}; Ok(None) }}"),
+                Some(ValType::I32 | ValType::I64) => format!("Ok(Some(i64::from({call})))"),
+                Some(ValType::F32) => format!("Ok(Some(i64::from({call}.to_bits())))"),
+                Some(ValType::F64) => format!("Ok(Some({call}.to_bits() as i64))"),
+            };
+            let _ = writeln!(
+                self.out,
+                "            {type_index} if args.len() == {arity} => {result},"
+            );
+        }
+        self.out.push_str(concat!(
+            "            other => Err(format!(\n",
+            "                \"table slot {slot} holds type {other}, and {} arguments is not \\\n",
+            "                 its arity\",\n",
+            "                args.len()\n",
+            "            )),\n",
+            "        }\n",
+            "    }\n\n",
+        ));
+    }
+
     fn indirect_dispatchers(&mut self) -> Result<()> {
         let mut signatures: BTreeSet<u32> = BTreeSet::new();
         for func in &self.module.funcs {
@@ -1919,6 +2044,16 @@ impl<'a> Generator<'a> {
         if let Some(spawn) = self.analysis.spawn {
             signatures.insert(spawn.entry_type);
         }
+        // And everything the table holds, so anything reachable through it can
+        // be called from outside as well. That is what an embind registration
+        // is: a table index, and a host with no other way to reach it.
+        // The cost is one arm per table entry, wherever it lands.
+        for func in self.analysis.table.values() {
+            if let Some(index) = crate::analysis::type_index_of(self.module, *func) {
+                signatures.insert(index);
+            }
+        }
+        self.invoke_by_slot(&signatures);
         for type_index in signatures {
             let ty = self.module.types.get(type_index as usize).ok_or_else(|| {
                 Error::invalid("call_indirect names a missing type", "type section")
