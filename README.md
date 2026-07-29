@@ -546,6 +546,36 @@ matched against a module sharing no code whatsoever it produced seven matches
 out of ten, so what it closed was noise. Build the reference yourself; do not
 expect a catalogue to recognise someone else's toolchain.
 
+### Compiling only what a path can reach
+
+Decompiling the VoIP module gives 2.3 million lines of Rust that take
+**21 minutes** to compile. For an investigation that is the bottleneck, and the
+fix is not to compile the other 82%:
+
+```console
+$ unwasm decompile voip.wasm -o out/ --reachable-from 10425 --direct-only
+wrote out/ (116 Rust files plus names.json, 510667 lines, 13347 functions)
+$ cargo build
+Finished in 11.10s
+```
+
+**11 seconds instead of 21 minutes.** The functions left out keep their names
+and signatures and become `unimplemented!()`, so the result still builds — and
+a run that reaches one stops and says which function it wanted, which is a
+worklist rather than a wrong answer:
+
+```
+not implemented: function #229 was not decompiled: --only
+```
+
+Without `--direct-only` the set is complete and useless: `call_indirect` names
+a type rather than a target, so every table slot with a matching signature
+joins it, and on this module that is 98% of the functions. That number is worth
+knowing rather than hiding — it is what "could run" honestly means here.
+
+`start` always comes along, since instantiation runs it before anything the
+caller asked for.
+
 ## Usage
 
 ```console
@@ -556,6 +586,7 @@ $ unwasm decompile module.wasm    # to stdout
 $ unwasm decompile module.wasm -o out.rs      # one file
 $ unwasm decompile module.wasm -o out/        # mod.rs, parts, names.json
 $ unwasm decompile module.wasm -o out/ --only 10532,12114
+$ unwasm decompile module.wasm -o out/ --reachable-from 10425 --direct-only
 $ unwasm signatures reference.wasm -o libc.sigs   # a catalogue, from a build with names
 $ unwasm decompile module.wasm --signatures libc.sigs
 ```

@@ -1904,10 +1904,77 @@ struct Context<'a> {
 struct Value {
     code: String,
     ty: ValType,
-    /// A read of something that can change — a local, a global, a `let` binding
-    /// that is still valid. Folded values are inlined into their consumer, but
-    /// must be spilled before anything runs that could change what they read.
+    /// Whether this is an expression waiting to be inlined into its consumer
+    /// rather than a name that already exists.
+    ///
+    /// A `let` binding is not folded: nothing can change what it holds, so it
+    /// never needs spilling, and re-spilling one produced 36269 lines of
+    /// `let t5: i32 = t4;` in the VoIP module.
     folded: bool,
+    /// What a folded expression reads, and therefore what can invalidate it.
+    reads: Reads,
+}
+
+/// What an expression on the stack depends on.
+///
+/// Only these two, because only pure expressions are ever folded: a load is
+/// impure and gets a name, so a folded value never reads memory. Which means
+/// a store, a `memory.fill` or a `memory.grow` cannot invalidate anything on
+/// the stack, and the spill before them was pure cost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Reads {
+    /// Which locals, by index, as a bitset. A local is a Rust `let mut`, and
+    /// only `local.set` and `local.tee` on *that* index can change it — not a
+    /// call, which cannot reach this function's locals at all.
+    locals: u64,
+    /// A local past the 64th, which the bitset has no room for. Rare enough
+    /// that a conservative "any high local invalidates this" costs nothing.
+    high_local: bool,
+    /// A global, which a call *can* change, since the callee may set it.
+    globals: bool,
+}
+
+impl Reads {
+    /// A read of one local.
+    fn local(index: u32) -> Self {
+        Self {
+            locals: if index < 64 { 1 << index } else { 0 },
+            high_local: index >= 64,
+            globals: false,
+        }
+    }
+
+    /// A read of a global.
+    fn global() -> Self {
+        Self {
+            locals: 0,
+            high_local: false,
+            globals: true,
+        }
+    }
+
+    /// What both operands read.
+    fn and(self, other: Self) -> Self {
+        Self {
+            locals: self.locals | other.locals,
+            high_local: self.high_local || other.high_local,
+            globals: self.globals || other.globals,
+        }
+    }
+
+    /// Whether a write to this local changes what this expression reads.
+    fn touched_by_local(self, index: u32) -> bool {
+        if index < 64 {
+            self.locals & (1 << index) != 0
+        } else {
+            self.high_local
+        }
+    }
+
+    /// Whether a call can change what this reads.
+    fn survives_a_call(self) -> bool {
+        !self.globals
+    }
 }
 
 impl Value {
@@ -2168,8 +2235,13 @@ impl<'a> Body<'a> {
         self.out.push('\n');
     }
 
-    fn push(&mut self, code: String, ty: ValType, folded: bool) {
-        self.stack.push(Value { code, ty, folded });
+    fn push(&mut self, code: String, ty: ValType, folded: bool, reads: Reads) {
+        self.stack.push(Value {
+            code,
+            ty,
+            folded,
+            reads,
+        });
     }
 
     /// How long an expression may get before it is given a name instead.
@@ -2188,7 +2260,8 @@ impl<'a> Body<'a> {
         let name = format!("t{}", self.temps);
         self.temps += 1;
         self.line(&format!("let {name}: {} = {code};", ty.rust_name()));
-        self.push(name, ty, true);
+        // Not folded: it is a binding, and nothing can change what it holds.
+        self.push(name, ty, false, Reads::default());
     }
 
     /// Pushes an expression that can be folded into whatever consumes it.
@@ -2203,9 +2276,9 @@ impl<'a> Body<'a> {
     /// lose the trap it owes on a zero divisor, and folding an atomic
     /// read-modify-write would lose the write. The differential tests caught
     /// both within a minute of the first attempt, which is what they are for.
-    fn push_pure(&mut self, code: &str, ty: ValType) {
+    fn push_pure(&mut self, code: &str, ty: ValType, reads: Reads) {
         if code.len() <= Self::FOLD_LIMIT {
-            self.push(code.to_string(), ty, true);
+            self.push(code.to_string(), ty, true, reads);
         } else {
             self.push_temp(code, ty);
         }
@@ -2232,9 +2305,43 @@ impl<'a> Body<'a> {
     /// write to a local or global, a store, a call. Without it, a folded
     /// `local.get 0` pushed before `local.set 0` would read the new value, and
     /// the output would be wrong in a way that only shows up on some inputs.
+    /// Names everything on the stack, whatever it reads.
+    ///
+    /// For opening a block, where the reason is scope rather than change: a
+    /// value spilled inside a block and consumed after it would name a binding
+    /// that has gone out of scope.
     fn spill_stack(&mut self) {
+        self.spill_if(|_| true);
+    }
+
+    /// Names the values a call could invalidate.
+    ///
+    /// A callee can set a global. It cannot reach this function's locals,
+    /// which are Rust `let mut` bindings — so `frame` folded into an
+    /// expression survives a call, and spilling it was pure cost: 47427 lines
+    /// of `let tN: i32 = frame;` in the VoIP module.
+    fn spill_across_a_call(&mut self) {
+        self.spill_if(|reads| !reads.survives_a_call());
+    }
+
+    /// Names the values a write to this local could invalidate.
+    ///
+    /// By index, not "anything that reads a local": `frame` folded into an
+    /// expression is not invalidated by a write to `l5`, and treating every
+    /// local as one produced 47427 lines of `let tN: i32 = frame;` in the VoIP
+    /// module.
+    fn spill_across_a_local_write(&mut self, index: u32) {
+        self.spill_if(|reads| reads.touched_by_local(index));
+    }
+
+    /// Names the values a write to a global could invalidate.
+    fn spill_across_a_global_write(&mut self) {
+        self.spill_if(|reads| reads.globals);
+    }
+
+    fn spill_if(&mut self, invalidated: impl Fn(Reads) -> bool) {
         for at in 0..self.stack.len() {
-            if !self.stack[at].folded {
+            if !self.stack[at].folded || !invalidated(self.stack[at].reads) {
                 continue;
             }
             let value = self.stack[at].clone();
@@ -2249,6 +2356,7 @@ impl<'a> Body<'a> {
                 code: name,
                 ty: value.ty,
                 folded: false,
+                reads: Reads::default(),
             };
         }
     }
@@ -2479,29 +2587,31 @@ impl<'a> Body<'a> {
                 let alternative = self.pop()?;
                 let consequent = self.pop()?;
                 let ty = consequent.ty;
+                let reads = condition.reads.and(consequent.reads).and(alternative.reads);
                 self.push_pure(
                     &format!(
                         "if {} != 0 {{ {} }} else {{ {} }}",
                         condition.code, consequent.code, alternative.code
                     ),
                     ty,
+                    reads,
                 );
             }
             Op::LocalGet(index) => {
                 let ty = self.local_type(*index)?;
-                self.push(self.local_ident(*index), ty, true);
+                self.push(self.local_ident(*index), ty, true, Reads::local(*index));
             }
             Op::LocalSet(index) => {
                 let value = self.pop()?;
-                self.spill_stack();
+                self.spill_across_a_local_write(*index);
                 self.line(&format!("{} = {};", self.local_ident(*index), value.code));
             }
             Op::LocalTee(index) => {
                 let value = self.pop()?;
-                self.spill_stack();
+                self.spill_across_a_local_write(*index);
                 self.line(&format!("{} = {};", self.local_ident(*index), value.code));
                 let ty = self.local_type(*index)?;
-                self.push(self.local_ident(*index), ty, true);
+                self.push(self.local_ident(*index), ty, true, Reads::local(*index));
             }
             Op::GlobalGet(index) => {
                 let ty = self.global_type(*index)?;
@@ -2509,11 +2619,12 @@ impl<'a> Body<'a> {
                     format!("self.{}", global_ident(*index, self.analysis)),
                     ty,
                     true,
+                    Reads::global(),
                 );
             }
             Op::GlobalSet(index) => {
                 let value = self.pop()?;
-                self.spill_stack();
+                self.spill_across_a_global_write();
                 self.line(&format!(
                     "self.{} = {};",
                     global_ident(*index, self.analysis),
@@ -2554,11 +2665,17 @@ impl<'a> Body<'a> {
                         None => format_i32(*value),
                     },
                 };
-                self.push(code, ValType::I32, true);
+                self.push(code, ValType::I32, true, Reads::default());
             }
-            Op::I64Const(value) => self.push(format_i64(*value), ValType::I64, true),
-            Op::F32Const(value) => self.push(format_f32(*value), ValType::F32, true),
-            Op::F64Const(value) => self.push(format_f64(*value), ValType::F64, true),
+            Op::I64Const(value) => {
+                self.push(format_i64(*value), ValType::I64, true, Reads::default())
+            }
+            Op::F32Const(value) => {
+                self.push(format_f32(*value), ValType::F32, true, Reads::default())
+            }
+            Op::F64Const(value) => {
+                self.push(format_f64(*value), ValType::F64, true, Reads::default())
+            }
             Op::Load { kind, mem } => {
                 let address = self.pop()?;
                 let method = load_method(*kind);
@@ -2570,7 +2687,7 @@ impl<'a> Body<'a> {
             Op::Store { kind, mem } => {
                 let mut values = self.pop_n(2)?;
                 self.spill_operands(&mut values);
-                self.spill_stack();
+                // Nothing folded reads memory, so a memory write invalidates nothing.
                 let (method, cast) = store_method(*kind);
                 let call = self.write_call(method);
                 self.line(&format!(
@@ -2582,7 +2699,7 @@ impl<'a> Body<'a> {
             Op::MemoryGrow => {
                 let mut values = self.pop_n(1)?;
                 self.spill_operands(&mut values);
-                self.spill_stack();
+                // Nothing folded reads memory, so a memory write invalidates nothing.
                 self.push_temp(
                     &format!("self.memory.grow({} as u32)", values[0].code),
                     ValType::I32,
@@ -2591,7 +2708,7 @@ impl<'a> Body<'a> {
             Op::MemoryFill => {
                 let mut values = self.pop_n(3)?;
                 self.spill_operands(&mut values);
-                self.spill_stack();
+                // Nothing folded reads memory, so a memory write invalidates nothing.
                 let call = self.write_call("fill");
                 self.line(&format!(
                     "self.memory.{call}{}, {}, {});",
@@ -2601,7 +2718,7 @@ impl<'a> Body<'a> {
             Op::MemoryCopy => {
                 let mut values = self.pop_n(3)?;
                 self.spill_operands(&mut values);
-                self.spill_stack();
+                // Nothing folded reads memory, so a memory write invalidates nothing.
                 let call = self.write_call("copy");
                 self.line(&format!(
                     "self.memory.{call}{}, {}, {});",
@@ -2611,7 +2728,7 @@ impl<'a> Body<'a> {
             Op::MemoryInit(segment) => {
                 let mut values = self.pop_n(3)?;
                 self.spill_operands(&mut values);
-                self.spill_stack();
+                // Nothing folded reads memory, so a memory write invalidates nothing.
                 // A dropped segment is an empty one, not a missing one: a
                 // zero-length `memory.init` from it still succeeds, and any
                 // other length is out of bounds. Reading `data_dropped` into a
@@ -2686,7 +2803,7 @@ impl<'a> Body<'a> {
             AtomicKind::Store => {
                 let mut values = self.pop_n(2)?;
                 self.spill_operands(&mut values);
-                self.spill_stack();
+                // Nothing folded reads memory, so a memory write invalidates nothing.
                 let call = self.write_call("atomic_store");
                 self.line(&format!(
                     "self.memory.{call}{}, {offset}, {width}, {}{cast_in});",
@@ -2696,7 +2813,7 @@ impl<'a> Body<'a> {
             AtomicKind::Rmw(kind) => {
                 let mut values = self.pop_n(2)?;
                 self.spill_operands(&mut values);
-                self.spill_stack();
+                // Nothing folded reads memory, so a memory write invalidates nothing.
                 let call = self.write_call("atomic_rmw");
                 self.push_temp(
                     &format!(
@@ -2711,7 +2828,7 @@ impl<'a> Body<'a> {
             AtomicKind::Cmpxchg => {
                 let mut values = self.pop_n(3)?;
                 self.spill_operands(&mut values);
-                self.spill_stack();
+                // Nothing folded reads memory, so a memory write invalidates nothing.
                 let call = self.write_call("atomic_cmpxchg");
                 self.push_temp(
                     &format!(
@@ -2724,7 +2841,7 @@ impl<'a> Body<'a> {
             AtomicKind::Notify => {
                 let mut values = self.pop_n(2)?;
                 self.spill_operands(&mut values);
-                self.spill_stack();
+                // Nothing folded reads memory, so a memory write invalidates nothing.
                 // The count decides the program: three threads on a lock and
                 // `notify(addr, 1)` means one of them proceeds.
                 self.push_temp(
@@ -2738,7 +2855,7 @@ impl<'a> Body<'a> {
             AtomicKind::Wait => {
                 let mut values = self.pop_n(3)?;
                 self.spill_operands(&mut values);
-                self.spill_stack();
+                // Nothing folded reads memory, so a memory write invalidates nothing.
                 self.push_temp(
                     &format!(
                         "self.memory.atomic_wait({}, {offset}, {width}, {}{cast_in}, {})",
@@ -2762,7 +2879,10 @@ impl<'a> Body<'a> {
         if num.template().starts_with("rt::") {
             self.push_temp(&code, num.result());
         } else {
-            self.push_pure(&code, num.result());
+            let reads = operands
+                .iter()
+                .fold(Reads::default(), |all, operand| all.and(operand.reads));
+            self.push_pure(&code, num.result(), reads);
         }
         Ok(())
     }
@@ -2780,7 +2900,7 @@ impl<'a> Body<'a> {
             .clone();
         let mut arguments = self.pop_n(ty.params.len())?;
         self.spill_operands(&mut arguments);
-        self.spill_stack();
+        self.spill_across_a_call();
         let call = format!(
             "self.{}({})",
             function_ident_with(index, self.analysis, self.recognised),
@@ -2809,7 +2929,7 @@ impl<'a> Body<'a> {
         let mut index = [index];
         self.spill_operands(&mut index);
         self.spill_operands(&mut arguments);
-        self.spill_stack();
+        self.spill_across_a_call();
         let mut parts = vec![index[0].code.clone()];
         parts.extend(arguments.iter().map(|value| value.code.clone()));
         let call = format!("self.call_indirect_{type_index}({})", parts.join(", "));
@@ -2885,7 +3005,7 @@ impl<'a> Body<'a> {
         self.unreachable = false;
         self.skipping = 0;
         if let Some(result) = frame.result {
-            self.push(format!("r{}", frame.label), result, false);
+            self.push(format!("r{}", frame.label), result, false, Reads::default());
         }
         Ok(())
     }
@@ -3364,12 +3484,14 @@ mod tests {
             code: "l3".to_string(),
             ty: ValType::I32,
             folded: true,
+            reads: Reads::local(3),
         };
         assert_eq!(name.as_operand(), "l3");
         let compound = Value {
             code: "l3 as u32".to_string(),
             ty: ValType::I32,
             folded: true,
+            reads: Reads::local(3),
         };
         assert_eq!(compound.as_operand(), "(l3 as u32)");
     }

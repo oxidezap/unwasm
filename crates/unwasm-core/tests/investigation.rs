@@ -559,3 +559,136 @@ fn a_split_layout_records_the_file_each_line_is_in() {
     assert!(sidecar.contains(r#""file": "part1.rs""#), "{sidecar}");
     common::assert_valid_json(sidecar);
 }
+
+// ---- compiling only what a path can reach ----
+
+/// A module where one export reaches half of it and the other half is dead
+/// weight, plus an indirect call to show the difference the table makes.
+const REACHABLE: &str = r#"(module
+    (memory (export "memory") 1)
+    (type $unary (func (param i32) (result i32)))
+    (func (export "entry") (param i32) (result i32)
+        local.get 0 call 1)
+    (func (param i32) (result i32) local.get 0 call 2)
+    (func (param i32) (result i32) local.get 0 i32.const 2 i32.mul)
+    (func (export "indirect") (param i32) (result i32)
+        local.get 0 i32.const 0 call_indirect (type $unary))
+    (func (type $unary) local.get 0 i32.const 3 i32.mul)
+    (func (export "elsewhere") (result i32) i32.const 9)
+    (table 2 funcref)
+    (elem (i32.const 0) func 4))"#;
+
+#[test]
+fn a_reachable_set_is_the_closure_over_calls() {
+    let wasm = common::assemble("reachable", REACHABLE);
+    let module = Module::parse(&wasm).expect("valid");
+    let analysis = analysis::analyse(&module);
+
+    let from_entry = analysis.reachable_from(&module, 0);
+    assert_eq!(from_entry, [0, 1, 2].into_iter().collect());
+    assert!(
+        !from_entry.contains(&5),
+        "an export nothing calls is not reachable from another one"
+    );
+
+    // A leaf reaches only itself.
+    assert_eq!(
+        analysis.reachable_from(&module, 2),
+        [2].into_iter().collect()
+    );
+}
+
+#[test]
+fn an_indirect_call_reaches_everything_of_that_shape() {
+    // `call_indirect` names a type, not a target, so the reachable set has to
+    // include every slot the table holds with that type — which is the module's
+    // own claim about what could run.
+    let wasm = common::assemble("reachable-indirect", REACHABLE);
+    let module = Module::parse(&wasm).expect("valid");
+    let analysis = analysis::analyse(&module);
+    assert!(analysis.reachable_from(&module, 3).contains(&4));
+    // And the direct-only set does not, which is what makes it smaller and
+    // incomplete.
+    assert!(!analysis.directly_reachable_from(&module, 3).contains(&4));
+}
+
+#[test]
+fn a_cycle_in_the_call_graph_terminates() {
+    // Mutual recursion, and a diamond: reaching a function twice must not walk
+    // it twice, or the closure never finishes.
+    let wasm = common::assemble(
+        "reachable-cycle",
+        r#"(module
+            (func (export "a") (param i32) (result i32)
+                local.get 0 call 1)
+            (func (param i32) (result i32)
+                local.get 0 call 0 call 2)
+            (func (param i32) (result i32) local.get 0))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let analysis = analysis::analyse(&module);
+    assert_eq!(
+        analysis.reachable_from(&module, 0),
+        [0, 1, 2].into_iter().collect()
+    );
+}
+
+#[test]
+fn an_imported_function_in_the_table_is_reachable_too() {
+    // The table can hold an import, and its type comes from the import section
+    // rather than from a body.
+    let wasm = common::assemble(
+        "reachable-import",
+        r#"(module
+            (import "env" "callback" (func (param i32) (result i32)))
+            (type $unary (func (param i32) (result i32)))
+            (func (export "entry") (param i32) (result i32)
+                local.get 0 i32.const 0 call_indirect (type $unary))
+            (table 1 funcref)
+            (elem (i32.const 0) func 0))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let analysis = analysis::analyse(&module);
+    assert!(
+        analysis.reachable_from(&module, 1).contains(&0),
+        "the import the table holds is part of what this can reach"
+    );
+}
+
+#[test]
+fn what_is_left_out_of_a_reachable_set_still_compiles_and_says_so() {
+    // The property the whole thing rests on: a stub keeps its name and its
+    // signature, so the output builds, and a run that reaches one stops and
+    // says which function it wanted rather than answering wrongly.
+    let wasm = common::assemble("reachable-stub", REACHABLE);
+    let module = Module::parse(&wasm).expect("valid");
+    let analysis = analysis::analyse(&module);
+    let only = analysis.reachable_from(&module, 0);
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            only: Some(only),
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+
+    const DRIVER: &str = r#"
+mod generated;
+fn main() {
+    let mut instance = generated::Instance::new();
+    println!("{}", instance.entry(21));
+    let missing = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        generated::Instance::new().elsewhere()
+    }));
+    println!("{}", missing.is_err());
+}
+"#;
+    let output = common::run_with_generated("reachable-stub", &files[0].contents, DRIVER);
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "42", "what was asked for runs");
+    assert_eq!(
+        lines[1], "true",
+        "and what was left out says so rather than lying"
+    );
+}

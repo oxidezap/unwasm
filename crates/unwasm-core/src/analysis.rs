@@ -451,6 +451,97 @@ fn read_call_graph(module: &Module) -> CallGraph {
     graph
 }
 
+impl Analysis {
+    /// Every function reachable from `start`, including through the table.
+    ///
+    /// A direct call names its callee; an indirect one names only a type, so
+    /// everything in the table with that type joins the set. That is the
+    /// module's own claim about what could run — `call_indirect` really can
+    /// reach any slot of the right shape — and it is why this is a reachable
+    /// set rather than a call tree.
+    ///
+    /// What it is for is not curiosity. Decompiling the VoIP module gives 2.3
+    /// million lines of Rust that take twenty minutes to compile, and a reader
+    /// chasing one path does not need the other 81% of it to be code rather
+    /// than a stub.
+    #[must_use]
+    pub fn reachable_from(&self, module: &Module, start: u32) -> std::collections::BTreeSet<u32> {
+        self.reached(module, start, true)
+    }
+
+    /// Every function reachable from `start` by *direct* calls only.
+    ///
+    /// A smaller set, and an incomplete one: an indirect call from inside it
+    /// can land anywhere in the table. It is worth having anyway, because the
+    /// complete set is not a reduction — on the VoIP module 98% of the module
+    /// is reachable once `call_indirect` is followed, since a common signature
+    /// reaches thousands of slots — and this is 19%.
+    ///
+    /// What makes it usable rather than wrong is what happens at the edge: a
+    /// function left out keeps its name and its signature and its body is
+    /// `unimplemented!()`, so a run that reaches one stops and says which
+    /// function it wanted. That is a worklist, not a silent wrong answer.
+    #[must_use]
+    pub fn directly_reachable_from(
+        &self,
+        module: &Module,
+        start: u32,
+    ) -> std::collections::BTreeSet<u32> {
+        self.reached(module, start, false)
+    }
+
+    fn reached(
+        &self,
+        module: &Module,
+        start: u32,
+        through_the_table: bool,
+    ) -> std::collections::BTreeSet<u32> {
+        // Which functions the table holds, by type, so an indirect call can be
+        // resolved to the set it could reach.
+        let mut by_type: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+        for func in self.table.values() {
+            if let Some(ty) = type_index_of(module, *func) {
+                by_type.entry(ty).or_default().push(*func);
+            }
+        }
+
+        let mut reached = std::collections::BTreeSet::new();
+        let mut pending = vec![start];
+        while let Some(func) = pending.pop() {
+            if !reached.insert(func) {
+                continue;
+            }
+            pending.extend(self.call_graph.calls_from(func).iter().copied());
+            if !through_the_table {
+                continue;
+            }
+            for ty in self
+                .call_graph
+                .calls_indirectly
+                .get(&func)
+                .into_iter()
+                .flatten()
+            {
+                pending.extend(by_type.get(ty).into_iter().flatten().copied());
+            }
+        }
+        reached
+    }
+}
+
+/// The type index of a function, whether imported or defined.
+fn type_index_of(module: &Module, func: u32) -> Option<u32> {
+    let imports = module.func_imports.len() as u32;
+    if func < imports {
+        module.func_imports.get(func as usize).map(|i| i.type_index)
+    } else {
+        module
+            .funcs
+            .get((func - imports) as usize)
+            .map(|f| f.type_index)
+    }
+}
+
 /// How many functions must share an address before it is worth pointing out.
 ///
 /// Low enough to catch a context pointer, high enough that a constant two

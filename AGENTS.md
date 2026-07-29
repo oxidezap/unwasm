@@ -128,6 +128,20 @@ into `{0} as u32` gives `a + b as u32`, which is a different number.
 decides — conservatively, since a redundant bracket costs noise and a missing
 one costs an answer.
 
+## A spill is for what the next operation can change
+
+Only pure expressions are folded, and a pure expression reads constants, locals
+and globals — never memory, since a load is impure and gets a name. So:
+
+- a **store**, a `memory.fill`, a `memory.grow` invalidate nothing on the stack;
+- a **call** can set a global but cannot touch this function's Rust locals;
+- a **`local.set N`** invalidates only the values that read local *N*.
+
+`Reads` carries that per value: a 64-bit set of local indices, a flag for the
+locals past it, and whether it reads a global. Getting this wrong is a wrong
+answer on some inputs and not others, which is exactly what the differential
+tests exist for — they were the check on this change.
+
 ## The two rules the value stack lives by
 
 Both were learned from a real module rather than from reasoning:
@@ -178,6 +192,28 @@ Measure with LCOV, not the text report: `cargo llvm-cov --workspace --lcov` and
 count `DA:` records with a zero. The text report's per-file view misses lines
 and reads as better than it is — it said `codegen.rs` was complete while the
 summary counted sixteen.
+
+## Compile time is the bottleneck, and it is mostly the front end
+
+Measured on a 2.9 MiB capture with the rustc cache off (`RUSTC_WRAPPER=`, which
+matters: this machine has `kache` installed and it turns a rebuild into five
+seconds of nothing):
+
+- `cargo check` is **18.5s** of a **22.4s** `cargo build`. Codegen is not the
+  cost; parsing, name resolution and type checking are. So the lever is fewer
+  bytes and fewer statements, not simpler ones.
+- Interleave the configurations when timing. A first run is cold and reads 30%
+  slow; measuring A then B once gave a 30% "improvement" that was the page
+  cache warming up. Repeat and alternate.
+
+Two changes came out of that, both measured in *volume* rather than in a time
+that is within noise: data segments as byte-string literals (`mod.rs` for the
+VoIP module 8.9 MB → 3.3 MB), and spilling only what an operation can actually
+change (508556 → 416101 temporaries).
+
+The one that actually moves the wall clock is not a codegen tweak: it is
+`--reachable-from … --direct-only`, which turns 21 minutes into 11 seconds by
+not compiling the 82% of the module the path never touches.
 
 ## Layout is a compile-time decision, and it was measured
 

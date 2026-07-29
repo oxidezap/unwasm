@@ -33,6 +33,11 @@ usage:
   --signatures <file>  name library code using a catalogue from `signatures`.
   --only <list>  decompile only these function indices
   --with-callees  and everything they call directly
+  --reachable-from <list>  decompile what these functions can reach, and stub
+                 the rest — the closure over direct calls plus every table
+                 entry an indirect call could land on
+  --direct-only  with --reachable-from: follow direct calls only. Smaller and
+                 incomplete; a stub it reaches says which function to add
   --instrument-stores  route every memory write through the watchpoint runtime,
                  so `instance.memory.watch(addr, len)` reports who wrote it
   --offsets      also write offsets.json: which wasm bytes made each line, comma-separated. The
@@ -123,6 +128,8 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
     let mut only: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let mut catalogue: Option<codegen::Signatures> = None;
     let mut with_callees = false;
+    let mut reachable_from: Vec<u32> = Vec::new();
+    let mut direct_only = false;
     let mut instrument = false;
     let mut map_offsets = false;
     let mut rest = arguments[1..].iter();
@@ -144,6 +151,22 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
                 catalogue = Some(read_signatures(value)?);
             }
             "--with-callees" => with_callees = true,
+            "--direct-only" => direct_only = true,
+            "--reachable-from" => {
+                let value = rest
+                    .next()
+                    .ok_or("--reachable-from needs a function index")?;
+                for part in value.split(',').filter(|part| !part.is_empty()) {
+                    reachable_from.push(
+                        part.trim()
+                            .parse::<u32>()
+                            .map_err(|_| format!("--reachable-from takes indices, not `{part}`"))?,
+                    );
+                }
+                if reachable_from.is_empty() {
+                    return Err("--reachable-from needs at least one index".to_string());
+                }
+            }
             "--instrument-stores" => instrument = true,
             "--offsets" => map_offsets = true,
             "--only" => {
@@ -164,6 +187,34 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
     }
 
     let module = read(path)?;
+    if direct_only && reachable_from.is_empty() {
+        return Err("--direct-only modifies --reachable-from".to_string());
+    }
+    if !reachable_from.is_empty() {
+        let count = module.func_imports.len() + module.funcs.len();
+        let analysis = unwasm_core::analysis::analyse(&module);
+        for start in reachable_from {
+            if start as usize >= count {
+                return Err(format!(
+                    "the module has {count} functions, and #{start} is not one of them"
+                ));
+            }
+            only.extend(if direct_only {
+                analysis.directly_reachable_from(&module, start)
+            } else {
+                analysis.reachable_from(&module, start)
+            });
+        }
+        // Instantiation runs `start` before anything else does, so leaving it
+        // out means the first thing that happens is a stub.
+        if let Some(start) = module.start {
+            only.extend(if direct_only {
+                analysis.directly_reachable_from(&module, start)
+            } else {
+                analysis.reachable_from(&module, start)
+            });
+        }
+    }
     if with_callees {
         if only.is_empty() {
             return Err("--with-callees expands --only, so it needs one".to_string());

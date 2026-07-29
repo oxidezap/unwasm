@@ -1150,3 +1150,140 @@ fn constants_finds_every_site_that_pushes_a_value() {
     assert!(!ok);
     assert!(stderr.contains("unexpected argument `2`"), "{stderr}");
 }
+
+#[test]
+fn reachable_from_compiles_a_path_and_stubs_the_rest() {
+    let path = fixture(
+        "reachable-cli",
+        r#"(module
+            (func $leaf (param i32) (result i32) local.get 0)
+            (func (export "entry") (param i32) (result i32) local.get 0 call $leaf)
+            (func (export "elsewhere") (result i32) i32.const 9))"#,
+    );
+    let (ok, stdout, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--reachable-from",
+        "1",
+    ]);
+    assert!(ok, "{stderr}");
+    // `entry` and the leaf it calls are there; the unrelated export is not.
+    assert_eq!(stdout.matches("was not decompiled").count(), 1, "{stdout}");
+
+    // Several starting points, and the module's own `start` if it has one.
+    let (ok, stdout, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--reachable-from",
+        "1,2",
+    ]);
+    assert!(ok, "{stderr}");
+    assert_eq!(stdout.matches("was not decompiled").count(), 0, "{stdout}");
+
+    let (ok, _, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--reachable-from",
+        "99",
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("#99 is not one of them"), "{stderr}");
+
+    let (ok, _, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--reachable-from",
+        "x",
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("takes indices, not `x`"), "{stderr}");
+
+    let (ok, _, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--reachable-from",
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("needs a function index"), "{stderr}");
+
+    let (ok, _, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--direct-only",
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("modifies --reachable-from"), "{stderr}");
+
+    let (ok, _, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--reachable-from",
+        ",",
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("at least one index"), "{stderr}");
+}
+
+#[test]
+fn a_reachable_set_always_includes_what_instantiation_runs() {
+    // `start` runs before anything the caller asks for, so leaving it out
+    // means the first thing that happens is a stub.
+    let path = fixture(
+        "reachable-start",
+        r#"(module
+            (global $g (mut i32) (i32.const 0))
+            (func $init i32.const 7 global.set $g)
+            (func (export "read") (result i32) global.get $g)
+            (start $init))"#,
+    );
+    for arguments in [
+        vec!["--reachable-from", "1", "--direct-only"],
+        vec!["--reachable-from", "1"],
+    ] {
+        let mut all = vec!["decompile", path.to_str().expect("utf-8 path")];
+        all.extend(arguments);
+        let (ok, stdout, stderr) = run(&all);
+        assert!(ok, "{stderr}");
+        assert_eq!(
+            stdout.matches("was not decompiled").count(),
+            0,
+            "the start function came along: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn direct_only_leaves_out_what_the_table_could_reach() {
+    let path = fixture(
+        "reachable-direct-cli",
+        r#"(module
+            (type $unary (func (param i32) (result i32)))
+            (func (export "entry") (param i32) (result i32)
+                local.get 0 i32.const 0 call_indirect (type $unary))
+            (func (type $unary) local.get 0 i32.const 2 i32.mul)
+            (table 1 funcref)
+            (elem (i32.const 0) func 1))"#,
+    );
+    let (ok, whole, _) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--reachable-from",
+        "0",
+    ]);
+    assert!(ok);
+    assert_eq!(whole.matches("was not decompiled").count(), 0, "{whole}");
+
+    let (ok, direct, _) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--reachable-from",
+        "0",
+        "--direct-only",
+    ]);
+    assert!(ok);
+    assert_eq!(
+        direct.matches("was not decompiled").count(),
+        1,
+        "the table's target is left out, and the stub names it: {direct}"
+    );
+}

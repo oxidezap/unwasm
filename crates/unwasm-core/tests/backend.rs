@@ -1300,6 +1300,31 @@ fn a_table_with_both_an_active_and_a_declared_segment_fills_only_the_active_one(
 }
 
 #[test]
+fn a_function_with_more_locals_than_the_bitset_holds_is_still_correct() {
+    // Which locals a folded expression reads is a 64-bit set, and a function
+    // can have more locals than that. Past the 64th the answer is
+    // conservative — any high write invalidates it — and this is the module
+    // that proves the conservative path is still right.
+    let mut wat = String::from(
+        "(module (memory (export \"memory\") 1)\n  (func (export \"go\") (result i32)\n",
+    );
+    for _ in 0..80 {
+        wat.push_str("    (local i32)\n");
+    }
+    // Read local 70, write local 70, and read it again: the value pushed
+    // before the write must not survive it.
+    wat.push_str(
+        "    i32.const 5 local.set 70\n\
+         \x20   local.get 70\n\
+         \x20   i32.const 9 local.set 70\n\
+         \x20   local.get 70\n\
+         \x20   i32.add))",
+    );
+    let wasm = common::assemble("many-locals", &wat);
+    common::assert_agrees("many-locals", &wasm, &[common::call("go", &[])]);
+}
+
+#[test]
 fn every_byte_survives_the_data_literal() {
     // The segments are byte-string literals rather than arrays of `0x41`, and
     // the whole point of that is speed — so the thing to pin is that it costs
