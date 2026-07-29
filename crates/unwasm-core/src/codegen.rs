@@ -224,13 +224,15 @@ impl ImportGroup {
 fn through_a_lock(body: &str) -> String {
     let mut out = body.to_string();
     for field in ["wasi", "cxx", "emscripten", "embind"] {
+        // Through a placeholder, because the locked form contains the text
+        // being replaced: a second pass over `self.wasi.` would find the one
+        // inside `self.wasi.lock()…` and lock it again.
+        let held = format!("<{field}>");
+        out = out.replace(&format!("&mut self.{field}"), &format!("&mut *{held}"));
+        out = out.replace(&format!("self.{field}."), &format!("{held}."));
         out = out.replace(
-            &format!("&mut self.{field}"),
-            &format!("&mut *self.{field}.lock().unwrap_or_else(|held| held.into_inner())"),
-        );
-        out = out.replace(
-            &format!("self.{field}."),
-            &format!("self.{field}.lock().unwrap_or_else(|held| held.into_inner())."),
+            &held,
+            &format!("self.{field}.lock().unwrap_or_else(|held| held.into_inner())"),
         );
     }
     out
@@ -595,10 +597,20 @@ pub fn generate_host_with(module: &Module, defaults: bool) -> Result<String> {
                 // Answering with the zero of the type, and recording that it
                 // did: the hypothesis is not hidden, it is counted.
                 None if defaults => {
+                    // The record is a list of i64, and a float is kept as its
+                    // bits: the argument the guest passed is what a reader
+                    // wants back, and a cast would round it.
                     let arguments: Vec<String> = ty
                         .map(|ty| {
-                            (0..ty.params.len())
-                                .map(|at| format!("i64::from(p{at})"))
+                            ty.params
+                                .iter()
+                                .enumerate()
+                                .map(|(at, param)| match param {
+                                    ValType::I32 => format!("i64::from(p{at})"),
+                                    ValType::I64 => format!("p{at}"),
+                                    ValType::F32 => format!("i64::from(p{at}.to_bits())"),
+                                    ValType::F64 => format!("p{at}.to_bits() as i64"),
+                                })
                                 .collect()
                         })
                         .unwrap_or_default();

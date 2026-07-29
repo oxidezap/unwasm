@@ -581,6 +581,61 @@ fn a_threaded_module_records_its_defaults_through_the_lock() {
         host.contains("pub unanswered: std::sync::Arc<std::sync::Mutex<runtime::Unanswered>>"),
         "{host}"
     );
+    // Locked once. The locked form contains the text being replaced, so a
+    // second pass over it produced `…into_inner()).lock()…`, which is not a
+    // thing — and only showed up fifteen minutes into compiling a 9 MiB
+    // module.
+    assert_eq!(host.matches("into_inner()).lock()").count(), 0, "{host}");
+}
+
+#[test]
+fn a_float_argument_is_recorded_as_its_bits() {
+    // The record is a list of i64 and a cast would round: what a reader wants
+    // back is the argument the guest passed.
+    let wasm = common::assemble(
+        "host-defaults-float",
+        r#"(module
+            (import "env" "render" (func (param i32 f64 f32 i64)))
+            (func (export "go") i32.const 1 f64.const 2 f32.const 3 i64.const 4 call 0))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let host = codegen::generate_host_with(&module, true).expect("generates");
+    assert!(
+        host.contains(
+            r#"record("env::render", &[i64::from(p0), p1.to_bits() as i64, i64::from(p2.to_bits()), p3]);"#
+        ),
+        "{host}"
+    );
+}
+
+#[test]
+fn a_threaded_body_that_takes_a_reference_locks_once() {
+    // `console_error` takes `&mut self.wasi` as well as reading another field,
+    // which is the body that exposed the double lock.
+    let wasm = common::assemble(
+        "host-defaults-console",
+        r#"(module
+            (import "env" "__pthread_create_js"
+                (func (param i32 i32 i32 i32) (result i32)))
+            (import "env" "memory" (memory 1 4 shared))
+            (import "env" "emscripten_console_error" (func (param i32)))
+            (global $sp (export "__stack_pointer") (mut i32) (i32.const 65536))
+            (type $entry (func (param i32) (result i32)))
+            (func (export "_emscripten_thread_init") (param i32 i32 i32 i32 i32 i32))
+            (func (type $entry) local.get 0)
+            (func (export "go") i32.const 1 call 1)
+            (table 1 funcref)
+            (elem (i32.const 0) func 3))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let host = codegen::generate_host(&module).expect("generates");
+    assert!(
+        host.contains(
+            "self.emscripten.lock().unwrap_or_else(|held| held.into_inner()).console_error(caller, &mut *self.wasi.lock().unwrap_or_else(|held| held.into_inner()), p0)"
+        ),
+        "{host}"
+    );
+    assert_eq!(host.matches("into_inner()).lock()").count(), 0, "{host}");
 }
 
 #[test]
