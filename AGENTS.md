@@ -184,6 +184,30 @@ Operands of anything whose receiver is `&mut self` — calls, stores, `memory.*`
 — are named too. `self.f1(self.f2())` does not borrow-check, and relying on
 two-phase borrows to cover the cases where it does is a coin flip per call site.
 
+## Nesting is the module's, and it costs more than it looks
+
+wasm's `block`/`loop`/`if` become Rust's labelled blocks one for one, so the
+output nests exactly as deep as the module does. A `br_table` dispatch in the
+VoIP module nests **1991** of them, and two things follow that neither the
+fixtures nor the small captures show:
+
+- **rustc parses nesting recursively, on an 8 MiB stack, and overflows it.** It
+  dies with `SIGSEGV` and a backtrace through `parse_expr_assoc_with`, which
+  reads as a compiler bug. `RUST_MIN_STACK=134217728` compiles the same file.
+  The harness sets it, and `unwasm decompile` says so — `analysis::deepest_nesting`
+  and `NESTING_RUSTC_HANDLES` — because the alternative is a reader concluding
+  the output does not compile.
+- **The indentation is capped at 32 levels** (`MAX_INDENT`). Uncapped, a line
+  inside that dispatch carried 7964 spaces: one part file was 650 MB, 644 MB of
+  it whitespace, and the module 1.8 GB. Capped it is 227 MB and the
+  decompilation itself halves. Nothing is lost — nobody counts two thousand
+  levels of leading space, and `'b1990` says exactly what the space only
+  suggested.
+
+Both were invisible until the whole VoIP module was taken through rustc, which
+is the argument for doing that rather than trusting that what works on 2 MiB
+works on 10.
+
 ## Unreachable code is not code
 
 After `br`, `return`, `unreachable` or `br_table`, wasm's stack is polymorphic

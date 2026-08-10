@@ -135,6 +135,33 @@ finer buys another 2.5× for four times the files. `--split <n>` overrides it,
 and a module of 512 functions or fewer stays in one file, where it compiles in
 seconds anyway.
 
+### Deep nesting needs a bigger parser stack
+
+wasm's `block`, `loop` and `if` become Rust's labelled blocks one for one, and
+rustc parses that recursively on an 8 MiB stack. A `br_table` dispatch in the
+VoIP module nests **1991** blocks, and rustc dies on it with `SIGSEGV` and a
+backtrace through its own parser — which reads as a compiler bug rather than as
+a file that needs a bigger stack:
+
+```console
+$ RUST_MIN_STACK=134217728 cargo build
+```
+
+`unwasm decompile` says so at the point it writes the file, rather than leaving
+it to be discovered:
+
+```
+note: function #10163 nests 1991 blocks, and rustc parses nesting recursively.
+      Compile this with RUST_MIN_STACK=134217728 set, or rustc overflows its
+      stack and dies with SIGSEGV.
+```
+
+The indentation stops at 32 levels for the same reason it exists at all. Two
+thousand levels of leading space is not readable, and it is not free: uncapped,
+one part file of that module came to 650 MB — 644 MB of which was whitespace —
+and the module to 1.8 GB of Rust. Capped it is 227 MB. The labels are what say
+where a `break` goes; `'b1990` is exact where the indentation was only wide.
+
 ### What the module says about itself
 
 Level 0 translates. Alongside it, a small analysis pass *reads*, and annotates
