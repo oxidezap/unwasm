@@ -109,6 +109,11 @@ function that never writes the stack pointer back — is not in any reference. I
 was found by looking at what clang actually emitted at `-O0`, after the first
 version silently found no frames at all.
 
+Which means **the frame tests are a measurement of a particular clang**. They
+were written against clang 22 and CI pins it. Under Ubuntu 24.04's clang 18 all
+four fail, finding no frame at all — a fourth spelling `read_prologue` does not
+know. Before concluding that a module has no frames, check what built it.
+
 ## Folding is only for expressions that cannot trap
 
 `push_pure` folds an expression into whatever consumes it; `push_temp` gives it

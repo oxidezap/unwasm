@@ -675,6 +675,15 @@ The harness needs `node` (the reference engine), `clang` (wasm32 fixtures),
 rather than skipping them: a run that compared nothing must not report the same
 green as a run that compared everything.
 
+**The clang version matters**, and it is the one requirement that is not
+obvious. `read_prologue` knows three spellings of the shadow-stack prologue,
+each found by reading what clang actually emits at `-O0` — so which frames the
+analysis can see is a property of the compiler that built the fixture. clang 22
+is what these tests were written against and what CI pins. Ubuntu 24.04's
+clang 18 emits a shape none of the three match, and the four frame tests in
+`backend.rs` then report no frame at all. That is a gap in `read_prologue`, not
+in the fixtures, and it is not fixed.
+
 `cargo test --workspace` needs none of the above beyond those four tools —
 it runs on a bare checkout.
 
