@@ -457,6 +457,53 @@ fn inspect_reports_a_stack_pointer_found_by_its_use() {
     );
 }
 
+/// rustc parses nesting recursively and dies with `SIGSEGV` past a couple of
+/// thousand blocks, which reads as a compiler bug. Saying so at the point the
+/// file is written is the difference between a fixable run and a mystery.
+#[test]
+fn decompiling_a_deeply_nested_module_says_what_rustc_will_need() {
+    const DEPTH: usize = 400;
+    let mut wat = String::from("(module (func (export \"deep\") (param i32) (result i32)\n");
+    for at in 0..DEPTH {
+        wat.push_str(&format!(
+            "  block\n  local.get 0\n  i32.const {at}\n  i32.eq\n  br_if 0\n"
+        ));
+    }
+    for _ in 0..DEPTH {
+        wat.push_str("  end\n");
+    }
+    wat.push_str("  local.get 0))\n");
+
+    let path = fixture("sample-deep", &wat);
+    let out = scratch().join("deep.rs");
+    let (ok, stdout, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "-o",
+        out.to_str().expect("utf-8 path"),
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains(&format!("nests {DEPTH} blocks")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("RUST_MIN_STACK"), "{stdout}");
+
+    // And a module rustc can parse on the stack it has says nothing.
+    let shallow = fixture(
+        "sample-shallow",
+        "(module (func (export \"f\") (result i32) (block (result i32) i32.const 1)))",
+    );
+    let (ok, stdout, stderr) = run(&[
+        "decompile",
+        shallow.to_str().expect("utf-8 path"),
+        "-o",
+        scratch().join("shallow.rs").to_str().expect("utf-8 path"),
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(!stdout.contains("RUST_MIN_STACK"), "{stdout}");
+}
+
 #[test]
 fn inspect_reports_a_stack_pointer_the_name_section_names() {
     // No export and no prologue: the module names the global, which is the

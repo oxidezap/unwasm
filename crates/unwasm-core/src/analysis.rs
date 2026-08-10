@@ -579,6 +579,49 @@ pub fn analyse(module: &Module) -> Analysis {
     }
 }
 
+/// The most deeply nested function in the module, and how deep it goes.
+///
+/// wasm's nesting becomes Rust's, one labelled block per `block`, `loop` or
+/// `if` — and rustc parses that recursively on an 8 MiB stack. A module whose
+/// `br_table` dispatch nests two thousand blocks makes rustc overflow it and
+/// die with `SIGSEGV`, which reads as a compiler bug rather than as a module
+/// that needs a bigger stack. Knowing the number before compiling is what turns
+/// that into `RUST_MIN_STACK`.
+///
+/// Returns `None` for a module with no functions.
+#[must_use]
+pub fn deepest_nesting(module: &Module) -> Option<(u32, usize)> {
+    let import_count = module.func_imports.len() as u32;
+    let mut deepest: Option<(u32, usize)> = None;
+    for (at, func) in module.funcs.iter().enumerate() {
+        let mut depth = 0usize;
+        let mut most = 0usize;
+        for op in &func.body {
+            match op {
+                Op::Block(_) | Op::Loop(_) | Op::If(_) => {
+                    depth += 1;
+                    most = most.max(depth);
+                }
+                Op::End => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if deepest.is_none_or(|(_, seen)| most > seen) {
+            deepest = Some((import_count + at as u32, most));
+        }
+    }
+    deepest
+}
+
+/// How deep a function can nest before rustc's default stack is not enough.
+///
+/// Not a guess: rustc parses 1991 nested blocks — the VoIP module's worst
+/// function — by overflowing an 8 MiB stack, and compiles the same file with
+/// `RUST_MIN_STACK` raised. The threshold is set well below that, because the
+/// cost of saying so unnecessarily is a line of output and the cost of not
+/// saying so is a segfault nobody can place.
+pub const NESTING_RUSTC_HANDLES: usize = 300;
+
 /// Reads the call graph out of the function bodies.
 fn read_call_graph(module: &Module) -> CallGraph {
     let import_count = module.func_imports.len() as u32;
@@ -2034,6 +2077,31 @@ mod tests {
             index: 0,
         });
         assert!(analyse(&module).stack_pointer.is_none());
+    }
+
+    #[test]
+    fn the_deepest_nesting_is_the_deepest_one_function_reaches() {
+        // Two functions, and the answer is the deeper one — not the sum, and
+        // not the last. Nesting that closes and reopens is not deeper.
+        let shallow = vec![
+            Op::Block(crate::module::BlockType::Empty),
+            Op::End,
+            Op::Block(crate::module::BlockType::Empty),
+            Op::Block(crate::module::BlockType::Empty),
+            Op::End,
+            Op::End,
+        ];
+        let deep = vec![
+            Op::Block(crate::module::BlockType::Empty),
+            Op::Loop(crate::module::BlockType::Empty),
+            Op::If(crate::module::BlockType::Empty),
+            Op::End,
+            Op::End,
+            Op::End,
+        ];
+        let module = with_bodies(module_with_globals(1, true), vec![shallow, deep]);
+        assert_eq!(deepest_nesting(&module), Some((1, 3)));
+        assert_eq!(deepest_nesting(&Module::default()), None);
     }
 
     #[test]

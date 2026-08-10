@@ -84,6 +84,19 @@ fn workspace_scratch(name: &str) -> PathBuf {
     path
 }
 
+/// rustc, with a stack big enough to parse what this emits.
+///
+/// wasm's nesting becomes Rust's, one labelled block per `block`, `loop` or
+/// `if`, and rustc's parser is recursive. The VoIP module's worst function nests
+/// 1991 blocks; on the default 8 MiB stack rustc overflows and dies with
+/// `SIGSEGV`, which reads as a compiler bug rather than as a file that needs a
+/// bigger stack — and it is what `unwasm decompile` now says before it happens.
+fn rustc() -> Command {
+    let mut command = tool("rustc");
+    command.env("RUST_MIN_STACK", "134217728");
+    command
+}
+
 fn tool(name: &str) -> Command {
     // A missing tool fails the test rather than skipping it: the alternative is
     // a green run that compared nothing.
@@ -463,7 +476,7 @@ fn run_in_rust_with(
     std::fs::write(scratch.join("main.rs"), &main).expect("writing the driver");
 
     let binary = scratch.join("driver");
-    let output = tool("rustc")
+    let output = rustc()
         .args(["--edition", "2024"])
         .arg("-o")
         .arg(&binary)
@@ -639,7 +652,7 @@ pub fn run_with_driver_in_layout(
     std::fs::write(scratch.join("main.rs"), driver).expect("writing the driver");
 
     let binary = scratch.join("driver");
-    let output = tool("rustc")
+    let output = rustc()
         .args(["--edition", "2024"])
         .arg("-o")
         .arg(&binary)
@@ -683,7 +696,7 @@ pub fn run_with_generated(name: &str, generated: &str, driver: &str) -> String {
     write_atomically(&scratch.join("main.rs"), driver.as_bytes());
 
     let binary = scratch.join("driver");
-    let output = tool("rustc")
+    let output = rustc()
         .args(["--edition", "2024"])
         .arg("-o")
         .arg(&binary)

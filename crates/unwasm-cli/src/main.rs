@@ -301,13 +301,26 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
     .map_err(|error| error.to_string())?;
     let lines: usize = files.iter().map(|file| file.contents.lines().count()).sum();
 
+    // Said before rustc says it its own way. wasm's nesting becomes Rust's, and
+    // rustc parses that recursively: past a couple of thousand blocks it
+    // overflows its stack and dies with SIGSEGV, which reads as a compiler bug
+    // rather than as a file that needs a bigger stack to parse.
+    let note = match unwasm_core::analysis::deepest_nesting(&module) {
+        Some((func, depth)) if depth > unwasm_core::analysis::NESTING_RUSTC_HANDLES => format!(
+            "note: function #{func} nests {depth} blocks, and rustc parses nesting \
+             recursively.\n      Compile this with RUST_MIN_STACK=134217728 set, or \
+             rustc overflows its\n      stack and dies with SIGSEGV.\n"
+        ),
+        _ => String::new(),
+    };
+
     // A single-file destination gets the Rust; the index needs a directory to
     // live beside it.
     if single_file {
         std::fs::write(&destination, &files[0].contents)
             .map_err(|error| format!("writing {destination}: {error}"))?;
         return Ok(format!(
-            "wrote {destination} ({} lines, {} functions)\n",
+            "wrote {destination} ({} lines, {} functions)\n{note}",
             files[0].contents.lines().count(),
             module.funcs.len()
         ));
@@ -322,7 +335,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
             .map_err(|error| format!("writing {}: {error}", at.display()))?;
     }
     Ok(format!(
-        "wrote {destination}/ ({} Rust files plus names.json, {lines} lines, {} functions)\n",
+        "wrote {destination}/ ({} Rust files plus names.json, {lines} lines, {} functions)\n{note}",
         files.len() - 1,
         module.funcs.len()
     ))
