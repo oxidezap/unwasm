@@ -765,7 +765,7 @@ fn the_layout_a_module_gets_by_default_follows_its_size() {
 
 /// Indentation stops growing long before the nesting does.
 ///
-/// A `br_table` dispatch in the VoIP module nests 1991 blocks, and indenting
+/// A `br_table` dispatch in the VoIP module nests 2466 blocks, and indenting
 /// each one put 7964 spaces in front of every line inside it: one part file came
 /// to 650 MB, 644 MB of which was whitespace, and the module to 1.8 GB. Nothing
 /// could read that depth off the leading space anyway — the labels are what say

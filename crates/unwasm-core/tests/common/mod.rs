@@ -88,7 +88,7 @@ fn workspace_scratch(name: &str) -> PathBuf {
 ///
 /// wasm's nesting becomes Rust's, one labelled block per `block`, `loop` or
 /// `if`, and rustc's parser is recursive. The VoIP module's worst function nests
-/// 1991 blocks; on the default 8 MiB stack rustc overflows and dies with
+/// 2466 blocks; on the default 8 MiB stack rustc overflows and dies with
 /// `SIGSEGV`, which reads as a compiler bug rather than as a file that needs a
 /// bigger stack — and it is what `unwasm decompile` now says before it happens.
 fn rustc() -> Command {

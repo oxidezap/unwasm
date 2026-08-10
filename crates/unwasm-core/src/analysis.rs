@@ -615,7 +615,7 @@ pub fn deepest_nesting(module: &Module) -> Option<(u32, usize)> {
 
 /// How deep a function can nest before rustc's default stack is not enough.
 ///
-/// Not a guess: rustc parses 1991 nested blocks — the VoIP module's worst
+/// Not a guess: rustc parses 2466 nested blocks — the VoIP module's worst
 /// function — by overflowing an 8 MiB stack, and compiles the same file with
 /// `RUST_MIN_STACK` raised. The threshold is set well below that, because the
 /// cost of saying so unnecessarily is a line of output and the cost of not
