@@ -160,17 +160,18 @@ pub fn assemble(name: &str, wat: &str) -> Vec<u8> {
     std::fs::read(&binary).expect("reading the assembled module")
 }
 
-/// Locates `emcc`.
+/// Locates one of Emscripten's compiler drivers, `emcc` or `em++`.
 ///
-/// The Arch package puts it in `/usr/lib/emscripten` and adds that to `PATH`
+/// The Arch package puts them in `/usr/lib/emscripten` and adds that to `PATH`
 /// through `/etc/profile.d`, which only applies to shells started afterwards —
-/// so a `cargo test` in an older shell would not find it. Looking in the known
-/// location as well means the tests do not depend on which shell ran them.
-fn emcc() -> Option<PathBuf> {
-    if Command::new("emcc").arg("--version").output().is_ok() {
-        return Some(PathBuf::from("emcc"));
+/// so a `cargo test` in an older shell would not find them. Looking in the
+/// known location as well means the tests do not depend on which shell ran
+/// them.
+fn emscripten_driver(name: &str) -> Option<PathBuf> {
+    if Command::new(name).arg("--version").output().is_ok() {
+        return Some(PathBuf::from(name));
     }
-    let packaged = PathBuf::from("/usr/lib/emscripten/emcc");
+    let packaged = PathBuf::from(format!("/usr/lib/emscripten/{name}"));
     packaged.exists().then_some(packaged)
 }
 
@@ -192,8 +193,15 @@ pub fn compile_emscripten(name: &str, source: &str, extension: &str, flags: &[&s
     let output_js = scratch.join("fixture.js");
     std::fs::write(&file, source).expect("writing the fixture");
 
-    let emcc = emcc().expect("emcc is required by this test; install the `emscripten` package");
-    let output = Command::new(emcc)
+    // `em++` for C++, not `emcc` with a `.cpp` argument. The driver decides
+    // which runtime to link, and emcc links libc only: on Emscripten 6 a C++
+    // fixture fails at the link with `undefined symbol: __cxa_throw` and a
+    // suggestion to use the other driver. It used to be linked anyway, so this
+    // is a toolchain difference rather than a fixture that was ever right.
+    let driver = if extension == "cpp" { "em++" } else { "emcc" };
+    let driver = emscripten_driver(driver)
+        .unwrap_or_else(|| panic!("{driver} is required by this test; install Emscripten"));
+    let output = Command::new(driver)
         .arg(&file)
         .args(["-sSTANDALONE_WASM", "--no-entry"])
         .args(flags)
