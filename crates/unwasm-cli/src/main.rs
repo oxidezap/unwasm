@@ -908,6 +908,8 @@ fn inspect(arguments: &[String]) -> Result<String, String> {
             found.global,
             match found.evidence {
                 unwasm_core::analysis::Evidence::Exported => "by its exported name".to_string(),
+                unwasm_core::analysis::Evidence::Named =>
+                    "by its name in the name section".to_string(),
                 unwasm_core::analysis::Evidence::Prologue { functions } =>
                     format!("by {functions} prologues"),
             }

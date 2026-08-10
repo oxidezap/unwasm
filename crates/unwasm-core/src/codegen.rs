@@ -61,6 +61,18 @@ const PART_HEADER: &str = concat!(
     ")]\n\n",
 );
 
+/// What follows [`PART_HEADER`] in a part file, before its first function.
+const PART_OPENING: &str = "use super::*;\n\nimpl<H: Imports> Instance<H> {\n";
+
+/// How many lines of a part file come before its first function.
+///
+/// Derived from the two strings rather than written down: the index says which
+/// line a function is on, and a header that grew by a line would silently move
+/// every one of those answers.
+fn part_prelude_lines() -> usize {
+    PART_HEADER.lines().count() + PART_OPENING.lines().count()
+}
+
 /// The runtime, as text, for embedding in the output.
 ///
 /// The tests are cut off: they belong to this crate, and carrying four hundred
@@ -1529,6 +1541,14 @@ impl<'a> Generator<'a> {
         let import_count = self.module.func_imports.len() as u32;
         let budget = match self.layout {
             Layout::Single => {
+                // Counted forward rather than recounted. `self.out.lines()`
+                // walks everything written so far, and doing that once per
+                // function is quadratic in the size of the output: on a 3.3 MiB
+                // capture it was 152 of the 154 seconds a decompilation took,
+                // and on the 10.2 MiB one it was twenty-five minutes. Each body
+                // ends in a newline, so the count of what is already there plus
+                // the count of what is being added is the count of the whole.
+                let mut lines = self.out.lines().count();
                 for (at, func) in self.module.funcs.iter().enumerate() {
                     let index = import_count + at as u32;
                     let body = self.function(index, func)?;
@@ -1536,8 +1556,9 @@ impl<'a> Generator<'a> {
                         index,
                         function_ident_with(index, &self.analysis, &self.recognised),
                         "mod.rs".to_string(),
-                        self.out.lines().count() + 1,
+                        lines + 1,
                     ));
+                    lines += body.lines().count();
                     self.out.push_str(&body);
                 }
                 self.out.push_str("}\n\n");
@@ -1564,14 +1585,12 @@ impl<'a> Generator<'a> {
                 self.push_part(std::mem::take(&mut current));
                 lines = 0;
             }
-            // Four lines of part header and `impl` opening come before the
-            // first function in a part.
             let file = format!("part{}.rs", self.parts.len());
             self.located.push((
                 index,
                 function_ident_with(index, &self.analysis, &self.recognised),
                 file,
-                lines + 5,
+                part_prelude_lines() + lines + 1,
             ));
             current.push_str(&body);
             lines += body_lines;
@@ -1590,7 +1609,7 @@ impl<'a> Generator<'a> {
     fn push_part(&mut self, functions: String) {
         let mut contents = String::new();
         contents.push_str(PART_HEADER);
-        contents.push_str("use super::*;\n\nimpl<H: Imports> Instance<H> {\n");
+        contents.push_str(PART_OPENING);
         contents.push_str(&functions);
         contents.push_str("}\n");
         let name = format!("part{}.rs", self.parts.len());
@@ -1607,6 +1626,10 @@ impl<'a> Generator<'a> {
             Some(found) if found.global == index => match found.evidence {
                 Evidence::Exported => {
                     "\n    ///\n    /// The C stack pointer: the module exports it under that name."
+                        .to_string()
+                }
+                Evidence::Named => {
+                    "\n    ///\n    /// The C stack pointer: the module's name section calls it that."
                         .to_string()
                 }
                 Evidence::Prologue { functions } => format!(

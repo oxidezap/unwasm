@@ -410,6 +410,14 @@ pub struct Module {
     /// Function names from the name section, indexed by function index. Empty
     /// for a stripped module, which is the normal case for shipped code.
     pub func_names: Vec<(u32, String)>,
+    /// Global names from the name section, indexed by global index.
+    ///
+    /// The same subsection as [`Self::func_names`] and just as absent from a
+    /// shipped module, but it answers a question exports cannot: a linker names
+    /// `__stack_pointer` here whether or not it exports it, and at that point
+    /// the module has said which global holds the C stack rather than left it
+    /// to be inferred from how the code uses it.
+    pub global_names: Vec<(u32, String)>,
 }
 
 impl Module {
@@ -636,6 +644,15 @@ impl Module {
     #[must_use]
     pub fn func_name(&self, index: u32) -> Option<&str> {
         self.func_names
+            .iter()
+            .find(|(at, _)| *at == index)
+            .map(|(_, name)| name.as_str())
+    }
+
+    /// The name section's name for a global, if it kept one.
+    #[must_use]
+    pub fn global_name(&self, index: u32) -> Option<&str> {
+        self.global_names
             .iter()
             .find(|(at, _)| *at == index)
             .map(|(_, name)| name.as_str())
@@ -1060,7 +1077,7 @@ fn check_memory_index(memarg: &wasmparser::MemArg, location: &str) -> Result<()>
     Ok(())
 }
 
-/// Reads the function names out of the name section.
+/// Reads the function and global names out of the name section.
 ///
 /// A malformed name section is not a reason to refuse a module: names are a
 /// convenience, and every shipped module has none at all. What it must not do
@@ -1068,14 +1085,15 @@ fn check_memory_index(memarg: &wasmparser::MemArg, location: &str) -> Result<()>
 fn read_names(data: &[u8], offset: usize, module: &mut Module) {
     let reader = wasmparser::NameSectionReader::new(wasmparser::BinaryReader::new(data, offset));
     for subsection in reader {
-        let Ok(wasmparser::Name::Function(names)) = subsection else {
-            continue;
+        let into = match subsection {
+            Ok(wasmparser::Name::Function(names)) => (names, &mut module.func_names),
+            Ok(wasmparser::Name::Global(names)) => (names, &mut module.global_names),
+            _ => continue,
         };
+        let (names, out) = into;
         for naming in names {
             let Ok(naming) = naming else { continue };
-            module
-                .func_names
-                .push((naming.index, naming.name.to_string()));
+            out.push((naming.index, naming.name.to_string()));
         }
     }
 }

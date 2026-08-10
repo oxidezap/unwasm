@@ -19,6 +19,12 @@ pub enum Evidence {
     /// The module exports it under the name the linker gives it. Conclusive,
     /// and present in unstripped builds.
     Exported,
+    /// The name section names it. Just as conclusive as an export and rather
+    /// more common in a debug build: the linker writes `__stack_pointer` into
+    /// the name section whether or not it also exports the global, and a
+    /// module that names it has said which global holds the C stack rather
+    /// than left it to be read off how the code uses it.
+    Named,
     /// Found by its use: the function prologue that reserves a frame.
     ///
     /// ```wat
@@ -1394,6 +1400,12 @@ fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame>
     };
 
     let mut stack: Vec<Tracked> = Vec::new();
+    // What each local holds, for the locals this walk has watched being
+    // written. At `-O0` an older clang routes every intermediate value through
+    // one of these — the size of the frame, and the frame address itself in the
+    // epilogue — so a walk that only follows the operand stack sees a function
+    // whose frame escapes immediately and can say nothing about it.
+    let mut locals: std::collections::BTreeMap<u32, Tracked> = std::collections::BTreeMap::new();
     for op in &body[prologue.length..] {
         // Control flow ends what this walk can follow. If the frame address is
         // live across it, the analysis gives up rather than losing track of
@@ -1403,13 +1415,28 @@ fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame>
                 frame.escapes = true;
                 return Some(frame);
             }
+            // A local written on one path and read on another holds whatever
+            // the path that ran put there, and this walk follows one path. So
+            // what a local holds is forgotten at the boundary — and a local
+            // holding the frame address when it is forgotten has gone somewhere
+            // this can no longer follow, which is what `escapes` says.
+            if locals
+                .values()
+                .any(|value| matches!(value, Tracked::Frame(_) | Tracked::Derived))
+            {
+                frame.escapes = true;
+            }
+            locals.clear();
             stack.clear();
             continue;
         }
 
         match op {
             Op::LocalGet(index) if *index == base_local => stack.push(Tracked::Frame(0)),
-            Op::LocalGet(_) | Op::GlobalGet(_) => stack.push(Tracked::Other),
+            Op::LocalGet(index) => {
+                stack.push(locals.get(index).copied().unwrap_or(Tracked::Other));
+            }
+            Op::GlobalGet(_) => stack.push(Tracked::Other),
             Op::I32Const(value) => stack.push(Tracked::Const(*value)),
             Op::I64Const(_) | Op::F32Const(_) | Op::F64Const(_) => stack.push(Tracked::Other),
 
@@ -1476,10 +1503,16 @@ fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame>
 
             Op::LocalSet(index) | Op::LocalTee(index) => {
                 let value = stack.pop().unwrap_or(Tracked::Other);
-                // The base being reassigned, or copied somewhere this walk no
-                // longer follows.
-                if matches!(value, Tracked::Frame(_)) || *index == base_local {
+                // The base being reassigned: the local this frame is named
+                // after no longer holds it, and every offset read after this
+                // point would be measured from the wrong address.
+                if *index == base_local {
                     frame.escapes = true;
+                } else {
+                    // Anything else is followed rather than given up on. A copy
+                    // of the frame address is still the frame address, and the
+                    // epilogue of an unoptimised build is exactly that.
+                    locals.insert(*index, value);
                 }
                 if matches!(op, Op::LocalTee(_)) {
                     stack.push(value);
@@ -1590,68 +1623,88 @@ struct Prologue {
     publishes: bool,
 }
 
-/// Matches the prologue: `global.get $sp; i32.const size; i32.sub`, then some
-/// way of keeping the result.
+/// Matches the prologue against the stack pointer this module was told to use.
+fn read_prologue(body: &[Op], stack_pointer: u32) -> Option<Prologue> {
+    let (global, prologue) = match_prologue(body)?;
+    (global == stack_pointer).then_some(prologue)
+}
+
+/// Matches the prologue: the stack pointer, less a constant, kept in a local.
 ///
-/// Three spellings turn up in practice, and the third was a surprise:
+/// Four spellings turn up in practice, and the last two were surprises:
 ///
 /// ```wat
-/// local.tee $base   global.set $sp     ;; the usual one
-/// local.set $base   local.get $base   global.set $sp
-/// local.set $base                      ;; a leaf function at -O0
+/// global.get $sp  i32.const 32  i32.sub  local.tee $base  global.set $sp
+/// global.get $sp  i32.const 32  i32.sub  local.set $base  local.get $base  global.set $sp
+/// global.get $sp  i32.const 32  i32.sub  local.set $base   ;; a leaf function at -O0
+/// global.get $sp  local.set $a  i32.const 32  local.set $b ;; every value through a local
+/// local.get $a    local.get $b  i32.sub       local.set $base
 /// ```
 ///
-/// The last one never writes the stack pointer back. clang emits it for a
-/// function that calls nothing: the space below the pointer is nobody else's
-/// while it runs, so reserving it formally would be wasted work. Requiring the
+/// The third never writes the stack pointer back. clang emits it for a function
+/// that calls nothing: the space below the pointer is nobody else's while it
+/// runs, so reserving it formally would be wasted work. Requiring the
 /// `global.set` — which this did at first — misses every one of them.
-fn read_prologue(body: &[Op], stack_pointer: u32) -> Option<Prologue> {
-    let Op::GlobalGet(index) = body.first()? else {
+///
+/// The fourth is what clang 18 emits at `-O0`, where every intermediate value
+/// goes through its own local and the subtraction reads two of them rather than
+/// the operand stack. clang 22 folds it; the two compilers describe the same
+/// frame. Missing this spelling is how the analysis reported that a module
+/// built by an older clang had no frames at all — a false statement about the
+/// code, made from the compiler's spelling rather than from the module's.
+fn match_prologue(body: &[Op]) -> Option<(u32, Prologue)> {
+    let Op::GlobalGet(global) = body.first()? else {
         return None;
     };
-    if *index != stack_pointer {
-        return None;
-    }
-    let Op::I32Const(size) = body.get(1)? else {
-        return None;
+    // The folded spellings read the stack pointer and the size straight off the
+    // operand stack; the unfolded one parks both in locals first.
+    let (size, rest) = match (body.get(1)?, body.get(2)?, body.get(3)?) {
+        (Op::I32Const(size), Op::Num(sub), _) if sub.name() == "I32Sub" => (*size, 3),
+        (Op::LocalSet(pointer), Op::I32Const(size), Op::LocalSet(reserved)) => {
+            if !matches!(body.get(4)?, Op::LocalGet(index) if index == pointer) {
+                return None;
+            }
+            if !matches!(body.get(5)?, Op::LocalGet(index) if index == reserved) {
+                return None;
+            }
+            if !matches!(body.get(6)?, Op::Num(sub) if sub.name() == "I32Sub") {
+                return None;
+            }
+            (*size, 7)
+        }
+        _ => return None,
     };
-    if *size <= 0 {
-        return None;
-    }
-    if !matches!(body.get(2)?, Op::Num(num) if num.name() == "I32Sub") {
+    if size <= 0 {
         return None;
     }
 
-    match body.get(3)? {
-        Op::LocalTee(base) => match body.get(4) {
-            Some(Op::GlobalSet(sp)) if *sp == stack_pointer => Some(Prologue {
-                size: *size,
-                base_local: *base,
-                length: 5,
-                publishes: true,
-            }),
-            _ => Some(Prologue {
-                size: *size,
-                base_local: *base,
-                length: 4,
-                publishes: false,
-            }),
-        },
-        Op::LocalSet(base) => {
-            let published = matches!(
-                (body.get(4), body.get(5)),
-                (Some(Op::LocalGet(again)), Some(Op::GlobalSet(sp)))
-                    if again == base && *sp == stack_pointer
-            );
-            Some(Prologue {
-                size: *size,
-                base_local: *base,
-                length: if published { 6 } else { 4 },
-                publishes: published,
-            })
+    // However it got here, the reserved address is now on the stack, and what
+    // keeps it decides both which local names the frame and whether the
+    // reservation is published.
+    let (base_local, kept) = match body.get(rest)? {
+        Op::LocalTee(base) | Op::LocalSet(base) => (*base, matches!(body[rest], Op::LocalTee(_))),
+        _ => return None,
+    };
+    let (length, publishes) = match (kept, body.get(rest + 1), body.get(rest + 2)) {
+        // `local.tee $base; global.set $sp`
+        (true, Some(Op::GlobalSet(sp)), _) if sp == global => (rest + 2, true),
+        // `local.set $base; local.get $base; global.set $sp`
+        (false, Some(Op::LocalGet(again)), Some(Op::GlobalSet(sp)))
+            if again == &base_local && sp == global =>
+        {
+            (rest + 3, true)
         }
-        _ => None,
-    }
+        _ => (rest + 1, false),
+    };
+    Some((
+        *global,
+        Prologue {
+            size,
+            base_local,
+            length,
+            publishes,
+        },
+    ))
 }
 
 /// The names a linker gives the stack pointer when it keeps names at all.
@@ -1669,16 +1722,56 @@ fn find_stack_pointer(module: &Module) -> Option<StackPointer> {
         }
     }
 
+    // Failing that, the name section. It survives `--export-all` not reaching
+    // a mutable global, which is how a debug build can name the stack pointer
+    // in every disassembly and still not export it.
+    for (index, name) in &module.global_names {
+        if STACK_POINTER_NAMES.contains(&name.as_str()) {
+            return Some(StackPointer {
+                global: *index,
+                evidence: Evidence::Named,
+            });
+        }
+    }
+
     // Otherwise, count prologues. A minified module keeps no names, but it
     // still has to reserve stack frames, and only one global is used that way.
-    let mut counts = vec![0usize; module.globals.len()];
+    //
+    // Two counts, because they are not equally good evidence. A prologue that
+    // writes the reservation back says the global is shared with everything the
+    // function calls, which is what a stack pointer is for, and the shape alone
+    // is enough. A leaf's prologue only takes the space, and `global.get;
+    // i32.const; i32.sub; local.set` is also just arithmetic on a global — so
+    // that one is counted only when the function goes on to address memory
+    // through the reserved address, which is what makes it a frame rather than
+    // a number.
+    //
+    // The published ones decide it whenever there are any; the bare
+    // reservations answer only for a build where nothing writes it back at all,
+    // which is what an older clang emits for a module whose functions are all
+    // leaves.
+    let mut published = vec![0usize; module.globals.len()];
+    let mut addressed = vec![0usize; module.globals.len()];
     for func in &module.funcs {
-        if let Some(global) = prologue_global(&func.body)
-            && let Some(count) = counts.get_mut(global as usize)
+        let Some((global, prologue)) = match_prologue(&func.body) else {
+            continue;
+        };
+        if prologue.publishes {
+            if let Some(count) = published.get_mut(global as usize) {
+                *count += 1;
+            }
+        } else if read_frame(module, &func.body, global)
+            .is_some_and(|frame| !frame.slots.is_empty())
+            && let Some(count) = addressed.get_mut(global as usize)
         {
             *count += 1;
         }
     }
+    let counts = if published.iter().any(|count| *count > 0) {
+        published
+    } else {
+        addressed
+    };
 
     let (global, functions) = counts
         .iter()
@@ -1701,37 +1794,6 @@ fn find_stack_pointer(module: &Module) -> Option<StackPointer> {
         global,
         evidence: Evidence::Prologue { functions },
     })
-}
-
-/// Recognises `global.get G; i32.const N; i32.sub; ...; global.set G` at the
-/// start of a function, and returns `G`.
-///
-/// The instructions between the subtraction and the store vary — clang emits a
-/// `local.tee` to keep the frame address, and at `-O0` there is often nothing
-/// at all — so the shape is matched at its two ends rather than exactly.
-fn prologue_global(body: &[Op]) -> Option<u32> {
-    let mut ops = body.iter();
-    let global = match ops.next()? {
-        Op::GlobalGet(index) => *index,
-        _ => return None,
-    };
-    match ops.next()? {
-        Op::I32Const(size) if *size > 0 => size,
-        _ => return None,
-    };
-    if !matches!(ops.next()?, Op::Num(op) if op.name() == "I32Sub") {
-        return None;
-    }
-    // The store back must be to the same global, and must come before anything
-    // that could be a different function's business.
-    for op in ops.take(3) {
-        match op {
-            Op::GlobalSet(index) if *index == global => return Some(global),
-            Op::LocalTee(_) | Op::LocalSet(_) => {}
-            _ => return None,
-        }
-    }
-    None
 }
 
 /// The NUL-terminated text at an address, if a data segment puts text there.
@@ -1975,6 +2037,42 @@ mod tests {
     }
 
     #[test]
+    fn the_name_section_settles_it_when_nothing_exports_it() {
+        // A debug build names the stack pointer and does not necessarily export
+        // it: `--export-all` under some linkers leaves the mutable global out.
+        // The name is still the module saying which global it is.
+        let mut module = module_with_globals(3, true);
+        module.global_names.push((1, "__stack_pointer".into()));
+        let found = analyse(&module).stack_pointer.expect("named");
+        assert_eq!(found.global, 1);
+        assert_eq!(found.evidence, Evidence::Named);
+    }
+
+    #[test]
+    fn an_export_outranks_a_name() {
+        // Both are conclusive, so this is only about which one is quoted back;
+        // the export is the module's interface and cannot be stripped without
+        // changing it.
+        let mut module = module_with_globals(3, true);
+        module.global_names.push((1, "__stack_pointer".into()));
+        module.exports.push(crate::module::Export {
+            name: "__stack_pointer".into(),
+            kind: ExportKind::Global,
+            index: 2,
+        });
+        let found = analyse(&module).stack_pointer.expect("named");
+        assert_eq!(found.global, 2);
+        assert_eq!(found.evidence, Evidence::Exported);
+    }
+
+    #[test]
+    fn a_global_named_something_else_is_not_taken_for_it() {
+        let mut module = module_with_globals(1, true);
+        module.global_names.push((0, "__heap_base".into()));
+        assert!(analyse(&module).stack_pointer.is_none());
+    }
+
+    #[test]
     fn the_prologue_identifies_it_in_a_stripped_module() {
         let module = with_bodies(
             module_with_globals(2, true),
@@ -2139,6 +2237,133 @@ mod tests {
             kind: crate::module::LoadKind::I32,
             mem: crate::module::MemArg { offset },
         }
+    }
+
+    /// The same frame, spelled the way clang 18 spells it at `-O0`: every
+    /// intermediate value parked in its own local, including the stack pointer
+    /// and the size, so the subtraction reads two locals rather than the
+    /// operand stack.
+    fn unfolded_prologue(size: i32, base: u32) -> Vec<Op> {
+        vec![
+            Op::GlobalGet(0),
+            Op::LocalSet(8),
+            Op::I32Const(size),
+            Op::LocalSet(9),
+            Op::LocalGet(8),
+            Op::LocalGet(9),
+            Op::Num(NumOp::I32Sub),
+            Op::LocalSet(base),
+            Op::LocalGet(base),
+            Op::GlobalSet(0),
+        ]
+    }
+
+    /// The epilogue that goes with it: the size through a local again, and the
+    /// restored pointer through one more before it reaches the global.
+    fn unfolded_epilogue(size: i32, base: u32) -> Vec<Op> {
+        vec![
+            Op::I32Const(size),
+            Op::LocalSet(9),
+            Op::LocalGet(base),
+            Op::LocalGet(9),
+            Op::Num(NumOp::I32Add),
+            Op::LocalSet(10),
+            Op::LocalGet(10),
+            Op::GlobalSet(0),
+        ]
+    }
+
+    #[test]
+    fn a_frame_reads_the_same_whether_the_prologue_is_folded_or_not() {
+        // The two compilers describe the same frame. An analysis that only
+        // knows the folded spelling reports that a module built by the other
+        // one has no frames at all, which is a statement about the compiler
+        // dressed up as one about the code.
+        let mut folded = frame_prologue(32, 4);
+        folded.extend([Op::LocalGet(4), Op::I32Const(7), store(12)]);
+        folded.extend(frame_epilogue(32, 4));
+
+        let mut unfolded = unfolded_prologue(32, 4);
+        unfolded.extend([Op::LocalGet(4), Op::I32Const(7), store(12)]);
+        unfolded.extend(unfolded_epilogue(32, 4));
+
+        let (folded, unfolded) = (frame_of(folded), frame_of(unfolded));
+        assert_eq!(folded, unfolded);
+        assert_eq!(unfolded.size, 32);
+        assert_eq!(unfolded.base_local, 4);
+        assert!(unfolded.publishes);
+        assert!(
+            !unfolded.escapes,
+            "the address only ever went into locals this walk follows"
+        );
+        assert_eq!(unfolded.slots[&12].writes, 1);
+    }
+
+    #[test]
+    fn an_unfolded_leaf_prologue_is_read_and_marked_unpublished() {
+        // clang drops the write-back for a function that calls nothing, in this
+        // spelling as in the folded one.
+        let mut body = unfolded_prologue(16, 3);
+        body.truncate(8);
+        body.extend([Op::LocalGet(3), Op::I32Const(1), store(4)]);
+        let frame = frame_of(body);
+        assert_eq!(frame.size, 16);
+        assert_eq!(frame.base_local, 3);
+        assert!(!frame.publishes);
+        assert_eq!(frame.slots[&4].writes, 1);
+    }
+
+    #[test]
+    fn an_unfolded_prologue_identifies_the_stack_pointer_too() {
+        // No export, no name section: the shape is the only evidence, and it
+        // has to be countable in this spelling as well.
+        let module = with_bodies(
+            module_with_globals(2, true),
+            vec![
+                {
+                    let mut body = unfolded_prologue(32, 4);
+                    body.extend(unfolded_epilogue(32, 4));
+                    body
+                },
+                {
+                    let mut body = unfolded_prologue(16, 4);
+                    body.extend(unfolded_epilogue(16, 4));
+                    body
+                },
+            ],
+        );
+        let found = analyse(&module).stack_pointer.expect("found by its use");
+        assert_eq!(found.global, 0);
+        assert_eq!(found.evidence, Evidence::Prologue { functions: 2 });
+    }
+
+    #[test]
+    fn leaf_prologues_are_evidence_only_when_they_address_memory() {
+        // Nothing writes the stack pointer back in a module of leaves, so the
+        // reservations are all there is — and a reservation that never becomes
+        // an address is indistinguishable from arithmetic on a global.
+        let bare = || {
+            let mut body = unfolded_prologue(16, 3);
+            body.truncate(8);
+            body
+        };
+        let module = with_bodies(module_with_globals(1, true), vec![bare(), bare()]);
+        assert!(
+            analyse(&module).stack_pointer.is_none(),
+            "a number, not a frame"
+        );
+
+        let addressing = || {
+            let mut body = bare();
+            body.extend([Op::LocalGet(3), Op::I32Const(1), store(4)]);
+            body
+        };
+        let module = with_bodies(
+            module_with_globals(1, true),
+            vec![addressing(), addressing()],
+        );
+        let found = analyse(&module).stack_pointer.expect("found by its use");
+        assert_eq!(found.evidence, Evidence::Prologue { functions: 2 });
     }
 
     #[test]
@@ -2338,9 +2563,38 @@ mod tests {
     }
 
     #[test]
-    fn copying_the_frame_address_to_another_local_is_an_escape() {
+    fn a_copy_of_the_frame_address_is_followed_through_the_local() {
+        // A copy is not an escape by itself: the walk knows which local it went
+        // into, so an access through the copy is an access to the frame and
+        // lands in the table like any other. Giving up here is what made an
+        // unoptimised build — where every value goes through a local — report a
+        // frame it could say nothing about.
         let mut body = frame_prologue(16, 0);
-        body.extend([Op::LocalGet(0), Op::LocalSet(3)]);
+        body.extend([
+            Op::LocalGet(0),
+            Op::LocalSet(3),
+            Op::LocalGet(3),
+            Op::I32Const(7),
+            store(4),
+        ]);
+        body.extend(frame_epilogue(16, 0));
+        let frame = frame_of(body);
+        assert!(!frame.escapes, "the copy never left the function");
+        assert_eq!(frame.slots[&4].writes, 1, "the write went to `frame + 4`");
+    }
+
+    #[test]
+    fn a_copy_of_the_frame_address_live_across_control_flow_is_an_escape() {
+        // The other side of following a copy: the walk follows one path, so at
+        // a branch it forgets what a local holds — and a local holding the
+        // frame address when that happens has gone where it cannot be followed.
+        let mut body = frame_prologue(16, 0);
+        body.extend([
+            Op::LocalGet(0),
+            Op::LocalSet(3),
+            Op::Block(crate::module::BlockType::Empty),
+            Op::End,
+        ]);
         body.extend(frame_epilogue(16, 0));
         assert!(frame_of(body).escapes);
     }
@@ -2911,7 +3165,10 @@ mod tests {
     #[test]
     fn a_prologue_that_never_stores_back_is_not_one() {
         // `global.get; i32.const; i32.sub` and then something else entirely:
-        // arithmetic on a global, not a frame being reserved.
+        // arithmetic on a global, not a frame being reserved. It is the same
+        // shape a leaf function's prologue has, which is why the leaf spelling
+        // counts as evidence only when the address is then used to reach
+        // memory — and nothing here ever is.
         let body = vec![
             Op::GlobalGet(0),
             Op::I32Const(32),
