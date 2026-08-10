@@ -421,7 +421,7 @@ fn known_import(field: &str, ty: &crate::module::FuncType) -> Option<&'static st
         ("__syscall_mkdirat", "iii->i") => "self.wasi.mkdirat(caller, p1)",
         ("__syscall_getdents64", "iii->i") => "self.wasi.getdents64(caller, p0, p1, p2)",
         ("__syscall_ftruncate64", "ij->i") => "self.wasi.ftruncate(p0, p1)",
-        ("__syscall_fcntl64", "iii->i") => "self.wasi.fcntl(p0, p1, p2)",
+        ("__syscall_fcntl64", "iii->i") => "self.wasi.fcntl(caller, p0, p1, p2)",
 
         // ---- embind and emval
         ("_emval_incref", "i->") => "self.embind.incref(p0)",

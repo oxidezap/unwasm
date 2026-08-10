@@ -568,7 +568,7 @@ fn the_whole_mechanical_set_is_answered_with_the_real_signatures() {
         "self.wasi.mkdirat(caller, p1)",
         "self.wasi.getdents64(caller, p0, p1, p2)",
         "self.wasi.ftruncate(p0, p1)",
-        "self.wasi.fcntl(p0, p1, p2)",
+        "self.wasi.fcntl(caller, p0, p1, p2)",
         "runtime::mktime(caller, p0)",
         "runtime::strftime(caller, p0, p1, p2, p3)",
         "-runtime::errno::NOTTY",

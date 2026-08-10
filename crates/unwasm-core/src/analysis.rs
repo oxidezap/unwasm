@@ -1754,12 +1754,21 @@ fn match_prologue(body: &[Op]) -> Option<(u32, Prologue)> {
 const STACK_POINTER_NAMES: &[&str] = &["__stack_pointer", "_stack_pointer", "stackPointer"];
 
 fn find_stack_pointer(module: &Module) -> Option<StackPointer> {
-    // An exported name settles it without any guessing.
+    // A name settles it without any guessing — but only for a global that is
+    // there. An index past the end names a field the output does not declare,
+    // and the generated Rust would not compile, which is the one thing it must
+    // always do. An imported global cannot shift the numbering here: this
+    // decompiler refuses those by name rather than modelling them.
+    let declared = |index: u32| module.globals.get(index as usize).map(|_| index);
+
+    // An exported name is the module's own declaration.
     for export in &module.exports {
-        if export.kind == ExportKind::Global && STACK_POINTER_NAMES.contains(&export.name.as_str())
+        if export.kind == ExportKind::Global
+            && STACK_POINTER_NAMES.contains(&export.name.as_str())
+            && let Some(global) = declared(export.index)
         {
             return Some(StackPointer {
-                global: export.index,
+                global,
                 evidence: Evidence::Exported,
             });
         }
@@ -1769,9 +1778,11 @@ fn find_stack_pointer(module: &Module) -> Option<StackPointer> {
     // a mutable global, which is how a debug build can name the stack pointer
     // in every disassembly and still not export it.
     for (index, name) in &module.global_names {
-        if STACK_POINTER_NAMES.contains(&name.as_str()) {
+        if STACK_POINTER_NAMES.contains(&name.as_str())
+            && let Some(global) = declared(*index)
+        {
             return Some(StackPointer {
-                global: *index,
+                global,
                 evidence: Evidence::Named,
             });
         }
@@ -1794,7 +1805,7 @@ fn find_stack_pointer(module: &Module) -> Option<StackPointer> {
     // which is what an older clang emits for a module whose functions are all
     // leaves.
     let mut published = vec![0usize; module.globals.len()];
-    let mut addressed = vec![0usize; module.globals.len()];
+    let mut unpublished: Vec<(u32, &[Op])> = Vec::new();
     for func in &module.funcs {
         let Some((global, prologue)) = match_prologue(&func.body) else {
             continue;
@@ -1803,16 +1814,25 @@ fn find_stack_pointer(module: &Module) -> Option<StackPointer> {
             if let Some(count) = published.get_mut(global as usize) {
                 *count += 1;
             }
-        } else if read_frame(module, &func.body, global)
-            .is_some_and(|frame| !frame.slots.is_empty())
-            && let Some(count) = addressed.get_mut(global as usize)
-        {
-            *count += 1;
+        } else {
+            unpublished.push((global, &func.body));
         }
     }
+    // The second walk only happens when the first found nothing. Reading every
+    // leaf's frame to fill a tally that is about to be thrown away is a whole
+    // extra pass over 14733 functions on the module where it matters most, and
+    // an Emscripten build always has published prologues.
     let counts = if published.iter().any(|count| *count > 0) {
         published
     } else {
+        let mut addressed = vec![0usize; module.globals.len()];
+        for (global, body) in unpublished {
+            if read_frame(module, body, global).is_some_and(|frame| !frame.slots.is_empty())
+                && let Some(count) = addressed.get_mut(global as usize)
+            {
+                *count += 1;
+            }
+        }
         addressed
     };
 
@@ -2137,6 +2157,26 @@ mod tests {
     fn a_global_named_something_else_is_not_taken_for_it() {
         let mut module = module_with_globals(1, true);
         module.global_names.push((0, "__heap_base".into()));
+        assert!(analyse(&module).stack_pointer.is_none());
+    }
+
+    #[test]
+    fn a_name_for_a_global_that_is_not_there_names_nothing() {
+        // The index reaches the output as a field name. One past the end would
+        // be `self.g9_stack_pointer` on a struct that declares one global, and
+        // the generated Rust would not compile — which is the one thing it must
+        // always do. Both naming routes are checked, since a malformed module
+        // can carry either.
+        let mut module = module_with_globals(1, true);
+        module.global_names.push((9, "__stack_pointer".into()));
+        assert!(analyse(&module).stack_pointer.is_none());
+
+        let mut module = module_with_globals(1, true);
+        module.exports.push(crate::module::Export {
+            name: "__stack_pointer".into(),
+            kind: ExportKind::Global,
+            index: 9,
+        });
         assert!(analyse(&module).stack_pointer.is_none());
     }
 

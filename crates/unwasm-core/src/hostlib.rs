@@ -225,8 +225,13 @@ impl Default for Wasi {
 
 impl Wasi {
     /// Puts a file in the filesystem, replacing whatever was there.
+    ///
+    /// The path is canonicalised the same way the guest's will be, so a host
+    /// that seeds `data/x` and a guest that opens `/data/x` are talking about
+    /// one file rather than two.
     pub fn add_file(&mut self, path: &str, contents: &[u8]) {
-        self.files.insert(path.to_string(), contents.to_vec());
+        let path = self.absolute(path);
+        self.files.insert(path, contents.to_vec());
     }
 
     /// What the guest wrote to `stdout`, as text, with anything that is not
@@ -402,6 +407,12 @@ impl Wasi {
         offset: i64,
         written: i32,
     ) -> i32 {
+        // Before anything else: a negative offset is not an enormous one. Cast
+        // to `u64` it becomes about 18 exabytes, and the write below would try
+        // to grow the file to it and abort the host instead of answering.
+        if offset < 0 {
+            return errno::INVAL;
+        }
         let Some(Descriptor::File(open)) = self.open.get(&fd) else {
             return match self.open.get(&fd) {
                 Some(_) => errno::SPIPE,
@@ -729,6 +740,12 @@ impl Wasi {
             };
         };
         let entries = self.entries_of(&open.path);
+        // A buffer too small for one entry is an error, not an empty directory.
+        // Answering 0 would tell the caller it had read the whole thing, and it
+        // would stop — with the directory unread and no way to know.
+        if count < ENTRY && open.returned < entries.len() {
+            return -errno::INVAL;
+        }
         let mut at = open.returned;
         let mut written = 0i32;
         while at < entries.len() && written + ENTRY <= count {
@@ -816,7 +833,21 @@ impl Wasi {
     /// `F_SETFD` concern a close-on-exec flag in a process that never execs,
     /// and record locks are uncontended when there is one process. `F_DUPFD`
     /// is the one that has to do something, and it does.
-    pub fn fcntl(&mut self, fd: i32, command: i32, argument: i32) -> i32 {
+    ///
+    /// `F_GETLK` takes the `Caller` because it has to *answer* through the
+    /// `struct flock` it was handed. Returning 0 and writing nothing leaves the
+    /// caller's own `l_type` where it put it — usually `F_WRLCK` — and it reads
+    /// that back as "somebody holds this lock". Emscripten's glue writes
+    /// `F_UNLCK` into the field, and so does this.
+    pub fn fcntl<M: rt::Access>(
+        &mut self,
+        caller: &mut rt::Caller<'_, M>,
+        fd: i32,
+        command: i32,
+        argument: i32,
+    ) -> i32 {
+        /// `F_UNLCK`, and where `l_type` sits in musl's `struct flock`.
+        const F_UNLCK: u8 = 2;
         let Some(descriptor) = self.open.get(&fd).cloned() else {
             return -errno::BADF;
         };
@@ -825,7 +856,11 @@ impl Wasi {
                 if argument < 0 {
                     return -errno::INVAL;
                 }
-                let mut at = argument.max(self.next_fd);
+                // The *lowest* free number at or above the floor, which is what
+                // `dup2`-by-hand depends on: `close(1); fcntl(fd, F_DUPFD, 0)`
+                // is how a program redirects its own stdout, and it only works
+                // if the answer is 1.
+                let mut at = argument;
                 while self.open.contains_key(&at) {
                     let Some(next) = at.checked_add(1) else {
                         return -errno::RANGE;
@@ -842,8 +877,13 @@ impl Wasi {
             // here reads them — so the honest answer is the default, `O_RDWR`.
             fcntl::GETFL => 2,
             fcntl::SETFL => 0,
-            // One process, so every lock is available and every one is taken.
-            fcntl::GETLK | fcntl::SETLK | fcntl::SETLKW => 0,
+            // One process, so the lock asked about is always free.
+            fcntl::GETLK => {
+                caller.write(argument, &[F_UNLCK, 0]);
+                0
+            }
+            // And every one asked for is granted.
+            fcntl::SETLK | fcntl::SETLKW => 0,
             _ => -errno::INVAL,
         }
     }
@@ -2538,6 +2578,14 @@ mod tests {
             wasi.fd_pwrite(&mut caller, 99, iovs, 1, 0, 512),
             errno::BADF
         );
+        // A negative offset is not an enormous one: cast to `u64` it asks for a
+        // file of eighteen exabytes, and the host aborts rather than answers.
+        let before = wasi.files["/f"].clone();
+        assert_eq!(
+            wasi.fd_pwrite(&mut caller, fd, iovs, 1, -1, 512),
+            errno::INVAL
+        );
+        assert_eq!(wasi.files["/f"], before, "and nothing was written");
     }
 
     #[test]
@@ -2585,6 +2633,10 @@ mod tests {
         assert_eq!(wasi.files.len(), 1);
         assert_eq!(wasi.absolute("../a/./b"), "/a/b");
         assert_eq!(wasi.absolute("/already"), "/already");
+        // A host seeding the filesystem gets the same canonicalisation, so a
+        // relative key and the guest's absolute path are one file.
+        wasi.add_file("seeded", b"x");
+        assert!(wasi.files.contains_key("/tmp/seeded"), "{:?}", wasi.files);
 
         // And what is not a directory, or is not there at all, is refused.
         caller.write(96, b"/tmp/notes\0");
@@ -2664,6 +2716,12 @@ mod tests {
         assert_eq!(wasi.getdents64(&mut caller, fd, 0, 280 * 2), 280 * 2);
         assert_eq!(wasi.getdents64(&mut caller, fd, 0, 280 * 8), 280 * 3);
 
+        // A buffer too small for one entry is an error. Answering 0 would say
+        // the directory had been read to the end, and the caller would stop.
+        let fd = wasi.openat("/d", false, false);
+        assert_eq!(wasi.getdents64(&mut caller, fd, 0, 279), -errno::INVAL);
+        assert_eq!(wasi.getdents64(&mut caller, fd, 0, 280), 280);
+
         assert_eq!(wasi.getdents64(&mut caller, 1, 0, 280), -errno::NOTDIR);
         assert_eq!(wasi.getdents64(&mut caller, 99, 0, 280), -errno::BADF);
     }
@@ -2672,31 +2730,42 @@ mod tests {
     fn fcntl_answers_the_commands_a_process_without_exec_can() {
         let mut wasi = Wasi::default();
         let fd = wasi.openat("/f", true, false);
+        let mut memory = memory();
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
         // F_GETFD / F_SETFD: nothing execs, so there is nothing to survive one.
-        assert_eq!(wasi.fcntl(fd, 1, 0), 0);
-        assert_eq!(wasi.fcntl(fd, 2, 1), 0);
+        assert_eq!(wasi.fcntl(&mut caller, fd, 1, 0), 0);
+        assert_eq!(wasi.fcntl(&mut caller, fd, 2, 1), 0);
         // F_GETFL / F_SETFL.
-        assert_eq!(wasi.fcntl(fd, 3, 0), 2);
-        assert_eq!(wasi.fcntl(fd, 4, 0), 0);
-        // The locks are all available, because there is one process.
-        assert_eq!(wasi.fcntl(fd, 13, 0), 0);
+        assert_eq!(wasi.fcntl(&mut caller, fd, 3, 0), 2);
+        assert_eq!(wasi.fcntl(&mut caller, fd, 4, 0), 0);
+        // Every lock asked for is granted, because there is one process.
+        assert_eq!(wasi.fcntl(&mut caller, fd, 13, 0), 0);
+        // And `F_GETLK` has to *say* the lock is free, in the caller's own
+        // `struct flock`: leaving the `F_WRLCK` it asked about there reads back
+        // as somebody holding it.
+        caller.write(64, &[1, 0]);
+        assert_eq!(wasi.fcntl(&mut caller, fd, 12, 64), 0);
+        assert_eq!(caller.bytes(64, 1), vec![2], "F_UNLCK");
+
         // F_DUPFD gives a new number for the same thing.
-        let duplicate = wasi.fcntl(fd, 0, 0);
+        let duplicate = wasi.fcntl(&mut caller, fd, 0, 0);
         assert_ne!(duplicate, fd);
         assert_eq!(wasi.open[&duplicate], wasi.open[&fd]);
-        // And it honours the floor it was given.
-        assert_eq!(wasi.fcntl(fd, 0, 40), 40);
+        // The *lowest* free number at or above the floor, which is what a
+        // program redirecting its own stdout depends on: `close(1)` then
+        // `F_DUPFD` from 0 has to answer 1.
+        assert_eq!(wasi.fd_close(1), errno::SUCCESS);
+        assert_eq!(wasi.fcntl(&mut caller, fd, 0, 0), 1);
+        // And it honours the floor it was given, walking up from one that is
+        // taken.
+        assert_eq!(wasi.fcntl(&mut caller, fd, 0, 40), 40);
+        assert_eq!(wasi.fcntl(&mut caller, fd, 0, 40), 41);
+        assert_eq!(wasi.fcntl(&mut caller, fd, 0, -1), -errno::INVAL);
 
-        // A floor already taken walks up to the first free number. Only a host
-        // that opened a descriptor itself can produce that — `openat` keeps
-        // `next_fd` past everything it has handed out — and the filesystem is a
-        // public struct precisely so a host can.
-        wasi.open.insert(41, wasi.open[&fd].clone());
-        assert_eq!(wasi.fcntl(fd, 0, 40), 42);
-        assert_eq!(wasi.fcntl(fd, 0, -1), -errno::INVAL);
-
-        assert_eq!(wasi.fcntl(fd, 99, 0), -errno::INVAL);
-        assert_eq!(wasi.fcntl(99, 1, 0), -errno::BADF);
+        assert_eq!(wasi.fcntl(&mut caller, fd, 99, 0), -errno::INVAL);
+        assert_eq!(wasi.fcntl(&mut caller, 99, 1, 0), -errno::BADF);
     }
 
     #[test]
