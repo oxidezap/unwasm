@@ -676,13 +676,18 @@ rather than skipping them: a run that compared nothing must not report the same
 green as a run that compared everything.
 
 **The clang version matters**, and it is the one requirement that is not
-obvious. `read_prologue` knows three spellings of the shadow-stack prologue,
+obvious. `read_prologue` knows four spellings of the shadow-stack prologue,
 each found by reading what clang actually emits at `-O0` — so which frames the
 analysis can see is a property of the compiler that built the fixture. clang 22
-is what these tests were written against and what CI pins. Ubuntu 24.04's
-clang 18 emits a shape none of the three match, and the four frame tests in
-`backend.rs` then report no frame at all. That is a gap in `read_prologue`, not
-in the fixtures, and it is not fixed.
+is what these tests were written against and what CI pins; Ubuntu 24.04's
+clang 18 emits the fourth spelling, where every intermediate value goes through
+a local of its own, and the frame tests in `backend.rs` pass under both. A
+fifth compiler may well have a fifth spelling — before concluding that a module
+has no frames, check what built it.
+
+`emcc` for a C++ fixture is `em++`. The driver decides which runtime to link,
+and `emcc` links libc only: on Emscripten 6 a `.cpp` fixture given to `emcc`
+fails the link with `undefined symbol: __cxa_throw`.
 
 `cargo test --workspace` needs none of the above beyond those four tools —
 it runs on a bare checkout.
@@ -711,21 +716,22 @@ shells started afterwards.
 
 ### Coverage
 
-**99.20% of lines** — 72 of 8946, from `cargo llvm-cov --workspace
---summary-only` on a checkout, with the `#[ignore]`d tiers not running:
+**99.68% of lines** — 30 of 9438, counted from `cargo llvm-cov --workspace
+--lcov` on a checkout, with the `#[ignore]`d tiers not running:
 
 | file | lines | missed |
 |---|---:|---:|
-| `rt.rs` | 1918 | 6 |
-| `codegen.rs` | 2605 | 18 |
-| `analysis.rs` | 1762 | 12 |
-| `module.rs` | 521 | 22 |
-| `hostlib.rs` | 1213 | 0 |
+| `rt.rs` | 1878 | 1 |
+| `codegen.rs` | 2548 | 7 |
+| `analysis.rs` | 1888 | 0 |
+| `module.rs` | 515 | 20 |
+| `hostlib.rs` | 1750 | 2 |
 | `error.rs` | 55 | 0 |
-| `ops.rs` | 144 | 3 |
-| `main.rs` (CLI) | 728 | 11 |
+| `ops.rs` | 137 | 0 |
+| `main.rs` (CLI) | 667 | 0 |
 
-The `module.rs` gap is the one that is unreachable rather than untested:
+Nearly all of what is left is unreachable rather than untested. The `module.rs`
+gap is all of it:
 
 - the `other =>` arms over wasmparser's `#[non_exhaustive]` enums. The compiler
   requires them; the only value that reaches one is from a proposal no
@@ -733,6 +739,10 @@ The `module.rs` gap is the one that is unreachable rather than untested:
 - two checks that the function and code sections agree — which the decoder
   guarantees by three separate routes, each with a test asserting the decoder's
   message.
+
+`codegen.rs`'s and `hostlib.rs`'s are malformed-input defences of the same kind,
+and `rt.rs`'s one is the retry arm of `grow`'s compare-exchange, which needs a
+race to reach.
 
 Those are kept. Deleting a defence to raise a percentage is how a decoder change
 becomes a panic two years later. The rest is ordinary uncovered code and is not

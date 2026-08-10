@@ -104,15 +104,33 @@ direction is the safe one: a frame wrongly called escaping costs an annotation,
 while one wrongly called contained is a false statement about the code, and the
 next level would build variable promotion on top of it.
 
-The three prologue spellings are in `read_prologue`, and the third one — a leaf
-function that never writes the stack pointer back — is not in any reference. It
-was found by looking at what clang actually emitted at `-O0`, after the first
-version silently found no frames at all.
+It follows a copy, though. A frame address put into another local is tracked
+rather than given up on, and forgotten at a control-flow boundary — which is
+where it stops being followable and becomes an escape. Without that, clang 18's
+epilogue (the size in one local, the restored pointer in another) makes every
+frame in a module look like it escapes.
 
-Which means **the frame tests are a measurement of a particular clang**. They
-were written against clang 22 and CI pins it. Under Ubuntu 24.04's clang 18 all
-four fail, finding no frame at all — a fourth spelling `read_prologue` does not
-know. Before concluding that a module has no frames, check what built it.
+The four prologue spellings are in `match_prologue`, and none of the last two is
+in any reference. The third — a leaf function that never writes the stack
+pointer back — was found by looking at what clang actually emitted at `-O0`,
+after the first version silently found no frames at all. The fourth is clang
+18's, where every intermediate value goes through its own local, so the
+subtraction reads two locals rather than the operand stack; before it was known,
+all four frame tests found no frame under that compiler and the gap was recorded
+here as a fact about the compiler.
+
+Which means **the frame tests are still a measurement of a particular clang**.
+They pass under 18 and 22, and CI pins 22. A fifth compiler may well have a
+fifth spelling: before concluding that a module has no frames, check what built
+it — `unwasm frames` on a module whose functions all have prologues and no
+frames is the symptom.
+
+The counting evidence asks for more than the walk does. A prologue that writes
+the reservation back is enough on its own; a leaf's is the same shape as
+arithmetic on a global, so it counts only when the function goes on to address
+memory through the reserved address. And the name section is consulted before
+either: a linker writes `__stack_pointer` there whether or not it exports the
+global, and that is the module saying which one it is.
 
 ## Folding is only for expressions that cannot trap
 
@@ -176,16 +194,16 @@ mistaken for the enclosing frame's.
 
 ## Coverage is a floor, not a target
 
-**99.20% of lines — 72 of 8946**, on a checkout with the `#[ignore]`d tiers not
-running: `module.rs` 22, `codegen.rs` 18, `analysis.rs` 12, `main.rs` 11,
-`rt.rs` 6, `ops.rs` 3. `hostlib.rs` and `error.rs` are complete.
+**99.68% of lines — 30 of 9438**, on a checkout with the `#[ignore]`d tiers not
+running: `module.rs` 20, `codegen.rs` 7, `hostlib.rs` 2, `rt.rs` 1. `analysis.rs`,
+`main.rs`, `error.rs` and `ops.rs` are complete.
 
-The number was **99.5%** here and **99.6%** in the README, and neither was
-re-measured as the code grew. Re-measure before quoting it; a coverage figure
-that is only ever copied forward is the kind of claim this project exists to
-not make.
+The number was **99.5%** here and **99.6%** in the README before either was
+re-measured, and **99.20%** after. Re-measure before quoting it; a coverage
+figure that is only ever copied forward is the kind of claim this project exists
+to not make.
 
-The part of `module.rs` that is unreachable rather than untested:
+What is left is almost all unreachable rather than untested. In `module.rs`:
 
 - the `other =>` arms over wasmparser's `#[non_exhaustive]` `TypeRef` and
   `ExternalKind`. The compiler requires the arm; the only value that reaches it
@@ -199,9 +217,12 @@ The part of `module.rs` that is unreachable rather than untested:
 Three of `codegen.rs`'s are in the table-type map: a table entry whose function
 index has no type, a type index past `u16::MAX`, and a signature missing from
 the type section. All three are malformed-module defences that `wasm-tools` will
-not assemble, and the third is unreachable by construction. The other fifteen
-there, and the gaps in `analysis.rs`, `main.rs`, `rt.rs` and `ops.rs`, are
-ordinary uncovered code — they are not defended, they are just untested.
+not assemble, and the third is unreachable by construction. `hostlib.rs`'s two
+are the same shape — a directory key already ending in `/`, and a descriptor
+number overflowing `i32` — and `rt.rs`'s one is the retry arm of `grow`'s
+compare-exchange, which needs a race to reach and is covered only when one
+happens. The rest is ordinary uncovered code and is not claimed to be anything
+else.
 
 Keep the defences. Deleting one to raise a percentage is how a decoder change
 becomes a panic two years later, and the tests record which layer rejects each

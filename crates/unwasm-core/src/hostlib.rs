@@ -2562,6 +2562,9 @@ mod tests {
         assert_eq!(wasi.ftruncate(1, 0), -errno::INVAL);
         assert_eq!(wasi.ftruncate(3, 0), -errno::ISDIR);
         assert_eq!(wasi.ftruncate(99, 0), -errno::BADF);
+        // A file that went away underneath an open descriptor.
+        wasi.files.remove("/f");
+        assert_eq!(wasi.ftruncate(fd, 0), -errno::NOENT);
     }
 
     #[test]
@@ -2581,6 +2584,7 @@ mod tests {
         assert!(fd > 0, "{fd}");
         assert_eq!(wasi.files.len(), 1);
         assert_eq!(wasi.absolute("../a/./b"), "/a/b");
+        assert_eq!(wasi.absolute("/already"), "/already");
 
         // And what is not a directory, or is not there at all, is refused.
         caller.write(96, b"/tmp/notes\0");
@@ -2588,6 +2592,11 @@ mod tests {
         caller.write(128, b"/nowhere\0");
         assert_eq!(wasi.chdir(&caller, 128), -errno::NOENT);
         assert_eq!(wasi.cwd, "/tmp");
+
+        // And back at the root, where there is no directory to prefix with.
+        caller.write(160, b"/\0");
+        assert_eq!(wasi.chdir(&caller, 160), 0);
+        assert_eq!(wasi.absolute("relative"), "/relative");
     }
 
     #[test]
@@ -2624,6 +2633,15 @@ mod tests {
         let mut caller = rt::Caller {
             memory: &mut memory,
         };
+
+        // A file outside the directory, and one whose name starts with it but
+        // is not under it: neither is an entry of `/d`.
+        wasi.add_file("/elsewhere", b"");
+        wasi.add_file("/dd", b"");
+        // A directory that is also implied by a file under it appears once.
+        wasi.directories.insert("/d/nested".to_string());
+        // And a key that *is* the prefix names no child at all.
+        wasi.add_file("/d/", b"");
 
         let read = wasi.getdents64(&mut caller, fd, 0, 280 * 8);
         assert_eq!(read, 280 * 5, ". .. nested one two");
@@ -2668,6 +2686,14 @@ mod tests {
         assert_eq!(wasi.open[&duplicate], wasi.open[&fd]);
         // And it honours the floor it was given.
         assert_eq!(wasi.fcntl(fd, 0, 40), 40);
+
+        // A floor already taken walks up to the first free number. Only a host
+        // that opened a descriptor itself can produce that — `openat` keeps
+        // `next_fd` past everything it has handed out — and the filesystem is a
+        // public struct precisely so a host can.
+        wasi.open.insert(41, wasi.open[&fd].clone());
+        assert_eq!(wasi.fcntl(fd, 0, 40), 42);
+        assert_eq!(wasi.fcntl(fd, 0, -1), -errno::INVAL);
 
         assert_eq!(wasi.fcntl(fd, 99, 0), -errno::INVAL);
         assert_eq!(wasi.fcntl(99, 1, 0), -errno::BADF);
@@ -2742,10 +2768,13 @@ mod tests {
             "am 05:06:07 AM 02/29/24 05:06:07 Feb"
         );
         assert_eq!(run(&mut caller, "%s", 64).1, "1709183167");
+        assert_eq!(run(&mut caller, "a%nb%tc", 64).1, "a\nb\tc");
         // `%O` and `%E` ask for a locale alternative the C locale has not.
         assert_eq!(run(&mut caller, "%Od", 64).1, "29");
         // An unknown conversion is kept rather than swallowed.
         assert_eq!(run(&mut caller, "%q", 64).1, "%q");
+        // A format that ends mid-conversion keeps the `%` rather than eating it.
+        assert_eq!(run(&mut caller, "at %", 64).1, "at %");
 
         // The epoch itself, where `%I` is 12 rather than 0 and `%e` pads with a
         // space rather than a zero.
@@ -2779,8 +2808,23 @@ mod tests {
             strftime(caller, 512, 64, 256, 64);
             String::from_utf8_lossy(&caller.cstring(512)).into_owned()
         };
-        // 2021-01-01 was a Friday: week 53 of 2020.
+        // 2021-01-01 was a Friday: week 53 of 2020 — and `%g` is the ISO year's
+        // last two digits, which are not the date's.
         assert_eq!(week(&mut caller, 1_609_459_200), "2020-W53");
+        caller.write(256, b"%g %y %u\0");
+        strftime(&mut caller, 512, 64, 256, 64);
+        assert_eq!(
+            String::from_utf8_lossy(&caller.cstring(512)).into_owned(),
+            "20 21 5"
+        );
+        // Sunday is 7 in ISO's numbering and 0 in `tm_wday`: 2021-01-03.
+        write_tm(&mut caller, 64, 1_609_632_000);
+        caller.write(256, b"%u %w\0");
+        strftime(&mut caller, 512, 64, 256, 64);
+        assert_eq!(
+            String::from_utf8_lossy(&caller.cstring(512)).into_owned(),
+            "7 0"
+        );
         // 2019-12-30 was a Monday: week 1 of 2020.
         assert_eq!(week(&mut caller, 1_577_664_000), "2020-W01");
         // And an ordinary mid-year date is its own year. `%U` and `%W` differ

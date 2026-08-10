@@ -648,15 +648,6 @@ impl Module {
             .find(|(at, _)| *at == index)
             .map(|(_, name)| name.as_str())
     }
-
-    /// The name section's name for a global, if it kept one.
-    #[must_use]
-    pub fn global_name(&self, index: u32) -> Option<&str> {
-        self.global_names
-            .iter()
-            .find(|(at, _)| *at == index)
-            .map(|(_, name)| name.as_str())
-    }
 }
 
 /// Reads a memory type, whether it was declared or imported.

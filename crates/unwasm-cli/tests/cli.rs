@@ -458,6 +458,25 @@ fn inspect_reports_a_stack_pointer_found_by_its_use() {
 }
 
 #[test]
+fn inspect_reports_a_stack_pointer_the_name_section_names() {
+    // No export and no prologue: the module names the global, which is the
+    // module saying which one it is.
+    let path = fixture(
+        "sample-named-sp",
+        r#"(module
+            (memory 1)
+            (global $__stack_pointer (mut i32) (i32.const 65536))
+            (func (export "a") (result i32) global.get $__stack_pointer))"#,
+    );
+    let (ok, stdout, stderr) = run(&["inspect", path.to_str().expect("utf-8 path")]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("stack pointer: global #0 (by its name in the name section)"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn table_lists_what_each_slot_holds_and_filters_by_signature() {
     let path = fixture(
         "sample-table",

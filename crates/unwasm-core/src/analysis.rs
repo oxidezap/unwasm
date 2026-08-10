@@ -2338,6 +2338,41 @@ mod tests {
     }
 
     #[test]
+    fn the_unfolded_prologue_is_matched_exactly_and_not_by_its_shape() {
+        // The four instructions between the two `local.set`s say *which* locals
+        // are subtracted. Reading a different pair is arithmetic on a global
+        // that happens to start the same way, and a frame claimed for it would
+        // have the wrong base and the wrong size.
+        let module = |body: Vec<Op>| {
+            let mut module = module_with_globals(1, true);
+            module.exports.push(crate::module::Export {
+                name: "__stack_pointer".into(),
+                kind: ExportKind::Global,
+                index: 0,
+            });
+            with_bodies(module, vec![body])
+        };
+        let good = unfolded_prologue(16, 3);
+        for spoiled in [
+            // Not the local the stack pointer went into.
+            (4, Op::LocalGet(7)),
+            // Not the local the size went into.
+            (5, Op::LocalGet(7)),
+            // Not a subtraction.
+            (6, Op::Num(NumOp::I32Add)),
+        ] {
+            let (at, op) = spoiled;
+            let mut body = good.clone();
+            body[at] = op;
+            assert!(
+                analyse(&module(body)).frames.is_empty(),
+                "the prologue was matched with instruction {at} replaced"
+            );
+        }
+        assert!(!analyse(&module(good)).frames.is_empty(), "and unspoiled");
+    }
+
+    #[test]
     fn leaf_prologues_are_evidence_only_when_they_address_memory() {
         // Nothing writes the stack pointer back in a module of leaves, so the
         // reservations are all there is — and a reservation that never becomes
