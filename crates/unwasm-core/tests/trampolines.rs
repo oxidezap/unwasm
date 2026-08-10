@@ -249,12 +249,13 @@ fn an_import_that_only_looks_like_a_trampoline_is_left_alone() {
     assert!(code.contains("fn env_invoke_later"), "{code}");
 }
 
-/// The real thing: 125 of the VoIP module's imports.
+/// The real thing: 134 of the VoIP module's imports.
 #[test]
 #[ignore = "reads the capture directory"]
 fn the_voip_module_generates_all_of_its_trampolines() {
-    let Some(bytes) = common::captured("D5pLH9sfOOl") else {
-        panic!("D5pLH9sfOOl is not available; set WA_WASM_DIR");
+    let id = common::captures::VOIP;
+    let Some(bytes) = common::captured(id) else {
+        panic!("{}", common::missing_capture(id));
     };
     let module = Module::parse(&bytes).expect("parses");
     let analysis = analysis::analyse(&module);
@@ -264,12 +265,25 @@ fn the_voip_module_generates_all_of_its_trampolines() {
         .iter()
         .filter(|import| import.field.starts_with("invoke_"))
         .count();
-    assert_eq!(named, 125, "the module's own count of trampolines");
+    assert_eq!(named, 134, "the module's own count of trampolines");
     assert_eq!(
         analysis.invokes.len(),
         named,
         "every one of them has a dispatch type in the module"
     );
+
+    // An `invoke_*` is not the only import that gets generated rather than
+    // asked for. `__pthread_create_js` and the main thread's initialiser have
+    // to reach back into the instance — the table, the stack pointer, another
+    // instance over the same memory — which the `Imports` trait cannot express,
+    // so `import_thunks` generates those two the same way.
+    //
+    // Counting only the `invoke_*` ones was right until those were added, and
+    // this assertion has been off by exactly two ever since. Nothing caught it
+    // because no documented command runs this tier.
+    let generated = named
+        + usize::from(analysis.spawn.is_some())
+        + usize::from(analysis.init_main_thread.is_some());
 
     let code = codegen::generate(&module).expect("generates");
     let asked_of_the_host = code
@@ -280,11 +294,12 @@ fn the_voip_module_generates_all_of_its_trampolines() {
         .count();
     assert_eq!(
         asked_of_the_host,
-        module.func_imports.len() - named,
-        "the host is asked for exactly the imports that are not trampolines"
+        module.func_imports.len() - generated,
+        "the host is asked for exactly the imports that are not generated"
     );
     eprintln!(
-        "D5pLH9sfOOl: {} imports, {named} generated, {asked_of_the_host} left for the host",
+        "{id}: {} imports, {generated} generated ({named} of them `invoke_*`), \
+         {asked_of_the_host} left for the host",
         module.func_imports.len()
     );
 }

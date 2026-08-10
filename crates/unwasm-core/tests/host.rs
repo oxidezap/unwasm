@@ -11,7 +11,7 @@
 
 mod common;
 
-use unwasm_core::{Module, codegen};
+use unwasm_core::{Module, analysis, codegen};
 
 const SAMPLE: &str = r#"(module
     (import "wasi_snapshot_preview1" "fd_write" (func (param i32 i32 i32 i32) (result i32)))
@@ -244,25 +244,77 @@ fn a_module_that_needs_no_host_gets_an_empty_skeleton() {
     assert!(skeleton.contains("0 methods"));
 }
 
+/// Counts host methods from the start of `region` to the `}` that closes the
+/// block it is inside, so it can be handed either the whole `impl` or one group
+/// within it.
+///
+/// Both halves of this are load-bearing, and getting either wrong cancelled
+/// against the other for a while:
+///
+/// - it counts *lines* at one indentation, not occurrences of `    fn `, which
+///   is a substring of `        fn ` and so matched every nested helper;
+/// - it is given the `impl` block rather than the whole skeleton, which embeds
+///   `hostlib.rs` indented by four spaces inside `pub mod runtime` — putting
+///   that file's top-level functions at exactly a trait method's indentation.
+///
+/// `hostlib.rs` contributes two (`civil_from_days`, `days_from_civil`), and
+/// two imports are generated rather than asked for without being `invoke_*`
+/// (`__pthread_create_js` and the main thread's initialiser). The count was
+/// over by two and the expected value was over by two, so the assertion held
+/// while both sides were wrong.
+fn trait_methods(region: &str) -> usize {
+    region
+        .lines()
+        .take_while(|line| !line.starts_with('}'))
+        .filter(|line| line.starts_with("    fn "))
+        .count()
+}
+
+/// The `impl Imports for Host` block, which is what the host actually has to
+/// write. Everything above it is the embedded runtime.
+fn imports_impl(skeleton: &str) -> &str {
+    let at = skeleton
+        .find("\nimpl Imports for Host")
+        .expect("the skeleton implements the trait");
+    &skeleton[at + 1..]
+}
+
 #[test]
 #[ignore = "reads the capture directory"]
-fn the_voip_module_leaves_a_hundred_and_two_methods() {
-    let Some(bytes) = common::captured("D5pLH9sfOOl") else {
-        panic!("D5pLH9sfOOl is not available; set WA_WASM_DIR");
+fn the_voip_module_leaves_every_import_that_is_not_a_trampoline() {
+    let id = common::captures::VOIP;
+    let Some(bytes) = common::captured(id) else {
+        panic!("{}", common::missing_capture(id));
     };
     let module = Module::parse(&bytes).expect("parses");
+    let analysis = analysis::analyse(&module);
     let skeleton = codegen::generate_host(&module).expect("generates");
-    let methods = skeleton.matches("    fn ").count();
-    assert_eq!(methods, 102, "227 imports, 125 of them trampolines");
+    let implementation = imports_impl(&skeleton);
+    let methods = trait_methods(implementation);
 
-    // The forty that only the application can answer are the ones that matter,
-    // and they are the last group.
-    let application = &skeleton[skeleton
+    // Stated as the arithmetic rather than as a number read off a run: 242
+    // imports, 136 of them generated — 134 `invoke_*` plus the two that have to
+    // reach back into the instance — and the host is asked for the other 106. A
+    // capture that rolls changes both sides together, which a bare
+    // `assert_eq!(methods, 106)` would not have said.
+    let generated = analysis.invokes.len()
+        + usize::from(analysis.spawn.is_some())
+        + usize::from(analysis.init_main_thread.is_some());
+    assert_eq!(
+        methods,
+        module.func_imports.len() - generated,
+        "{} imports, {generated} of them generated",
+        module.func_imports.len()
+    );
+
+    // The ones only the application can answer are what matter, and they are
+    // the last group.
+    let application = &implementation[implementation
         .find("---- The application")
         .expect("the module has callbacks of its own")..];
-    let their_methods = application.matches("    fn ").count();
-    eprintln!("D5pLH9sfOOl: {methods} methods for a host, {their_methods} of them WhatsApp's own");
-    assert!(their_methods >= 30);
+    let their_methods = trait_methods(application);
+    eprintln!("{id}: {methods} methods for a host, {their_methods} of them WhatsApp's own");
+    assert!(their_methods >= 30, "{their_methods} of the module's own");
 }
 
 #[test]
