@@ -2,19 +2,25 @@
 //!
 //! Fixtures are what a decompiler is developed against; shipped modules are what
 //! it is judged by. These run over the WhatsApp Web captures — minified,
-//! Emscripten-built, up to 9 MiB — and they found the two bugs that fixtures did
-//! not: a value spilled inside a block and consumed after it, and an `Imports`
-//! trait emitted without return types.
+//! Emscripten-built, up to 10 MiB — and they found the two bugs that fixtures
+//! did not: a value spilled inside a block and consumed after it, and an
+//! `Imports` trait emitted without return types.
 //!
 //! They are `#[ignore]`d because they are slow, not because they are optional:
 //!
 //! ```sh
+//! ./scripts/fetch-captures.sh
 //! cargo test --test captured -- --ignored --nocapture
 //! ```
 //!
-//! The captures live in the whatsapp-rust checkout and are not copied here — a
-//! second copy drifts from the one the protocol notes refer to. `WA_WASM_DIR`
-//! points somewhere else.
+//! The captures are megabytes of somebody else's build output, so they are not
+//! committed: `scripts/fetch-captures.sh` downloads them into `fixtures/wasm`
+//! from the public `oxidezap/whatspec` archive and checks each against a pinned
+//! sha256. `WA_WASM_DIR` points somewhere else.
+//!
+//! WhatsApp rolls these payloads. An id that stops being served is replaced
+//! here by the build that succeeded it, and every number a test pins to it is
+//! re-read against the new one rather than carried over.
 
 mod common;
 
@@ -22,27 +28,26 @@ use unwasm_core::{Module, codegen};
 
 /// Every capture, with what is known about it.
 const CAPTURES: &[(&str, &str)] = &[
-    ("COs9e0Kj0ic", "VOPRF / crypto, 236 KiB"),
+    (common::captures::SMALLEST, "VOPRF / crypto, 236 KiB"),
     ("php8T1oSIZM", "mozjpeg, 376 KiB"),
-    ("9Nbh3eMuVjD", "2.9 MiB"),
+    ("a19OxQ3jkd2", "3.3 MiB, and the only WASI one"),
     ("ayqr5HQtlkb", "2.0 MiB"),
     ("rogm88TRRiw", "2.1 MiB"),
     (
-        "D5pLH9sfOOl",
-        "VoIP / PJSIP, 9.4 MiB — a shared imported memory and 1070 atomics",
+        common::captures::VOIP,
+        "VoIP / PJSIP, 10.2 MiB — a shared imported memory and 134 trampolines",
     ),
 ];
 
 #[test]
 #[ignore = "reads the capture directory and decompiles several megabytes"]
 fn every_capture_either_decompiles_or_says_why_not() {
-    let mut seen = 0;
+    let mut missing = Vec::new();
     for (id, description) in CAPTURES {
         let Some(bytes) = common::captured(id) else {
-            eprintln!("skipping: {id} unavailable (set WA_WASM_DIR)");
+            missing.push(*id);
             continue;
         };
-        seen += 1;
         match Module::parse(&bytes) {
             Ok(module) => {
                 let code = codegen::generate(&module).unwrap_or_else(|error| {
@@ -56,19 +61,26 @@ fn every_capture_either_decompiles_or_says_why_not() {
                 );
             }
             Err(error) => {
-                // A refusal is a result, as long as it names the construct. The
-                // VoIP module imports its memory, which this version does not
-                // model; what must never happen is a module that decompiles
-                // into something that does not mean the same thing.
+                // A refusal is a result, as long as it names the construct.
+                // What must never happen is a module that decompiles into
+                // something that does not mean the same thing.
                 let message = error.to_string();
                 assert!(message.contains("unsupported"), "{id}: {message}");
                 eprintln!("{id}: refused — {message}");
             }
         }
     }
+    // The whole corpus, not whatever happened to be on the disk. A run that
+    // covered four of six modules and reported the same green as one that
+    // covered all six is the failure this tier exists to make visible — and
+    // now that the captures are fetchable, a partial corpus is a fixable state
+    // rather than a fact of the machine.
     assert!(
-        seen > 0,
-        "no captures were found; this test compared nothing. Set WA_WASM_DIR."
+        missing.is_empty(),
+        "these captures were not found: {}.\n\
+         Run `scripts/fetch-captures.sh`, or set WA_WASM_DIR to a directory \
+         that already holds them.",
+        missing.join(", ")
     );
 }
 
@@ -79,8 +91,9 @@ fn every_capture_either_decompiles_or_says_why_not() {
 #[test]
 #[ignore = "compiles 70k lines of generated Rust"]
 fn the_smallest_capture_compiles_and_instantiates() {
-    let Some(bytes) = common::captured("COs9e0Kj0ic") else {
-        panic!("COs9e0Kj0ic is not available; set WA_WASM_DIR");
+    let id = common::captures::SMALLEST;
+    let Some(bytes) = common::captured(id) else {
+        panic!("{}", common::missing_capture(id));
     };
     const DRIVER: &str = r#"
 mod generated;
@@ -104,8 +117,9 @@ fn main() {
 #[test]
 #[ignore = "compiles 70k lines of generated Rust"]
 fn a_capture_compiles_in_the_split_layout() {
-    let Some(bytes) = common::captured("COs9e0Kj0ic") else {
-        panic!("COs9e0Kj0ic is not available; set WA_WASM_DIR");
+    let id = common::captures::SMALLEST;
+    let Some(bytes) = common::captured(id) else {
+        panic!("{}", common::missing_capture(id));
     };
     let module = Module::parse(&bytes).expect("it parses");
     let layout = codegen::Layout::Split {
@@ -129,7 +143,7 @@ fn main() {
     let bytes_of_memory: usize = output.trim().parse().expect("a memory size");
     assert_eq!(bytes_of_memory % 65536, 0);
     eprintln!(
-        "COs9e0Kj0ic: {} files, {} bytes of memory after instantiation",
+        "{id}: {} files, {} bytes of memory after instantiation",
         files.len(),
         bytes_of_memory
     );
@@ -144,9 +158,9 @@ fn a_catalogue_from_our_own_emscripten_names_musl_in_a_capture() {
     // a handful out of hundreds — and the point of the test is that the
     // pipeline works and that a match is a *plausible* one, not that recall is
     // good. See the fingerprint doc comment for the measurements.
-    let Some(capture) = common::captured("COs9e0Kj0ic") else {
-        eprintln!("skipping: capture unavailable (set WA_WASM_DIR)");
-        return;
+    let id = common::captures::SMALLEST;
+    let Some(capture) = common::captured(id) else {
+        panic!("{}", common::missing_capture(id));
     };
     let reference = common::compile_emscripten(
         "signature-reference",

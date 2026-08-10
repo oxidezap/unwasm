@@ -164,8 +164,9 @@ fn a_module_that_registers_nothing_says_nothing() {
 #[test]
 #[ignore = "reads the capture directory"]
 fn the_voip_modules_own_api_comes_back() {
-    let Some(bytes) = common::captured("D5pLH9sfOOl") else {
-        panic!("D5pLH9sfOOl is not available; set WA_WASM_DIR");
+    let id = common::captures::VOIP;
+    let Some(bytes) = common::captured(id) else {
+        panic!("{}", common::missing_capture(id));
     };
     let module = Module::parse(&bytes).expect("parses");
     let registrations = analysis::analyse(&module).registrations;
@@ -186,7 +187,7 @@ fn the_voip_modules_own_api_comes_back() {
         assert!(names.contains(&expected), "{expected} was not recovered");
     }
     eprintln!(
-        "D5pLH9sfOOl: {} embind registrations, {} named",
+        "{id}: {} embind registrations, {} named",
         registrations.len(),
         names.len()
     );

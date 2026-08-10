@@ -256,8 +256,9 @@ fn placing_the_same_segment_twice_at_one_address_is_not_ambiguous() {
 #[test]
 #[ignore = "reads the capture directory"]
 fn the_voip_module_names_a_fifth_of_its_functions() {
-    let Some(bytes) = common::captured("D5pLH9sfOOl") else {
-        panic!("D5pLH9sfOOl is not available; set WA_WASM_DIR");
+    let id = common::captures::VOIP;
+    let Some(bytes) = common::captured(id) else {
+        panic!("{}", common::missing_capture(id));
     };
     let module = Module::parse(&bytes).expect("parses");
     let analysis = analysis::analyse(&module);
@@ -286,7 +287,7 @@ fn the_voip_module_names_a_fifth_of_its_functions() {
         assert!(names.contains(&expected), "{expected} was not derived");
     }
     eprintln!(
-        "D5pLH9sfOOl: {} of {} functions named from their own messages",
+        "{id}: {} of {} functions named from their own messages",
         analysis.derived_names.len(),
         module.funcs.len()
     );

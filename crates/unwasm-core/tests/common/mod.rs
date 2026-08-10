@@ -617,16 +617,59 @@ pub fn decompile(wasm: &[u8]) -> String {
     codegen::generate(&module).expect("generating Rust")
 }
 
+/// The two captures that more than one test names.
+///
+/// They are constants rather than literals at each use because WhatsApp rolls
+/// these payloads: a module is reissued under a new id and the old id stops
+/// being served, so a roll should be one edit and a re-derivation of whatever
+/// exact numbers the tests pin — not a search across five files. The rest of
+/// the corpus is named once, in `captured.rs`.
+pub mod captures {
+    /// VoIP / PJSIP, 10.2 MiB — a shared imported memory, 134 `invoke_*`
+    /// trampolines and embind. The one capture that exercises the host, the
+    /// trampolines, the derived names and the registrations at once.
+    ///
+    /// Was `D5pLH9sfOOl` (9.4 MiB, 125 trampolines) until that build aged out
+    /// of every published archive. Same product, newer build: every fact the
+    /// tests derive from it still held, and the counts they pin were re-read.
+    pub const VOIP: &str = "JgwtTQVeWPm";
+
+    /// VOPRF / crypto, 236 KiB. The smallest, and so the one taken all the way
+    /// through rustc and instantiated.
+    pub const SMALLEST: &str = "COs9e0Kj0ic";
+}
+
+/// Where the captures are, when `WA_WASM_DIR` does not say otherwise: the
+/// repository's own `fixtures/wasm`, which `scripts/fetch-captures.sh` fills.
+///
+/// The default used to be a directory in one particular home. A harness that
+/// only finds its corpus on the machine it was written on reports "unavailable"
+/// everywhere else — which reads exactly like a capture that was withdrawn, and
+/// is the one failure this whole tier is supposed to be able to tell apart.
+pub fn captures_directory() -> PathBuf {
+    if let Ok(directory) = std::env::var("WA_WASM_DIR") {
+        return PathBuf::from(directory);
+    }
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("../../fixtures/wasm");
+    path
+}
+
 /// Reads a module from the wasm captures, if they are present.
 pub fn captured(id: &str) -> Option<Vec<u8>> {
-    let directory = std::env::var("WA_WASM_DIR").unwrap_or_else(|_| {
-        format!(
-            "{}/projects/whatsapp-rust/docs/captured-js/wasm",
-            std::env::var("HOME").unwrap_or_default()
-        )
-    });
-    let path = Path::new(&directory).join(format!("{id}.wasm"));
-    std::fs::read(path).ok()
+    std::fs::read(captures_directory().join(format!("{id}.wasm"))).ok()
+}
+
+/// What to say when a capture a test needs is not there. Naming the script that
+/// fetches it is the difference between a failure someone can act on and one
+/// that looks like the test itself is broken.
+pub fn missing_capture(id: &str) -> String {
+    format!(
+        "{id} is not in {}.\n\
+         Run `scripts/fetch-captures.sh` to download the captures, or set \
+         WA_WASM_DIR to a directory that already holds them.",
+        captures_directory().display()
+    )
 }
 
 const NODE_DRIVER: &str = r#"
