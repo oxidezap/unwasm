@@ -5,7 +5,7 @@ always runs, and is checked against the module it came from.
 
 ```console
 $ unwasm decompile module.wasm -o module.rs
-wrote module.rs (73657 lines, 478 functions)
+wrote module.rs (50672 lines, 478 functions)
 ```
 
 The claim other decompilers cannot make is the one this project is built
@@ -74,7 +74,7 @@ Concretely:
   `NoImports` traps on every call, so "nobody supplied a host" never looks like
   "the host returned 0".
 - **Emscripten's `invoke_*` trampolines are generated**, not asked for. On the
-  VoIP module that is 125 of 228 imports; see below.
+  VoIP module that is 134 of its 242 function imports; see below.
 - **Nothing is skipped.** An opcode with no faithful Rust form is an error
   naming the construct — never a comment in the output, never a stub.
 - **No `unsafe`.** `unsafe_code = "forbid"` for this crate and for what it
@@ -83,19 +83,20 @@ Concretely:
 
 ### On the real modules
 
-Every WhatsApp Web capture decompiles:
+Every WhatsApp Web capture decompiles — the corpus as `scripts/fetch-captures.sh`
+fetches it today, measured by `cargo test --test captured -- --ignored`:
 
 ```
-COs9e0Kj0ic:   478 functions,  73703 lines of Rust  (VOPRF/crypto, 236 KiB)
-php8T1oSIZM:   321 functions,  79486 lines          (mozjpeg, 376 KiB)
-9Nbh3eMuVjD:  7865 functions, 977766 lines          (2.9 MiB)
-ayqr5HQtlkb:  3055 functions, 660186 lines          (2.0 MiB)
-rogm88TRRiw:  2157 functions, 508994 lines          (2.1 MiB)
-D5pLH9sfOOl: 13347 functions, 3611088 lines         (VoIP/PJSIP, 9.4 MiB)
+COs9e0Kj0ic:   478 functions,   50672 lines of Rust  (VOPRF/crypto, 236 KiB)
+php8T1oSIZM:   321 functions,   51798 lines          (mozjpeg, 376 KiB)
+a19OxQ3jkd2:  9093 functions,  897503 lines          (3.3 MiB, WASI)
+ayqr5HQtlkb:  3055 functions,  470487 lines          (2.0 MiB)
+rogm88TRRiw:  2157 functions,  356911 lines          (2.1 MiB)
+JgwtTQVeWPm: 14733 functions, 2508142 lines          (VoIP/PJSIP, 10.2 MiB)
 ```
 
-All six decompile. The last one took a shared imported memory and 1070 atomic
-instructions; see below.
+All six decompile. The last one took a shared imported memory, 134 `invoke_*`
+trampolines and the atomics; see below.
 
 `COs9e0Kj0ic` compiles with rustc in about 2.5 seconds and instantiates, which
 runs the module's own `__wasm_call_ctors` and every static initialiser with it.
@@ -108,6 +109,11 @@ across 415 files, a shared imported memory and 1070 atomics — **compiles and
 instantiates in 13m44s**, and comes up with the 160 pages of memory its import
 declares. Its `start` function runs during instantiation without needing a
 host.
+
+That last run was on `D5pLH9sfOOl`, which WhatsApp has since stopped serving;
+the corpus now holds its successor `JgwtTQVeWPm`, which is larger again (14733
+functions, 2.5M lines) and has not been taken through rustc. Every rustc timing
+on this page names the build it was measured on for the same reason.
 
 ### The split, and why it is not cosmetic
 
@@ -321,13 +327,14 @@ clock are supplied rather than taken, so two runs produce the same bytes.
 The skeleton:
 
 ```console
-$ unwasm host D5pLH9sfOOl.wasm -o host.rs
-wrote host.rs (102 methods to implement)
+$ unwasm host JgwtTQVeWPm.wasm -o host.rs
+wrote host.rs (106 methods, 49 of them still to implement)
 ```
 
 ```rust
 impl Imports for Host {
-    // 102 methods. 125 of the module's 227 imports are Emscripten
+    // 106 methods, 57 of them answered by the library above
+    // and 49 left for you. 134 of the module's 242 imports are Emscripten
     // exception trampolines and are generated, so they are not here.
 
     // ---- WASI. A subset over an in-memory filesystem answers these.
@@ -353,8 +360,8 @@ address of a string — so without the memory a host cannot answer at all. The
 it is where the next capability goes: adding a field costs nothing, while
 adding a parameter changes every host ever written.
 
-Grouped by where each import comes from, because 102 methods in one list is a
-wall and the same 102 split into "these are WASI", "these are the C++ runtime"
+Grouped by where each import comes from, because 106 methods in one list is a
+wall and the same 106 split into "these are WASI", "these are the C++ runtime"
 and "these are yours" is a plan. What is left is `todo!()` rather than a stub
 returning zero — a stub compiles, runs, and is wrong, and the module cannot
 tell "not written yet" from "answered 0".
@@ -654,17 +661,38 @@ those are compared as `nan`, not as bits.
 ## Building and testing
 
 ```sh
-cargo test --workspace                                  # 393 tests, ~15s
-cargo test --test captured -- --ignored --nocapture     # the real modules
-cargo test --test emscripten -- --ignored --nocapture   # the real toolchain
+cargo test --workspace                                  # 564 tests, ~20s
 cargo clippy --workspace --all-targets -- -D warnings
 cargo llvm-cov --workspace --summary-only
+
+./scripts/fetch-captures.sh                             # ~19 MB, once
+cargo test --test captured -- --ignored --nocapture     # the real modules
+cargo test --test emscripten -- --ignored --nocapture   # the real toolchain
 ```
 
 The harness needs `node` (the reference engine), `clang` (wasm32 fixtures),
 `wasm-tools` (wat assembly) and `rustc`. A missing tool **fails** the tests
 rather than skipping them: a run that compared nothing must not report the same
 green as a run that compared everything.
+
+`cargo test --workspace` needs none of the above beyond those four tools —
+it runs on a bare checkout.
+
+### The captures
+
+The `#[ignore]`d tiers run against the real WhatsApp Web modules. Those are
+megabytes of somebody else's build output, so they are not committed:
+`scripts/fetch-captures.sh` downloads them into `fixtures/wasm` (git-ignored)
+from the public [`oxidezap/whatspec`](https://github.com/oxidezap/whatspec)
+archive, and checks each one against the sha256 pinned in
+`fixtures/captures.sha256`. A capture that arrives with different bytes is not
+the module the tests pin their numbers to, and is refused rather than used.
+
+WhatsApp rolls these payloads: a module is reissued under a new id and the old
+id stops being served. When that happens the corpus moves to the build that
+succeeded it and every number a test pins is re-read against the new module —
+which is why the counts in `captured.rs` and the ones quoted throughout this
+README can name different builds. Each figure below says which.
 
 `emcc` is needed only by the `#[ignore]`d Emscripten tests. On Arch the
 `emscripten` package provides it — note that it replaces `binaryen`, which it
@@ -674,8 +702,21 @@ shells started afterwards.
 
 ### Coverage
 
-**99.6% of lines.** Every file is complete except `module.rs`, and the twenty
-lines left there are unreachable rather than untested:
+**99.20% of lines** — 72 of 8946, from `cargo llvm-cov --workspace
+--summary-only` on a checkout, with the `#[ignore]`d tiers not running:
+
+| file | lines | missed |
+|---|---:|---:|
+| `rt.rs` | 1918 | 6 |
+| `codegen.rs` | 2605 | 18 |
+| `analysis.rs` | 1762 | 12 |
+| `module.rs` | 521 | 22 |
+| `hostlib.rs` | 1213 | 0 |
+| `error.rs` | 55 | 0 |
+| `ops.rs` | 144 | 3 |
+| `main.rs` (CLI) | 728 | 11 |
+
+The `module.rs` gap is the one that is unreachable rather than untested:
 
 - the `other =>` arms over wasmparser's `#[non_exhaustive]` enums. The compiler
   requires them; the only value that reaches one is from a proposal no
@@ -684,8 +725,13 @@ lines left there are unreachable rather than untested:
   guarantees by three separate routes, each with a test asserting the decoder's
   message.
 
-Both are kept. Deleting a defence to raise a percentage is how a decoder change
-becomes a panic two years later.
+Those are kept. Deleting a defence to raise a percentage is how a decoder change
+becomes a panic two years later. The rest is ordinary uncovered code and is not
+claimed to be anything else.
+
+Measure with LCOV rather than the text report — `cargo llvm-cov --workspace
+--lcov` and count `DA:` records with a zero. The per-file text view misses lines
+and reads as better than it is.
 
 ### Atomics on one thread
 
@@ -724,7 +770,7 @@ function invoke_vii(index, a, b) {
 
 Every part of that is already in the module — the table, the stack pointer, and
 its own exported `setThrew` — so it is generated rather than left as one more
-thing for a host to write. **The VoIP module's 228 imports become 102.**
+thing for a host to write. **`D5pLH9sfOOl`'s 227 function imports become 100.**
 
 ```rust
 /// `env::invoke_vii` — generated, not delegated.
@@ -764,13 +810,13 @@ import stays the host's to implement.
   23 seconds for 2.0 MiB of wasm. The 9.4 MiB VoIP module would be several
   minutes, if the rest of it were supported.
 - **The VoIP module compiles, instantiates and runs its `start` with the
-  generated host.** 2.47 million lines of Rust plus a 102-method host, built in
-  21m41s and instantiating 160 pages of shared memory. Half its host is written
-  for you. `unwasm host` implements 51 of its 102 imports — WASI, the C++
-  runtime, Emscripten's runtime, embind's registrations — and leaves 51,
-  which are WhatsApp's own callbacks, `stat` (a struct layout nobody should
-  guess at) and `emscripten_asm_const_*` (which runs JavaScript the module
-  carries).
+  generated host.** Measured on `D5pLH9sfOOl`: 2.47 million lines of Rust plus
+  a 100-method host, built in 21m41s and instantiating 160 pages of shared
+  memory. Half its host is written for you. On the current capture `unwasm host` answers 57 of its 106 host
+  methods — WASI, the C++ runtime, Emscripten's runtime, embind's
+  registrations — and leaves 49, which are WhatsApp's own callbacks, `stat`
+  (a struct layout nobody should guess at) and `emscripten_asm_const_*`
+  (which runs JavaScript the module carries).
 - **No SIMD, no reference types, no exceptions, no multi-value.** Each is
   refused by name.
 - **Level 0 only.** Linear memory is bytes; a C local that lived in the shadow

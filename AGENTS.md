@@ -171,8 +171,16 @@ mistaken for the enclosing frame's.
 
 ## Coverage is a floor, not a target
 
-**99.5% of lines. Twenty are left, all in `module.rs`, and all of them are
-unreachable rather than untested:**
+**99.20% of lines — 72 of 8946**, on a checkout with the `#[ignore]`d tiers not
+running: `module.rs` 22, `codegen.rs` 18, `analysis.rs` 12, `main.rs` 11,
+`rt.rs` 6, `ops.rs` 3. `hostlib.rs` and `error.rs` are complete.
+
+The number was **99.5%** here and **99.6%** in the README, and neither was
+re-measured as the code grew. Re-measure before quoting it; a coverage figure
+that is only ever copied forward is the kind of claim this project exists to
+not make.
+
+The part of `module.rs` that is unreachable rather than untested:
 
 - the `other =>` arms over wasmparser's `#[non_exhaustive]` `TypeRef` and
   `ExternalKind`. The compiler requires the arm; the only value that reaches it
@@ -183,12 +191,14 @@ unreachable rather than untested:**
   section, and a body count mismatch — and `malformed.rs` has a test for each,
   asserting the decoder's message rather than ours.
 
-Three more are in `codegen.rs`, in the table-type map: a table entry whose
-function index has no type, a type index past `u16::MAX`, and a signature
-missing from the type section. All three are malformed-module defences that
-`wasm-tools` will not assemble, and the third is unreachable by construction.
+Three of `codegen.rs`'s are in the table-type map: a table entry whose function
+index has no type, a type index past `u16::MAX`, and a signature missing from
+the type section. All three are malformed-module defences that `wasm-tools` will
+not assemble, and the third is unreachable by construction. The other fifteen
+there, and the gaps in `analysis.rs`, `main.rs`, `rt.rs` and `ops.rs`, are
+ordinary uncovered code — they are not defended, they are just untested.
 
-Keep them. Deleting a defence to raise a percentage is how a decoder change
+Keep the defences. Deleting one to raise a percentage is how a decoder change
 becomes a panic two years later, and the tests record which layer rejects each
 case today, so a change in that answer shows up as a failing test rather than
 as a crash.
@@ -243,7 +253,8 @@ notification that never came. Do not "fix" that trap by returning 2.
 
 Measure before believing a feature list: the VoIP module's `target_features`
 asks for `reference-types` and `multivalue`, and the module uses neither — one
-`funcref` declaration and zero multi-result blocks across 13347 functions.
+`funcref` declaration and zero multi-result blocks across the 13347 functions
+of `D5pLH9sfOOl`.
 
 ## A trampoline must not catch a trap
 
@@ -355,14 +366,34 @@ easy to get wrong:
   unmodelled opcode is refused rather than dropped — so a table cannot change
   after instantiation, and a copy of something immutable is the original. This
   was worth measuring rather than assuming: all six captured modules have zero
-  table-mutation opcodes, and the VoIP module's table is declared `9291 9291`.
+  table-mutation opcodes, and `D5pLH9sfOOl`'s table is declared `9291 9291`.
+
+## The corpus rolls, and a measurement is dated by the build it was taken on
+
+WhatsApp reissues these payloads under new ids and stops serving the old ones.
+`scripts/fetch-captures.sh` pulls what is still published from the public
+`oxidezap/whatspec` archive and checks each against a pinned sha256; the two
+captures more than one test names are constants in `tests/common/mod.rs`.
+
+When an id ages out, the corpus moves to the build that succeeded it and every
+number a test pins is **re-read against the new module**, not carried over. The
+VoIP module went `D5pLH9sfOOl` (9.4 MiB, 13347 functions, 227 imports, 125
+trampolines) → `JgwtTQVeWPm` (10.2 MiB, 14733 functions, 242 imports, 134
+trampolines); the 2.9 MiB one went `9Nbh3eMuVjD` → `a19OxQ3jkd2`.
+
+Figures quoted in `README.md` were measured on the build named beside them, and
+most of them name `D5pLH9sfOOl`. They are records of a run, not claims about
+whatever the corpus holds today — so re-measure before reusing one, and say
+which build you measured.
 
 ## Open work
 
-1. **Drive the VoIP module.** `unwasm host` now implements 51 of its 102
-   imports; the rest are WhatsApp's own callbacks, `stat` (a struct layout
-   nobody should guess at), `asm_const` (JavaScript the module carries) and the
-   pthread glue, which needs a way back into the instance from an import.
+1. **Drive the VoIP module.** `unwasm host` implements about half of it; the
+   rest are WhatsApp's own callbacks, `stat` (a struct layout nobody should
+   guess at), `asm_const` (JavaScript the module carries) and the pthread glue,
+   which needs a way back into the instance from an import. The exact split was
+   51 of 102 on `D5pLH9sfOOl`; on `JgwtTQVeWPm` it is 108 methods and has not
+   been re-counted.
 2. **Level 1 proper**: turn shadow-stack slots into named locals, now that the
    stack pointer is identified. The frame size is in the prologue; what is
    missing is tracking which offsets from it are distinct variables — with the
