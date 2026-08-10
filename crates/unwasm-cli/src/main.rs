@@ -15,6 +15,8 @@ unwasm — a WebAssembly decompiler whose output compiles
 
 usage:
   unwasm decompile <module.wasm> [-o <out>] [--split <n>] [--only <indices>]
+                   [--reachable-from <indices>] [--signatures <file>]
+                   [--instrument-stores] [--offsets]
   unwasm host      <module.wasm> [-o <host.rs>] [--defaults]
   unwasm table     <module.wasm> [--type <signature>]
   unwasm calls     <module.wasm> <index>
@@ -31,20 +33,21 @@ usage:
   --split <n>    roughly how many lines to put in each part file. Implies a
                  directory. Without it, a directory gets the layout the
                  module's size calls for.
-  --signatures <file>  name library code using a catalogue from `signatures`.
-  --only <list>  decompile only these function indices
-  --with-callees  and everything they call directly
+  --only <list>  decompile only these function indices. The rest keep their
+                 signatures and become `unimplemented!()`, so the result still
+                 compiles — for reading three functions out of thirteen
+                 thousand without producing 365 MB.
+  --with-callees  with --only: and everything they call directly
   --reachable-from <list>  decompile what these functions can reach, and stub
                  the rest — the closure over direct calls plus every table
                  entry an indirect call could land on
   --direct-only  with --reachable-from: follow direct calls only. Smaller and
                  incomplete; a stub it reaches says which function to add
+  --signatures <file>  name library code using a catalogue from `signatures`
   --instrument-stores  route every memory write through the watchpoint runtime,
                  so `instance.memory.watch(addr, len)` reports who wrote it
-  --offsets      also write offsets.json: which wasm bytes made each line, comma-separated. The
-                 rest keep their signatures and become `unimplemented!()`, so
-                 the result still compiles - for reading three functions out of
-                 thirteen thousand without producing 365 MB.
+  --offsets      also write offsets.json: which wasm bytes made each line,
+                 comma-separated
 
 A directory output also gets `names.json`: every function's index, name, file,
 line and table slots. That is the index to look things up in rather than
