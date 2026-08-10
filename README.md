@@ -5,7 +5,7 @@ always runs, and is checked against the module it came from.
 
 ```console
 $ unwasm decompile module.wasm -o module.rs
-wrote module.rs (50672 lines, 478 functions)
+wrote module.rs (50682 lines, 478 functions)
 ```
 
 The claim other decompilers cannot make is the one this project is built
@@ -87,12 +87,12 @@ Every WhatsApp Web capture decompiles — the corpus as `scripts/fetch-captures.
 fetches it today, measured by `cargo test --test captured -- --ignored`:
 
 ```
-COs9e0Kj0ic:   478 functions,   50672 lines of Rust  (VOPRF/crypto, 236 KiB)
+COs9e0Kj0ic:   478 functions,   50682 lines of Rust  (VOPRF/crypto, 236 KiB)
 php8T1oSIZM:   321 functions,   51798 lines          (mozjpeg, 376 KiB)
-a19OxQ3jkd2:  9093 functions,  897503 lines          (3.3 MiB, WASI)
-ayqr5HQtlkb:  3055 functions,  470487 lines          (2.0 MiB)
-rogm88TRRiw:  2157 functions,  356911 lines          (2.1 MiB)
-JgwtTQVeWPm: 14733 functions, 2508142 lines          (VoIP/PJSIP, 10.2 MiB)
+a19OxQ3jkd2:  9093 functions,  898131 lines          (3.3 MiB, WASI)
+ayqr5HQtlkb:  3055 functions,  470524 lines          (2.0 MiB)
+rogm88TRRiw:  2157 functions,  356954 lines          (2.1 MiB)
+JgwtTQVeWPm: 14733 functions, 2508203 lines          (VoIP/PJSIP, 10.2 MiB)
 ```
 
 All six decompile. The last one took a shared imported memory, 134 `invoke_*`
@@ -110,10 +110,24 @@ instantiates in 13m44s**, and comes up with the 160 pages of memory its import
 declares. Its `start` function runs during instantiation without needing a
 host.
 
-That last run was on `D5pLH9sfOOl`, which WhatsApp has since stopped serving;
-the corpus now holds its successor `JgwtTQVeWPm`, which is larger again (14733
-functions, 2.5M lines) and has not been taken through rustc. Every rustc timing
-on this page names the build it was measured on for the same reason.
+That run was on `D5pLH9sfOOl`, which WhatsApp has since stopped serving. Its
+successor `JgwtTQVeWPm` is larger again and has now been through rustc too:
+
+```console
+$ unwasm decompile JgwtTQVeWPm.wasm -o src/generated   # 17s, 455 files, 2.5M lines
+$ unwasm host JgwtTQVeWPm.wasm --defaults -o src/host.rs
+$ RUST_MIN_STACK=134217728 cargo run
+   Finished `dev` profile [unoptimized] target(s) in 11m 23s
+instantiated in 1.454084497s
+memory: 10485760 bytes
+table: 10762 slots
+nothing was answered with a default
+```
+
+Ten megabytes of somebody else's wasm, compiled and instantiated — and the last
+line is the one that matters: its `start` ran through to the end without asking
+the host a single question, so nothing in that run rests on a default. Every
+rustc timing on this page names the build it was measured on.
 
 ### The split, and why it is not cosmetic
 
@@ -853,15 +867,15 @@ import stays the host's to implement.
 ## Known limits
 
 - **Compile time still scales with the module**, just not catastrophically:
-  23 seconds for 2.0 MiB of wasm. The 9.4 MiB VoIP module would be several
-  minutes, if the rest of it were supported.
+  23 seconds for 2.0 MiB of wasm, 11m23s for the 10.2 MiB VoIP module.
 - **The VoIP module compiles, instantiates and runs its `start` with the
-  generated host.** Measured on `D5pLH9sfOOl`: 2.47 million lines of Rust plus
-  a 100-method host, built in 21m41s and instantiating 160 pages of shared
-  memory. Most of its host is written for you: on the current capture
-  `unwasm host` answers **67 of its 106 host methods** — WASI over an in-memory
-  filesystem, the C++ runtime, Emscripten's runtime, the clock and `strftime`,
-  embind's registrations — and leaves 39. Twenty-two of those are WhatsApp's
+  generated host.** On the current capture `JgwtTQVeWPm`: 2.5 million lines of
+  Rust across 455 files plus a 106-method host, built in 11m23s and
+  instantiating 160 pages of shared memory in 1.45 seconds, with nothing
+  answered by a default. Most of that host is written for you: `unwasm host`
+  answers **67 of its 106 methods** — WASI over an in-memory filesystem, the
+  C++ runtime, Emscripten's runtime, the clock and `strftime`, embind's
+  registrations — and leaves 39. Twenty-two of those are WhatsApp's
   own callbacks, six are the C++ catch-matching entry points this refuses to
   guess at, six need a way back into the instance from an import (the pthread
   glue and `mmap`), and two are `emscripten_asm_const_*`, which runs JavaScript
