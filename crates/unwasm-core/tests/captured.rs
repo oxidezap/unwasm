@@ -108,6 +108,45 @@ fn main() {
     assert_eq!(pages % 65536, 0, "memory is a whole number of pages");
 }
 
+/// The VoIP module's own allocator, run.
+///
+/// Everything else in this tier reads the big capture or compiles a small one.
+/// This one *runs* the big one: Emscripten's dlmalloc as it was shipped, sliced
+/// out of 14733 functions, compiled by rustc, and asked the same questions the
+/// engine is asked — with the whole of linear memory compared afterwards, which
+/// is where an allocator's real answer lives. A boundary tag written one byte
+/// out returns the same pointer and a different heap.
+///
+/// `free` is not called with an address, because the harness's calls are
+/// literals and the address is whichever one the run produces. What it is
+/// called with is 0, which the standard defines as doing nothing — and which a
+/// wrong translation of the null check would not.
+#[test]
+#[ignore = "reads the capture directory and compiles a slice of a 10.2 MiB module"]
+fn the_voip_modules_own_allocator_agrees_with_the_engine() {
+    let id = common::captures::VOIP;
+    let Some(bytes) = common::captured(id) else {
+        panic!("{}", common::missing_capture(id));
+    };
+    let calls = vec![
+        common::call("malloc", &[common::Arg::I32(64)]),
+        common::call("malloc", &[common::Arg::I32(64)]),
+        common::call("malloc", &[common::Arg::I32(1024)]),
+        // Zero bytes is still an allocation, and a distinct one.
+        common::call("malloc", &[common::Arg::I32(0)]),
+        // More than the address space holds: a null, not a wrap to something
+        // small, and not a growth of the memory.
+        common::call("malloc", &[common::Arg::I32(-1)]),
+        common::call("free", &[common::Arg::I32(0)]),
+        common::call(
+            "emscripten_builtin_memalign",
+            &[common::Arg::I32(64), common::Arg::I32(128)],
+        ),
+        common::call("__errno_location", &[]),
+    ];
+    common::assert_agrees_over_reachable("capture-voip-malloc", &bytes, &calls);
+}
+
 /// A real module in the split layout, compiled and instantiated.
 ///
 /// The layout is forced rather than taken from the module's size: 478

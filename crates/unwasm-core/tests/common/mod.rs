@@ -294,11 +294,29 @@ fn run_in_node(name: &str, wasm: &[u8], calls: &[Call], module: &Module) -> Vec<
         })
         .unwrap_or_else(|| "null".to_string());
 
+    // Every function import the module declares, so the engine can instantiate
+    // it at all. Each one is a stub that *throws*, which is not a stub that
+    // answers: it is exactly what `NoImports` does on the other side, so a call
+    // that reaches a host is a trap in both runs rather than a zero in one of
+    // them and a trap in the other.
+    let function_imports = module
+        .func_imports
+        .iter()
+        .map(|import| {
+            format!(
+                "{{\"module\":\"{}\",\"field\":\"{}\"}}",
+                import.module, import.field
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
     let output = tool("node")
         .arg(&driver)
         .arg(&binary)
         .arg(format!("[{plan}]"))
         .arg(memory_import)
+        .arg(format!("[{function_imports}]"))
         .output()
         .expect("running node");
     assert!(
@@ -332,8 +350,17 @@ fn result_kind(module: &Module, export: &str) -> String {
 /// Both layouts land at `mod generated;`: Rust resolves that to `generated.rs`
 /// or to `generated/mod.rs`, so the driver is identical either way and the two
 /// layouts are compared by exactly the same tests.
-fn write_generated(scratch: &Path, module: &Module, layout: codegen::Layout) {
-    let files = codegen::generate_files(module, layout).expect("generating Rust");
+fn write_generated(
+    scratch: &Path,
+    module: &Module,
+    layout: codegen::Layout,
+    only: Option<&std::collections::BTreeSet<u32>>,
+) {
+    let files = match only {
+        Some(only) => codegen::generate_only(module, layout, only),
+        None => codegen::generate_files(module, layout),
+    }
+    .expect("generating Rust");
     let single = scratch.join("generated.rs");
     let directory = scratch.join("generated");
     // Clear whichever form a previous run left, or `mod generated;` becomes
@@ -363,8 +390,18 @@ fn run_in_rust_with_layout(
     calls: &[Call],
     layout: codegen::Layout,
 ) -> Vec<String> {
+    run_in_rust_with(name, module, calls, layout, None)
+}
+
+fn run_in_rust_with(
+    name: &str,
+    module: &Module,
+    calls: &[Call],
+    layout: codegen::Layout,
+    only: Option<&std::collections::BTreeSet<u32>>,
+) -> Vec<String> {
     let scratch = workspace_scratch(name);
-    write_generated(&scratch, module, layout);
+    write_generated(&scratch, module, layout, only);
 
     let mut main = String::from(
         "mod generated;\n\
@@ -498,6 +535,78 @@ pub fn assert_agrees_with_layout(name: &str, wasm: &[u8], calls: &[Call], layout
     }
 }
 
+/// As [`assert_agrees`], decompiling only what the calls can reach.
+///
+/// For a capture too large to compile whole. The engine still runs the *whole*
+/// module — it is the file, untouched — so this is not a comparison of two
+/// slices: it is the module against a decompilation of the part of it these
+/// calls execute, and every function left out is one nothing on this path ever
+/// enters. A stub that was wrongly left out is not a quiet difference either;
+/// it is an `unimplemented!()`, and the run stops there.
+///
+/// Reachability is over *direct* calls only, which is `unwasm decompile
+/// --direct-only`. Following the table would be the complete answer and is not
+/// a reduction — 98% of the VoIP module is reachable once `call_indirect` is
+/// followed — so it is the direct closure that fits through rustc. That cannot
+/// buy a false pass: the engine still runs everything, and a stub the run
+/// reaches panics, which is compared against whatever the engine returned.
+///
+/// # Panics
+///
+/// Panics with the first disagreement, naming the call that produced it.
+pub fn assert_agrees_over_reachable(name: &str, wasm: &[u8], calls: &[Call]) {
+    let module = Module::parse(wasm).expect("parsing the module under test");
+    let analysis = unwasm_core::analysis::analyse(&module);
+    let mut only = std::collections::BTreeSet::new();
+    // The start function is a root whether or not anything calls it: both sides
+    // run it at instantiation, before the first call, so leaving it out is a
+    // panic before the comparison has begun.
+    if let Some(start) = module.start {
+        only.extend(analysis.directly_reachable_from(&module, start));
+    }
+    for call in calls {
+        let index = module
+            .exports
+            .iter()
+            .find(|export| {
+                export.kind == unwasm_core::module::ExportKind::Func && export.name == call.export
+            })
+            .unwrap_or_else(|| panic!("the module exports no `{}`", call.export))
+            .index;
+        only.extend(analysis.directly_reachable_from(&module, index));
+    }
+    eprintln!(
+        "{name}: {} of {} functions decompiled for {} calls",
+        only.len(),
+        module.funcs.len(),
+        calls.len()
+    );
+
+    let engine = run_in_node(name, wasm, calls, &module);
+    let ours = run_in_rust_with(
+        name,
+        &module,
+        calls,
+        codegen::Layout::for_module(&module),
+        Some(&only),
+    );
+
+    assert_eq!(
+        engine.len(),
+        ours.len(),
+        "the two sides produced different numbers of lines\nengine: {engine:#?}\nours: {ours:#?}"
+    );
+    for (at, (expected, actual)) in engine.iter().zip(ours.iter()).enumerate() {
+        let what = calls
+            .get(at)
+            .map_or_else(|| "linear memory".to_string(), |call| format!("{call:?}"));
+        assert_eq!(
+            expected, actual,
+            "the decompilation disagrees with the engine on {what}"
+        );
+    }
+}
+
 /// Decompiles and compiles, without running. For modules with no callable
 /// entry point worth driving, where the claim under test is only that the
 /// output builds.
@@ -526,7 +635,7 @@ pub fn run_with_driver_in_layout(
 ) -> String {
     let module = Module::parse(wasm).expect("parsing the module under test");
     let scratch = workspace_scratch(name);
-    write_generated(&scratch, &module, layout);
+    write_generated(&scratch, &module, layout, None);
     std::fs::write(scratch.join("main.rs"), driver).expect("writing the driver");
 
     let binary = scratch.join("driver");
@@ -694,6 +803,19 @@ if (memoryImport) {
   if (memoryImport.maximum !== null) descriptor.maximum = memoryImport.maximum;
   if (memoryImport.shared) descriptor.shared = true;
   imports[memoryImport.module] = {[memoryImport.field]: new WebAssembly.Memory(descriptor)};
+}
+
+// The function imports, each one a stub that throws. A module with 242 of them
+// cannot be instantiated without something in every slot, and what goes there
+// has to be what `NoImports` does on the other side: no host was supplied, so
+// reaching one is a trap in both runs. A stub returning 0 would make the two
+// sides disagree about which of them was even asked.
+for (const {module: from, field} of JSON.parse(process.argv[5] || '[]')) {
+  imports[from] = imports[from] || {};
+  if (field in imports[from]) continue;
+  imports[from][field] = () => {
+    throw new WebAssembly.RuntimeError(`no host was supplied for ${from}::${field}`);
+  };
 }
 
 const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), imports);
