@@ -328,13 +328,13 @@ The skeleton:
 
 ```console
 $ unwasm host JgwtTQVeWPm.wasm -o host.rs
-wrote host.rs (106 methods, 49 of them still to implement)
+wrote host.rs (106 methods, 39 of them still to implement)
 ```
 
 ```rust
 impl Imports for Host {
-    // 106 methods, 57 of them answered by the library above
-    // and 49 left for you. 134 of the module's 242 imports are Emscripten
+    // 106 methods, 67 of them answered by the library above
+    // and 39 left for you. 134 of the module's 242 imports are Emscripten
     // exception trampolines and are generated, so they are not here.
 
     // ---- WASI. A subset over an in-memory filesystem answers these.
@@ -831,11 +831,18 @@ import stays the host's to implement.
 - **The VoIP module compiles, instantiates and runs its `start` with the
   generated host.** Measured on `D5pLH9sfOOl`: 2.47 million lines of Rust plus
   a 100-method host, built in 21m41s and instantiating 160 pages of shared
-  memory. Half its host is written for you. On the current capture `unwasm host` answers 57 of its 106 host
-  methods — WASI, the C++ runtime, Emscripten's runtime, embind's
-  registrations — and leaves 49, which are WhatsApp's own callbacks, `stat`
-  (a struct layout nobody should guess at) and `emscripten_asm_const_*`
-  (which runs JavaScript the module carries).
+  memory. Most of its host is written for you: on the current capture
+  `unwasm host` answers **67 of its 106 host methods** — WASI over an in-memory
+  filesystem, the C++ runtime, Emscripten's runtime, the clock and `strftime`,
+  embind's registrations — and leaves 39. Twenty-two of those are WhatsApp's
+  own callbacks, six are the C++ catch-matching entry points this refuses to
+  guess at, six need a way back into the instance from an import (the pthread
+  glue and `mmap`), and two are `emscripten_asm_const_*`, which runs JavaScript
+  the module carries.
+- **Its allocator runs, and agrees with the engine.** `captured.rs` decompiles
+  the 42 functions `malloc`, `free` and `memalign` reach, compiles them, and
+  compares against V8 running the whole 10.2 MiB file: the pointers returned
+  *and* the whole of linear memory.
 - **No SIMD, no reference types, no exceptions, no multi-value.** Each is
   refused by name.
 - **Level 0 only.** Linear memory is bytes; a C local that lived in the shadow

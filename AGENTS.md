@@ -256,6 +256,16 @@ The one that actually moves the wall clock is not a codegen tweak: it is
 `--reachable-from … --direct-only`, which turns 21 minutes into 11 seconds by
 not compiling the 82% of the module the path never touches.
 
+**Decompiling was itself quadratic until recently, and every wall-clock figure
+on this page was measured with that in it.** The index recorded which line each
+function starts on by counting the lines of everything written so far, once per
+function — 152 of the 154 seconds a 3.3 MiB capture took, and twenty-five
+minutes of the ten. Counted forward it is 11.8 seconds and 33.2 seconds, for
+byte-identical output, and the whole `captured` tier went from 1887 seconds to
+47. The lesson generalises: before optimising what the output costs to *compile*,
+check what it costs to *produce* — `unwasm inspect` is parse and analysis alone,
+and the difference between it and `decompile` is the emitter's own bill.
+
 ## Layout is a compile-time decision, and it was measured
 
 rustc partitions codegen units along module boundaries. The 2.0 MiB capture in
@@ -267,6 +277,12 @@ The default was chosen from the whole curve (1 / 13 / 49 / 192 / 764 files:
 looked good. The table is in `Layout::FUNCTIONS_PER_FILE`. Any change to it
 should be measured the same way rather than argued about — and the system time
 is the number to watch, since it was 1102s for one file and 12.6s for 192.
+
+Those numbers are rustc's, and they still stand: 1102s of *system* time is not a
+figure a decompiler's own arithmetic produces. But the one-file row was taken
+before the quadratic above was found, so some of its 22m49s was ours. The shape
+of the curve is what the default rests on, and that has not changed; if the
+exact figure ever matters, re-measure it rather than quoting this one.
 
 ## What a single thread can and cannot say about atomics
 
@@ -414,12 +430,28 @@ which build you measured.
 
 ## Open work
 
-1. **Drive the VoIP module.** `unwasm host` implements about half of it; the
-   rest are WhatsApp's own callbacks, `stat` (a struct layout nobody should
-   guess at), `asm_const` (JavaScript the module carries) and the pthread glue,
-   which needs a way back into the instance from an import. The exact split was
-   51 of 102 on `D5pLH9sfOOl`; on `JgwtTQVeWPm` it is 108 methods and has not
-   been re-counted.
+1. **Drive the VoIP module.** `unwasm host` writes **106 methods for
+   `JgwtTQVeWPm`, 39 of them still `todo!()`** — re-counted, not carried over
+   from `D5pLH9sfOOl`'s 51 of 102. Its allocator already runs: `captured.rs`
+   compiles a 42-function slice and compares it against the engine, linear
+   memory included. What the remaining 39 are is worth knowing before adding to
+   them:
+
+   - **22 are WhatsApp's own callbacks** — eleven `call_*_js_sync` capture and
+     playback drivers, plus `on_call_event_js_sync`, `renderVideoFrame_js`,
+     `sendSignalingXMPP_js_sync` and the rest. Nothing but the application can
+     answer them.
+   - **6 are the C++ catch-matching and primary-exception entry points**,
+     refused on purpose — see the note on `__cxa_find_matching_catch_*` above.
+   - **3 are the pthread glue**, which needs a way back into the instance from
+     an import. So do the **3 `mmap` ones**, which allocate through the guest's
+     own `memalign`. That single capability is what six of the thirty-nine are
+     waiting on, and it is the honest next step.
+   - **2 are `asm_const`**, JavaScript the module carries.
+   - the rest are `gethostbyname`, the offscreen canvas, and `longjmp`.
+
+   What is *not* left is anything a standard already decides. Those were
+   written; adding to the list means adding a capability, not another entry.
 2. **Level 1 proper**: turn shadow-stack slots into named locals, now that the
    stack pointer is identified. The frame size is in the prologue; what is
    missing is tracking which offsets from it are distinct variables — with the
