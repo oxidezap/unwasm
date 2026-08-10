@@ -319,7 +319,9 @@ fn known_import(field: &str, ty: &crate::module::FuncType) -> Option<&'static st
         ("fd_write", "iiii->i") => "self.wasi.fd_write(caller, p0, p1, p2, p3)",
         ("fd_read", "iiii->i") => "self.wasi.fd_read(caller, p0, p1, p2, p3)",
         ("fd_pread", "iiiji->i") => "self.wasi.fd_pread(caller, p0, p1, p2, p3, p4)",
+        ("fd_pwrite", "iiiji->i") => "self.wasi.fd_pwrite(caller, p0, p1, p2, p3, p4)",
         ("fd_seek", "ijii->i") => "self.wasi.fd_seek(caller, p0, p1, p2, p3)",
+        ("fd_sync", "i->i") => "self.wasi.fd_sync(p0)",
         ("fd_close", "i->i") => "self.wasi.fd_close(p0)",
         ("environ_sizes_get", "ii->i") => "self.wasi.environ_sizes_get(caller, p0, p1)",
         ("environ_get", "ii->i") => "self.wasi.environ_get(caller, p0, p1)",
@@ -343,6 +345,10 @@ fn known_import(field: &str, ty: &crate::module::FuncType) -> Option<&'static st
         // class. Answering with the exception unconditionally selects the
         // wrong handler for `throw Derived; catch (Base&)` and hands the guest
         // the wrong address, which is worse than saying it is not written.
+        // The type id *is* the answer: Emscripten's glue is `(type) => type`,
+        // because the personality routine compares the value it gets back
+        // against the same pointers the module's own tables hold.
+        ("llvm_eh_typeid_for", "i->i") => "p0",
         ("__assert_fail", "iiii->") => "runtime::assert_fail(caller, p0, p1, p2, p3)",
 
         // ---- Emscripten's runtime
@@ -360,6 +366,12 @@ fn known_import(field: &str, ty: &crate::module::FuncType) -> Option<&'static st
         ("_localtime_js", "ji->") | ("_gmtime_js", "ji->") => {
             "let _ = runtime::write_tm(caller, p1, p0);"
         }
+        ("_mktime_js", "i->j") => "runtime::mktime(caller, p0)",
+        // `strftime` is specified by the standard rather than by the
+        // application, so it is the same for every module — and the locale
+        // argument of `strftime_l` selects nothing this answers differently.
+        ("strftime", "iiii->i") => "runtime::strftime(caller, p0, p1, p2, p3)",
+        ("strftime_l", "iiiii->i") => "runtime::strftime(caller, p0, p1, p2, p3)",
         ("_tzset_js", "iiii->") => "runtime::tzset(caller, p0, p1, p2, p3)",
         ("_tzset_js", "iii->") => "runtime::tzset(caller, p0, p1, p2, 0)",
         ("emscripten_num_logical_cores", "->i") => "self.emscripten.cores",
@@ -402,9 +414,14 @@ fn known_import(field: &str, ty: &crate::module::FuncType) -> Option<&'static st
             "self.wasi.stat_path(caller, p0, p1)"
         }
         ("__syscall_fstat64", "ii->i") => "self.wasi.stat_fd(caller, p0, p1)",
-        // `newfstatat(dirfd, path, buf, flags)`: every path here is absolute,
-        // so the directory descriptor decides nothing.
+        // `newfstatat(dirfd, path, buf, flags)`: a relative path is resolved
+        // against the working directory, so the descriptor decides nothing.
         ("__syscall_newfstatat", "iiii->i") => "self.wasi.stat_path(caller, p1, p2)",
+        ("__syscall_chdir", "i->i") => "self.wasi.chdir(caller, p0)",
+        ("__syscall_mkdirat", "iii->i") => "self.wasi.mkdirat(caller, p1)",
+        ("__syscall_getdents64", "iii->i") => "self.wasi.getdents64(caller, p0, p1, p2)",
+        ("__syscall_ftruncate64", "ij->i") => "self.wasi.ftruncate(p0, p1)",
+        ("__syscall_fcntl64", "iii->i") => "self.wasi.fcntl(p0, p1, p2)",
 
         // ---- embind and emval
         ("_emval_incref", "i->") => "self.embind.incref(p0)",

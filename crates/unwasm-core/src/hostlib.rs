@@ -51,6 +51,29 @@ pub mod errno {
     pub const NOTTY: i32 = 59;
     /// Invalid seek.
     pub const SPIPE: i32 = 70;
+    /// Result too large — what `fcntl` answers for a range it cannot give.
+    pub const RANGE: i32 = 68;
+}
+
+/// `fcntl`'s commands, at musl's numbers — which is what an Emscripten module
+/// was built against, and which are not glibc's for everything.
+mod fcntl {
+    /// Duplicate a descriptor, at or above the number given.
+    pub const DUPFD: i32 = 0;
+    /// Read the close-on-exec flag.
+    pub const GETFD: i32 = 1;
+    /// Set it.
+    pub const SETFD: i32 = 2;
+    /// Read the descriptor's status flags.
+    pub const GETFL: i32 = 3;
+    /// Set them.
+    pub const SETFL: i32 = 4;
+    /// Test a record lock.
+    pub const GETLK: i32 = 12;
+    /// Take one.
+    pub const SETLK: i32 = 13;
+    /// Take one, waiting.
+    pub const SETLKW: i32 = 14;
 }
 
 /// Where a `fd_seek` measures its offset from.
@@ -90,6 +113,19 @@ pub struct Open {
     pub append: bool,
 }
 
+/// An open directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenDir {
+    /// The path it was opened under.
+    pub path: String,
+    /// How many entries `getdents64` has already handed back.
+    ///
+    /// A directory read is a cursor, not a query: the caller keeps asking until
+    /// it is answered with nothing, so a descriptor that forgot how far it had
+    /// got would return the first entry for ever.
+    pub returned: usize,
+}
+
 /// A stream that is not a file: the three the C runtime assumes exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Standard {
@@ -109,7 +145,7 @@ pub enum Descriptor {
     /// A file in [`Wasi::files`].
     File(Open),
     /// A directory, which `openat` resolves paths against.
-    Directory(String),
+    Directory(OpenDir),
 }
 
 /// A host for the WASI imports, over a filesystem that lives in this struct.
@@ -121,6 +157,16 @@ pub enum Descriptor {
 pub struct Wasi {
     /// The filesystem: a path to its contents. Nothing outside it exists.
     pub files: std::collections::BTreeMap<String, Vec<u8>>,
+    /// Directories that exist without holding anything.
+    ///
+    /// A directory is normally implied by the files under it, which is what
+    /// [`Self::is_directory`] reads. `mkdir` is the case that has nothing to
+    /// imply it: a program that creates a directory and then stats it has to
+    /// find it there, and a program that creates one and writes nothing has
+    /// still created it.
+    pub directories: std::collections::BTreeSet<String>,
+    /// The working directory a relative path is resolved against.
+    pub cwd: String,
     /// Open descriptors by number.
     pub open: std::collections::BTreeMap<i32, Descriptor>,
     /// What the next `openat` will be given.
@@ -150,9 +196,17 @@ impl Default for Wasi {
         open.insert(0, Descriptor::Standard(Standard::In));
         open.insert(1, Descriptor::Standard(Standard::Out));
         open.insert(2, Descriptor::Standard(Standard::Error));
-        open.insert(3, Descriptor::Directory("/".to_string()));
+        open.insert(
+            3,
+            Descriptor::Directory(OpenDir {
+                path: "/".to_string(),
+                returned: 0,
+            }),
+        );
         Self {
             files: std::collections::BTreeMap::new(),
+            directories: std::collections::BTreeSet::new(),
+            cwd: "/".to_string(),
             open,
             next_fd: 4,
             stdout: Vec::new(),
@@ -337,6 +391,48 @@ impl Wasi {
         result
     }
 
+    /// `fd_pwrite`: a write at an explicit offset, which does not move the
+    /// position.
+    pub fn fd_pwrite<M: rt::Access>(
+        &mut self,
+        caller: &mut rt::Caller<'_, M>,
+        fd: i32,
+        iovs: i32,
+        count: i32,
+        offset: i64,
+        written: i32,
+    ) -> i32 {
+        let Some(Descriptor::File(open)) = self.open.get(&fd) else {
+            return match self.open.get(&fd) {
+                Some(_) => errno::SPIPE,
+                None => errno::BADF,
+            };
+        };
+        let mut moved = open.clone();
+        moved.position = offset as u64;
+        // A positional write ignores `O_APPEND` — that is the whole difference
+        // between it and a plain one on an appending descriptor.
+        moved.append = false;
+        let saved = std::mem::replace(
+            self.open.get_mut(&fd).expect("just matched"),
+            Descriptor::File(moved),
+        );
+        let result = self.fd_write(caller, fd, iovs, count, written);
+        self.open.insert(fd, saved);
+        result
+    }
+
+    /// `fd_sync`. Nothing here is buffered anywhere the guest cannot already
+    /// see, so there is nothing to flush — but a descriptor that does not exist
+    /// is still an error, and answering `SUCCESS` for one would be a lie about
+    /// a write that never happened.
+    pub fn fd_sync(&self, fd: i32) -> i32 {
+        match self.open.get(&fd) {
+            Some(_) => errno::SUCCESS,
+            None => errno::BADF,
+        }
+    }
+
     /// `fd_seek`. Reports where it landed through `out`.
     pub fn fd_seek<M: rt::Access>(
         &mut self,
@@ -479,26 +575,65 @@ impl Wasi {
         errno::SUCCESS
     }
 
+    /// An absolute, `.`-and-`..`-free form of a path, resolved against
+    /// [`Self::cwd`] when it is relative.
+    ///
+    /// Every path in this filesystem is a key in a map, so two spellings of the
+    /// same place have to become one string before anything looks it up —
+    /// otherwise `chdir("/tmp")` followed by `open("x")` writes a file called
+    /// `x` that `stat("/tmp/x")` cannot find.
+    #[must_use]
+    pub fn absolute(&self, path: &str) -> String {
+        let joined = if path.starts_with('/') {
+            path.to_string()
+        } else if self.cwd == "/" {
+            format!("/{path}")
+        } else {
+            format!("{}/{path}", self.cwd)
+        };
+        let mut parts: Vec<&str> = Vec::new();
+        for part in joined.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
+            }
+        }
+        format!("/{}", parts.join("/"))
+    }
+
     /// `__syscall_openat`. Only the path matters here: the directory
-    /// descriptor is checked for existence and otherwise ignored, since every
-    /// path in this filesystem is absolute.
+    /// descriptor is checked for existence and otherwise ignored, since a
+    /// relative path is resolved against [`Self::cwd`] instead.
     ///
     /// Returns a descriptor, or the negative errno a Linux syscall returns —
     /// which is what Emscripten's `__syscall_*` shims expect, and is not what
     /// WASI returns.
     pub fn openat(&mut self, path: &str, create: bool, append: bool) -> i32 {
-        if !self.files.contains_key(path) {
+        let path = self.absolute(path);
+        // A directory opens as one. Creating a file where a directory is would
+        // put the map in a state `stat` then reads two ways.
+        if self.is_directory(&path) {
+            let fd = self.next_fd;
+            self.next_fd += 1;
+            self.open
+                .insert(fd, Descriptor::Directory(OpenDir { path, returned: 0 }));
+            return fd;
+        }
+        if !self.files.contains_key(&path) {
             if !create {
                 return -errno::NOENT;
             }
-            self.files.insert(path.to_string(), Vec::new());
+            self.files.insert(path.clone(), Vec::new());
         }
         let fd = self.next_fd;
         self.next_fd += 1;
         self.open.insert(
             fd,
             Descriptor::File(Open {
-                path: path.to_string(),
+                path,
                 position: 0,
                 append,
             }),
@@ -509,9 +644,9 @@ impl Wasi {
     /// `__syscall_openat(dirfd, path, flags, mode)`, which is how Emscripten
     /// spells `open`.
     ///
-    /// The directory descriptor is ignored: every path in this filesystem is
-    /// absolute, and resolving a relative one against a directory that does
-    /// not exist would be inventing a tree.
+    /// The directory descriptor is ignored: a relative path is resolved against
+    /// the working directory, and resolving it against a descriptor whose
+    /// directory this filesystem never created would be inventing a tree.
     pub fn openat_at<M: rt::Access>(
         &mut self,
         caller: &rt::Caller<'_, M>,
@@ -527,10 +662,189 @@ impl Wasi {
     /// `__syscall_unlinkat`. Returns 0, or the negative errno a syscall does.
     pub fn unlinkat<M: rt::Access>(&mut self, caller: &rt::Caller<'_, M>, path: i32) -> i32 {
         let path = String::from_utf8_lossy(&caller.cstring(path)).into_owned();
-        if self.files.remove(&path).is_some() {
+        let path = self.absolute(&path);
+        if self.files.remove(&path).is_some() || self.directories.remove(&path) {
             0
         } else {
             -errno::NOENT
+        }
+    }
+
+    /// `__syscall_chdir`. Returns 0, or the negative errno a syscall does.
+    pub fn chdir<M: rt::Access>(&mut self, caller: &rt::Caller<'_, M>, path: i32) -> i32 {
+        let path = String::from_utf8_lossy(&caller.cstring(path)).into_owned();
+        let path = self.absolute(&path);
+        if self.files.contains_key(&path) {
+            return -errno::NOTDIR;
+        }
+        if !self.is_directory(&path) {
+            return -errno::NOENT;
+        }
+        self.cwd = path;
+        0
+    }
+
+    /// `__syscall_mkdirat(dirfd, path, mode)`.
+    ///
+    /// The mode is not kept: nothing here checks permissions, and storing a
+    /// number that decides nothing would suggest it does.
+    pub fn mkdirat<M: rt::Access>(&mut self, caller: &rt::Caller<'_, M>, path: i32) -> i32 {
+        let path = String::from_utf8_lossy(&caller.cstring(path)).into_owned();
+        let path = self.absolute(&path);
+        if self.files.contains_key(&path) || self.is_directory(&path) {
+            return -errno::EXIST;
+        }
+        self.directories.insert(path);
+        0
+    }
+
+    /// `__syscall_getdents64(fd, dirp, count)`: the next batch of directory
+    /// entries, in Emscripten's `struct dirent` layout.
+    ///
+    /// Like [`Self::write_stat`] this is a layout rather than something the
+    /// wasm says: 280 bytes per entry, the inode as an i64 at 0, the offset of
+    /// the *next* entry at 8, the record length at 16, the type at 18 and the
+    /// name from 19. That is what Emscripten's own glue writes, and a module
+    /// reads it back with the `struct dirent` its libc was built with.
+    ///
+    /// Returns the bytes written, 0 at the end of the directory, or a negative
+    /// errno.
+    pub fn getdents64<M: rt::Access>(
+        &mut self,
+        caller: &mut rt::Caller<'_, M>,
+        fd: i32,
+        dirp: i32,
+        count: i32,
+    ) -> i32 {
+        /// The size Emscripten gives each entry, name included.
+        const ENTRY: i32 = 280;
+        /// `DT_DIR` and `DT_REG`, from `dirent.h`.
+        const DT_DIR: u8 = 4;
+        const DT_REG: u8 = 8;
+
+        let Some(Descriptor::Directory(open)) = self.open.get(&fd) else {
+            return match self.open.get(&fd) {
+                Some(_) => -errno::NOTDIR,
+                None => -errno::BADF,
+            };
+        };
+        let entries = self.entries_of(&open.path);
+        let mut at = open.returned;
+        let mut written = 0i32;
+        while at < entries.len() && written + ENTRY <= count {
+            let (name, directory) = &entries[at];
+            let base = dirp + written;
+            caller.write(base, &[0u8; ENTRY as usize]);
+            caller.write_i64(base, (at as i64) + 2);
+            caller.write_i64(base + 8, ((at as i64) + 1) * i64::from(ENTRY));
+            // The record length is a `u16`, and there is no 16-bit write:
+            // 280 is `0x0118`, little-endian.
+            caller.write(base + 16, &(ENTRY as u16).to_le_bytes());
+            caller.write(base + 18, &[if *directory { DT_DIR } else { DT_REG }]);
+            // 255 bytes plus the terminator is what the field holds; a longer
+            // name is truncated rather than allowed to run into the next entry.
+            let mut bytes = name.as_bytes().to_vec();
+            bytes.truncate(255);
+            bytes.push(0);
+            caller.write(base + 19, &bytes);
+            written += ENTRY;
+            at += 1;
+        }
+        if let Some(Descriptor::Directory(open)) = self.open.get_mut(&fd) {
+            open.returned = at;
+        }
+        written
+    }
+
+    /// What a directory holds: `.` and `..` first, as a real one does, then
+    /// each immediate child once, with whether it is itself a directory.
+    fn entries_of(&self, path: &str) -> Vec<(String, bool)> {
+        let prefix = if path.ends_with('/') {
+            path.to_string()
+        } else {
+            format!("{path}/")
+        };
+        let mut entries = vec![(".".to_string(), true), ("..".to_string(), true)];
+        let mut seen = std::collections::BTreeSet::new();
+        let files = self.files.keys().map(|name| (name, false));
+        let directories = self.directories.iter().map(|name| (name, true));
+        for (name, is_directory) in files.chain(directories) {
+            let Some(rest) = name.strip_prefix(&prefix) else {
+                continue;
+            };
+            // Only the immediate child: everything deeper is inside the
+            // directory that child names, not in this one.
+            let (child, deeper) = match rest.split_once('/') {
+                Some((child, _)) => (child, true),
+                None => (rest, false),
+            };
+            if child.is_empty() {
+                continue;
+            }
+            if seen.insert(child.to_string()) {
+                entries.push((child.to_string(), is_directory || deeper));
+            }
+        }
+        entries
+    }
+
+    /// `__syscall_ftruncate64(fd, length)`. Extends with zeros or cuts short.
+    pub fn ftruncate(&mut self, fd: i32, length: i64) -> i32 {
+        if length < 0 {
+            return -errno::INVAL;
+        }
+        match self.open.get(&fd) {
+            Some(Descriptor::File(open)) => {
+                let path = open.path.clone();
+                match self.files.get_mut(&path) {
+                    Some(contents) => {
+                        contents.resize(length as usize, 0);
+                        0
+                    }
+                    None => -errno::NOENT,
+                }
+            }
+            Some(Descriptor::Directory(_)) => -errno::ISDIR,
+            Some(Descriptor::Standard(_)) => -errno::INVAL,
+            None => -errno::BADF,
+        }
+    }
+
+    /// `__syscall_fcntl64(fd, cmd, arg)`.
+    ///
+    /// The answers are Emscripten's own, which is the point: `F_GETFD` and
+    /// `F_SETFD` concern a close-on-exec flag in a process that never execs,
+    /// and record locks are uncontended when there is one process. `F_DUPFD`
+    /// is the one that has to do something, and it does.
+    pub fn fcntl(&mut self, fd: i32, command: i32, argument: i32) -> i32 {
+        let Some(descriptor) = self.open.get(&fd).cloned() else {
+            return -errno::BADF;
+        };
+        match command {
+            fcntl::DUPFD => {
+                if argument < 0 {
+                    return -errno::INVAL;
+                }
+                let mut at = argument.max(self.next_fd);
+                while self.open.contains_key(&at) {
+                    let Some(next) = at.checked_add(1) else {
+                        return -errno::RANGE;
+                    };
+                    at = next;
+                }
+                self.open.insert(at, descriptor);
+                self.next_fd = self.next_fd.max(at + 1);
+                at
+            }
+            // There is no exec, so there is nothing for the flag to survive.
+            fcntl::GETFD | fcntl::SETFD => 0,
+            // The flags a descriptor was opened with are not kept — nothing
+            // here reads them — so the honest answer is the default, `O_RDWR`.
+            fcntl::GETFL => 2,
+            fcntl::SETFL => 0,
+            // One process, so every lock is available and every one is taken.
+            fcntl::GETLK | fcntl::SETLK | fcntl::SETLKW => 0,
+            _ => -errno::INVAL,
         }
     }
 
@@ -583,6 +897,7 @@ impl Wasi {
         buf: i32,
     ) -> i32 {
         let path = String::from_utf8_lossy(&caller.cstring(path)).into_owned();
+        let path = self.absolute(&path);
         match self.files.get(&path) {
             Some(contents) => {
                 let size = contents.len();
@@ -620,7 +935,8 @@ impl Wasi {
         }
     }
 
-    /// Whether anything in the filesystem lives under `path`.
+    /// Whether `path` is a directory: one that was created, or one that
+    /// something in the filesystem lives under.
     #[must_use]
     pub fn is_directory(&self, path: &str) -> bool {
         let prefix = if path.ends_with('/') {
@@ -628,7 +944,13 @@ impl Wasi {
         } else {
             format!("{path}/")
         };
-        path == "/" || self.files.keys().any(|name| name.starts_with(&prefix))
+        path == "/"
+            || self.directories.contains(path)
+            || self.files.keys().any(|name| name.starts_with(&prefix))
+            || self
+                .directories
+                .iter()
+                .any(|name| name.starts_with(&prefix))
     }
 
     /// A stable inode for a path: its position in the map.
@@ -916,6 +1238,253 @@ pub fn write_tm<M: rt::Access>(caller: &mut rt::Caller<'_, M>, at: i32, seconds:
     caller.write_i32(at + 32, 0); // tm_isdst: UTC has none
     caller.write_i32(at + 36, 0); // tm_gmtoff
     0
+}
+
+/// `_mktime_js(tm)`: the seconds since the epoch that a `struct tm` names, and
+/// the fields it implies written back into it.
+///
+/// The inverse of [`write_tm`], and it has to be exactly that: `mktime`
+/// normalises out-of-range fields — December 32nd is the 1st of January — and
+/// a caller reads `tm_wday` and `tm_yday` back out afterwards. Everything is
+/// UTC here, so there is no `tm_isdst` to resolve; the field is reported as 0
+/// rather than left as the caller set it.
+pub fn mktime<M: rt::Access>(caller: &mut rt::Caller<'_, M>, at: i32) -> i64 {
+    let field =
+        |caller: &mut rt::Caller<'_, M>, offset: i32| i64::from(caller.read_i32(at + offset));
+    let seconds = field(caller, 0);
+    let minutes = field(caller, 4);
+    let hours = field(caller, 8);
+    let day = field(caller, 12);
+    let month = field(caller, 16);
+    let year = field(caller, 20) + 1900;
+
+    // The month first, because a `tm_mon` of 12 is January of the next year and
+    // `days_from_civil` is not defined for it.
+    let year = year + month.div_euclid(12);
+    let month = month.rem_euclid(12) + 1;
+    let days = days_from_civil(year, month, day);
+    let total = days * 86_400 + hours * 3_600 + minutes * 60 + seconds;
+    // Written back through the same function that reads a time, so what the
+    // caller sees after `mktime` and after `gmtime` cannot disagree.
+    write_tm(caller, at, total);
+    total
+}
+
+/// `strftime(s, maxsize, format, tm)`, and `strftime_l`, which is the same
+/// with a locale nothing here reads.
+///
+/// The C locale, in full — English names, ISO weeks, the lot. This one is
+/// mechanical in a way `emscripten_asm_const_int` is not: `strftime` is
+/// specified by the standard rather than by the application, so writing it once
+/// is writing it for every module.
+///
+/// Returns the bytes written, not counting the terminator. Zero if the result
+/// does not fit in `maxsize`, which is what the standard says and what a caller
+/// retries against with a bigger buffer — and in that case nothing is written,
+/// since a partial answer left in the buffer is one a caller can mistake for a
+/// short but complete one.
+pub fn strftime<M: rt::Access>(
+    caller: &mut rt::Caller<'_, M>,
+    out: i32,
+    maxsize: i32,
+    format: i32,
+    tm: i32,
+) -> i32 {
+    let format = caller.cstring(format);
+    let time = Tm::read(caller, tm);
+    let text = time.format(&String::from_utf8_lossy(&format));
+    let bytes = text.as_bytes();
+    // `maxsize` counts the terminator, so the text has to be one shorter.
+    if maxsize <= 0 || bytes.len() + 1 > maxsize as usize {
+        return 0;
+    }
+    caller.write(out, bytes);
+    caller.write(out + bytes.len() as i32, &[0]);
+    bytes.len() as i32
+}
+
+/// A `struct tm`, read out of guest memory at the layout [`write_tm`] writes.
+struct Tm {
+    second: i32,
+    minute: i32,
+    hour: i32,
+    day: i32,
+    month: i32,
+    year: i32,
+    weekday: i32,
+    yearday: i32,
+}
+
+impl Tm {
+    fn read<M: rt::Access>(caller: &rt::Caller<'_, M>, at: i32) -> Self {
+        Self {
+            second: caller.read_i32(at),
+            minute: caller.read_i32(at + 4),
+            hour: caller.read_i32(at + 8),
+            day: caller.read_i32(at + 12),
+            month: caller.read_i32(at + 16),
+            year: caller.read_i32(at + 20) + 1900,
+            weekday: caller.read_i32(at + 24),
+            yearday: caller.read_i32(at + 28),
+        }
+    }
+
+    /// The week number, counting from the first `start` of the year — which is
+    /// what `%U` (Sunday) and `%W` (Monday) mean.
+    fn week_from(&self, start: i32) -> i32 {
+        let into_week = (self.weekday.rem_euclid(7) + 7 - start).rem_euclid(7);
+        (self.yearday + 7 - into_week) / 7
+    }
+
+    /// The ISO 8601 week, and the year it belongs to — which is not always the
+    /// year the date is in: the 1st of January can be week 52 of the year
+    /// before, and the 31st of December week 1 of the year after.
+    fn iso_week(&self) -> (i32, i32) {
+        // Monday is 0 here, which is what the ISO rule counts in.
+        let weekday = (self.weekday + 6) % 7;
+        let thursday = self.yearday - weekday + 3;
+        let leap = |year: i32| (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        if thursday < 0 {
+            let year = self.year - 1;
+            let days = if leap(year) { 366 } else { 365 };
+            ((thursday + days) / 7 + 1, year)
+        } else {
+            let days = if leap(self.year) { 366 } else { 365 };
+            if thursday >= days {
+                (1, self.year + 1)
+            } else {
+                (thursday / 7 + 1, self.year)
+            }
+        }
+    }
+
+    fn format(&self, format: &str) -> String {
+        const DAYS: [&str; 7] = [
+            "Sunday",
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+        ];
+        const MONTHS: [&str; 12] = [
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ];
+        let day_name = |full: bool| {
+            let name = DAYS[self.weekday.rem_euclid(7) as usize];
+            if full {
+                name.to_string()
+            } else {
+                name[..3].to_string()
+            }
+        };
+        let month_name = |full: bool| {
+            let name = MONTHS[self.month.rem_euclid(12) as usize];
+            if full {
+                name.to_string()
+            } else {
+                name[..3].to_string()
+            }
+        };
+        let hour12 = match self.hour % 12 {
+            0 => 12,
+            other => other,
+        };
+
+        let mut out = String::new();
+        let mut characters = format.chars();
+        while let Some(character) = characters.next() {
+            if character != '%' {
+                out.push(character);
+                continue;
+            }
+            // `%E` and `%O` ask for a locale's alternative representation. The
+            // C locale has none, so the modifier is dropped and the conversion
+            // after it answers — which is what the standard says it does.
+            let conversion = match characters.next() {
+                Some('E' | 'O') => characters.next(),
+                other => other,
+            };
+            let Some(conversion) = conversion else {
+                // A format ending in `%` is undefined; keeping the character is
+                // what musl does and loses nothing.
+                out.push('%');
+                break;
+            };
+            match conversion {
+                'a' => out.push_str(&day_name(false)),
+                'A' => out.push_str(&day_name(true)),
+                'b' | 'h' => out.push_str(&month_name(false)),
+                'B' => out.push_str(&month_name(true)),
+                'c' => out.push_str(&self.format("%a %b %e %H:%M:%S %Y")),
+                'C' => out.push_str(&format!("{:02}", self.year.div_euclid(100))),
+                'd' => out.push_str(&format!("{:02}", self.day)),
+                'D' => out.push_str(&self.format("%m/%d/%y")),
+                'e' => out.push_str(&format!("{:2}", self.day)),
+                'F' => out.push_str(&self.format("%Y-%m-%d")),
+                'g' => out.push_str(&format!("{:02}", self.iso_week().1.rem_euclid(100))),
+                'G' => out.push_str(&self.iso_week().1.to_string()),
+                'H' => out.push_str(&format!("{:02}", self.hour)),
+                'I' => out.push_str(&format!("{hour12:02}")),
+                'j' => out.push_str(&format!("{:03}", self.yearday + 1)),
+                'm' => out.push_str(&format!("{:02}", self.month + 1)),
+                'M' => out.push_str(&format!("{:02}", self.minute)),
+                'n' => out.push('\n'),
+                'p' => out.push_str(if self.hour < 12 { "AM" } else { "PM" }),
+                'P' => out.push_str(if self.hour < 12 { "am" } else { "pm" }),
+                'r' => out.push_str(&self.format("%I:%M:%S %p")),
+                'R' => out.push_str(&self.format("%H:%M")),
+                's' => out.push_str(
+                    &(days_from_civil(
+                        i64::from(self.year),
+                        i64::from(self.month) + 1,
+                        i64::from(self.day),
+                    ) * 86_400
+                        + i64::from(self.hour) * 3_600
+                        + i64::from(self.minute) * 60
+                        + i64::from(self.second))
+                    .to_string(),
+                ),
+                'S' => out.push_str(&format!("{:02}", self.second)),
+                't' => out.push('\t'),
+                'T' | 'X' => out.push_str(&self.format("%H:%M:%S")),
+                'u' => out.push_str(&match self.weekday.rem_euclid(7) {
+                    0 => 7.to_string(),
+                    other => other.to_string(),
+                }),
+                'U' => out.push_str(&format!("{:02}", self.week_from(0))),
+                'V' => out.push_str(&format!("{:02}", self.iso_week().0)),
+                'w' => out.push_str(&self.weekday.rem_euclid(7).to_string()),
+                'W' => out.push_str(&format!("{:02}", self.week_from(1))),
+                'x' => out.push_str(&self.format("%m/%d/%y")),
+                'y' => out.push_str(&format!("{:02}", self.year.rem_euclid(100))),
+                'Y' => out.push_str(&self.year.to_string()),
+                // UTC throughout, for the reason `write_tm` gives.
+                'z' => out.push_str("+0000"),
+                'Z' => out.push_str("UTC"),
+                '%' => out.push('%'),
+                // An unknown conversion is copied through rather than dropped:
+                // the alternative is silently losing part of the format.
+                other => {
+                    out.push('%');
+                    out.push(other);
+                }
+            }
+        }
+        out
+    }
 }
 
 /// The civil date of a day count from 1970-01-01, and the day of its year.
@@ -1930,6 +2499,299 @@ mod tests {
         assert_ne!(first, second, "two files are not one file");
         wasi.stat_path(&mut caller, 64, 256);
         assert_eq!(caller.read_i32(256 + 88), first, "and one file is one file");
+    }
+
+    #[test]
+    fn a_positional_write_lands_at_the_offset_and_leaves_the_position_alone() {
+        let mut wasi = Wasi::default();
+        wasi.add_file("/f", b"aaaaaaaa");
+        let fd = wasi.openat("/f", false, false);
+        let mut memory = memory();
+        let iovs = iovecs(&mut memory, &[b"XY"]);
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
+        assert_eq!(
+            wasi.fd_pwrite(&mut caller, fd, iovs, 1, 3, 512),
+            errno::SUCCESS
+        );
+        assert_eq!(wasi.files["/f"], b"aaaXYaaa");
+        assert_eq!(caller.memory.load32(512, 0), 2);
+        // The descriptor did not move: a following plain write starts at 0.
+        assert_eq!(wasi.fd_write(&mut caller, fd, iovs, 1, 512), errno::SUCCESS);
+        assert_eq!(wasi.files["/f"], b"XYaXYaaa");
+
+        // And it ignores `O_APPEND`, which is the difference between it and a
+        // plain write on an appending descriptor.
+        let appending = wasi.openat("/f", false, true);
+        assert_eq!(
+            wasi.fd_pwrite(&mut caller, appending, iovs, 1, 0, 512),
+            errno::SUCCESS
+        );
+        assert_eq!(wasi.files["/f"], b"XYaXYaaa");
+
+        assert_eq!(
+            wasi.fd_pwrite(&mut caller, 1, iovs, 1, 0, 512),
+            errno::SPIPE
+        );
+        assert_eq!(
+            wasi.fd_pwrite(&mut caller, 99, iovs, 1, 0, 512),
+            errno::BADF
+        );
+    }
+
+    #[test]
+    fn syncing_says_whether_the_descriptor_exists_and_nothing_more() {
+        let mut wasi = Wasi::default();
+        let fd = wasi.openat("/f", true, false);
+        assert_eq!(wasi.fd_sync(fd), errno::SUCCESS);
+        assert_eq!(wasi.fd_sync(1), errno::SUCCESS);
+        assert_eq!(wasi.fd_sync(99), errno::BADF);
+    }
+
+    #[test]
+    fn truncating_extends_with_zeros_and_cuts_short() {
+        let mut wasi = Wasi::default();
+        wasi.add_file("/f", b"abcdef");
+        let fd = wasi.openat("/f", false, false);
+        assert_eq!(wasi.ftruncate(fd, 3), 0);
+        assert_eq!(wasi.files["/f"], b"abc");
+        assert_eq!(wasi.ftruncate(fd, 5), 0);
+        assert_eq!(wasi.files["/f"], b"abc\0\0");
+        assert_eq!(wasi.ftruncate(fd, -1), -errno::INVAL);
+        assert_eq!(wasi.ftruncate(1, 0), -errno::INVAL);
+        assert_eq!(wasi.ftruncate(3, 0), -errno::ISDIR);
+        assert_eq!(wasi.ftruncate(99, 0), -errno::BADF);
+    }
+
+    #[test]
+    fn a_relative_path_is_resolved_against_the_working_directory() {
+        let mut wasi = Wasi::default();
+        wasi.add_file("/tmp/notes", b"hello");
+        let mut memory = memory();
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
+        caller.write(64, b"/tmp\0");
+        assert_eq!(wasi.chdir(&caller, 64), 0);
+        assert_eq!(wasi.cwd, "/tmp");
+
+        // `notes` from `/tmp` is the file that is already there, not a new one.
+        let fd = wasi.openat("notes", false, false);
+        assert!(fd > 0, "{fd}");
+        assert_eq!(wasi.files.len(), 1);
+        assert_eq!(wasi.absolute("../a/./b"), "/a/b");
+
+        // And what is not a directory, or is not there at all, is refused.
+        caller.write(96, b"/tmp/notes\0");
+        assert_eq!(wasi.chdir(&caller, 96), -errno::NOTDIR);
+        caller.write(128, b"/nowhere\0");
+        assert_eq!(wasi.chdir(&caller, 128), -errno::NOENT);
+        assert_eq!(wasi.cwd, "/tmp");
+    }
+
+    #[test]
+    fn a_created_directory_exists_before_anything_is_put_in_it() {
+        let mut wasi = Wasi::default();
+        let mut memory = memory();
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
+        caller.write(64, b"/data\0");
+        assert_eq!(wasi.mkdirat(&caller, 64), 0);
+        assert!(wasi.is_directory("/data"));
+        // Twice is `EEXIST`, and so is a directory over a file.
+        assert_eq!(wasi.mkdirat(&caller, 64), -errno::EXIST);
+        wasi.add_file("/f", b"");
+        caller.write(96, b"/f\0");
+        assert_eq!(wasi.mkdirat(&caller, 96), -errno::EXIST);
+
+        // It stats as a directory, and opens as one rather than as a new file.
+        assert_eq!(wasi.stat_path(&mut caller, 64, 256), errno::SUCCESS);
+        assert_eq!(caller.read_i32(256 + 4), 0o040_755);
+        let fd = wasi.openat("/data", true, false);
+        assert!(matches!(wasi.open[&fd], Descriptor::Directory(_)));
+    }
+
+    #[test]
+    fn a_directory_read_walks_its_entries_once() {
+        let mut wasi = Wasi::default();
+        wasi.add_file("/d/one", b"1");
+        wasi.add_file("/d/two", b"2");
+        wasi.add_file("/d/nested/deep", b"3");
+        let fd = wasi.openat("/d", false, false);
+        let mut memory = rt::Memory::new(2, None);
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
+
+        let read = wasi.getdents64(&mut caller, fd, 0, 280 * 8);
+        assert_eq!(read, 280 * 5, ". .. nested one two");
+        let name = |at: i32| String::from_utf8_lossy(&caller.cstring(at * 280 + 19)).into_owned();
+        assert_eq!(name(0), ".");
+        assert_eq!(name(1), "..");
+        assert_eq!(name(2), "nested");
+        assert_eq!(name(3), "one");
+        assert_eq!(name(4), "two");
+        // The record length and the type, at Emscripten's offsets.
+        assert_eq!(caller.bytes(16, 2), vec![0x18, 0x01]);
+        assert_eq!(caller.bytes(2 * 280 + 18, 1), vec![4], "a directory");
+        assert_eq!(caller.bytes(3 * 280 + 18, 1), vec![8], "a file");
+
+        // The cursor stays where it got to: a second read is the end.
+        assert_eq!(wasi.getdents64(&mut caller, fd, 0, 280 * 8), 0);
+
+        // A buffer that holds two entries gets two, and the rest next time.
+        let fd = wasi.openat("/d", false, false);
+        assert_eq!(wasi.getdents64(&mut caller, fd, 0, 280 * 2), 280 * 2);
+        assert_eq!(wasi.getdents64(&mut caller, fd, 0, 280 * 8), 280 * 3);
+
+        assert_eq!(wasi.getdents64(&mut caller, 1, 0, 280), -errno::NOTDIR);
+        assert_eq!(wasi.getdents64(&mut caller, 99, 0, 280), -errno::BADF);
+    }
+
+    #[test]
+    fn fcntl_answers_the_commands_a_process_without_exec_can() {
+        let mut wasi = Wasi::default();
+        let fd = wasi.openat("/f", true, false);
+        // F_GETFD / F_SETFD: nothing execs, so there is nothing to survive one.
+        assert_eq!(wasi.fcntl(fd, 1, 0), 0);
+        assert_eq!(wasi.fcntl(fd, 2, 1), 0);
+        // F_GETFL / F_SETFL.
+        assert_eq!(wasi.fcntl(fd, 3, 0), 2);
+        assert_eq!(wasi.fcntl(fd, 4, 0), 0);
+        // The locks are all available, because there is one process.
+        assert_eq!(wasi.fcntl(fd, 13, 0), 0);
+        // F_DUPFD gives a new number for the same thing.
+        let duplicate = wasi.fcntl(fd, 0, 0);
+        assert_ne!(duplicate, fd);
+        assert_eq!(wasi.open[&duplicate], wasi.open[&fd]);
+        // And it honours the floor it was given.
+        assert_eq!(wasi.fcntl(fd, 0, 40), 40);
+
+        assert_eq!(wasi.fcntl(fd, 99, 0), -errno::INVAL);
+        assert_eq!(wasi.fcntl(99, 1, 0), -errno::BADF);
+    }
+
+    #[test]
+    fn mktime_is_the_inverse_of_the_time_it_reads_back() {
+        let mut memory = memory();
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
+        // 2024-02-29T12:34:56Z — a leap day, which is what a month table gets
+        // wrong.
+        let seconds = 1_709_209_496;
+        write_tm(&mut caller, 64, seconds);
+        assert_eq!(mktime(&mut caller, 64), seconds);
+
+        // Out-of-range fields normalise: the 32nd of December is the 1st of
+        // January, and the fields the caller reads back say so.
+        caller.write(64, &[0u8; 44]);
+        caller.write_i32(64 + 12, 32); // tm_mday
+        caller.write_i32(64 + 16, 11); // tm_mon, December
+        caller.write_i32(64 + 20, 123); // tm_year, 2023
+        assert_eq!(mktime(&mut caller, 64), 1_704_067_200);
+        assert_eq!(caller.read_i32(64 + 12), 1, "tm_mday");
+        assert_eq!(caller.read_i32(64 + 16), 0, "tm_mon");
+        assert_eq!(caller.read_i32(64 + 20), 124, "tm_year");
+        assert_eq!(caller.read_i32(64 + 24), 1, "a Monday");
+        assert_eq!(caller.read_i32(64 + 28), 0, "tm_yday");
+    }
+
+    /// Every expectation in this test and the next was read off a C library's
+    /// own `strftime` for the same `time_t` rather than worked out here — the
+    /// same reason the differential tests compare against V8 and not against
+    /// another reading of the spec. The one deliberate difference is `%Z`,
+    /// which glibc's `gmtime` calls `GMT`: this answers `UTC`, because that is
+    /// the name [`tzset`] writes, and the two must not disagree.
+    #[test]
+    fn strftime_writes_the_c_locale_and_says_when_it_did_not_fit() {
+        let mut memory = memory();
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
+        // 2024-02-29T05:06:07Z, a Thursday and a leap day.
+        write_tm(&mut caller, 64, 1_709_183_167);
+        let run = |caller: &mut rt::Caller<'_, rt::Memory>, format: &str, size: i32| {
+            let mut bytes = format.as_bytes().to_vec();
+            bytes.push(0);
+            caller.write(256, &bytes);
+            let written = strftime(caller, 512, size, 256, 64);
+            (
+                written,
+                String::from_utf8_lossy(&caller.cstring(512)).into_owned(),
+            )
+        };
+
+        assert_eq!(run(&mut caller, "%Y-%m-%d", 64).1, "2024-02-29");
+        assert_eq!(run(&mut caller, "%H:%M:%S", 64).1, "05:06:07");
+        assert_eq!(run(&mut caller, "%A %B %e", 64).1, "Thursday February 29");
+        assert_eq!(run(&mut caller, "%a %b %d", 64).1, "Thu Feb 29");
+        assert_eq!(run(&mut caller, "%I%p %j %C %y", 64).1, "05AM 060 20 24");
+        assert_eq!(run(&mut caller, "%c", 64).1, "Thu Feb 29 05:06:07 2024");
+        assert_eq!(
+            run(&mut caller, "%D %F %R %T", 64).1,
+            "02/29/24 2024-02-29 05:06 05:06:07"
+        );
+        assert_eq!(run(&mut caller, "%u %w %z %Z %%", 64).1, "4 4 +0000 UTC %");
+        // The ISO week of a leap Thursday, and the two week-number rules.
+        assert_eq!(run(&mut caller, "%G-W%V %U %W", 64).1, "2024-W09 08 09");
+        assert_eq!(
+            run(&mut caller, "%P %r %x %X %h", 64).1,
+            "am 05:06:07 AM 02/29/24 05:06:07 Feb"
+        );
+        assert_eq!(run(&mut caller, "%s", 64).1, "1709183167");
+        // `%O` and `%E` ask for a locale alternative the C locale has not.
+        assert_eq!(run(&mut caller, "%Od", 64).1, "29");
+        // An unknown conversion is kept rather than swallowed.
+        assert_eq!(run(&mut caller, "%q", 64).1, "%q");
+
+        // The epoch itself, where `%I` is 12 rather than 0 and `%e` pads with a
+        // space rather than a zero.
+        write_tm(&mut caller, 64, 0);
+        assert_eq!(run(&mut caller, "%c", 64).1, "Thu Jan  1 00:00:00 1970");
+        assert_eq!(run(&mut caller, "%I%p %j %C %y", 64).1, "12AM 001 19 70");
+        assert_eq!(run(&mut caller, "%G-W%V %U %W", 64).1, "1970-W01 00 00");
+        // A century boundary that is a leap year, which the 100-year rule alone
+        // gets wrong.
+        write_tm(&mut caller, 64, 951_782_400);
+        assert_eq!(run(&mut caller, "%a %b %d %y", 64).1, "Tue Feb 29 00");
+        assert_eq!(run(&mut caller, "%G-W%V %U %W", 64).1, "2000-W09 09 09");
+        write_tm(&mut caller, 64, 1_709_183_167);
+
+        // 10 characters and the terminator need 11 bytes; 10 is a refusal, and
+        // nothing is written.
+        caller.write(512, &[0u8; 32]);
+        assert_eq!(run(&mut caller, "%Y-%m-%d", 10), (0, String::new()));
+        assert_eq!(run(&mut caller, "%Y-%m-%d", 11).0, 10);
+    }
+
+    #[test]
+    fn the_iso_week_crosses_the_year_the_way_the_standard_says() {
+        let mut memory = memory();
+        let mut caller = rt::Caller {
+            memory: &mut memory,
+        };
+        let week = |caller: &mut rt::Caller<'_, rt::Memory>, seconds: i64| {
+            write_tm(caller, 64, seconds);
+            caller.write(256, b"%G-W%V\0");
+            strftime(caller, 512, 64, 256, 64);
+            String::from_utf8_lossy(&caller.cstring(512)).into_owned()
+        };
+        // 2021-01-01 was a Friday: week 53 of 2020.
+        assert_eq!(week(&mut caller, 1_609_459_200), "2020-W53");
+        // 2019-12-30 was a Monday: week 1 of 2020.
+        assert_eq!(week(&mut caller, 1_577_664_000), "2020-W01");
+        // And an ordinary mid-year date is its own year. `%U` and `%W` differ
+        // here, which is the pair of rules rather than the ISO one.
+        assert_eq!(week(&mut caller, 1_718_000_000), "2024-W24");
+        caller.write(256, b"%U %W\0");
+        strftime(&mut caller, 512, 64, 256, 64);
+        assert_eq!(
+            String::from_utf8_lossy(&caller.cstring(512)).into_owned(),
+            "23 24"
+        );
     }
 
     #[test]
