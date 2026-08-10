@@ -2743,9 +2743,20 @@ impl<'a> Body<'a> {
         self.lines
     }
 
+    /// How deep the indentation is allowed to get.
+    ///
+    /// Past this the leading whitespace stops growing, and the nesting is read
+    /// from the labels instead — which is where it is legible at that depth
+    /// anyway. This is not tidiness: a `br_table` dispatch in the VoIP module
+    /// nests **1991** blocks, so a line inside it carried 7964 spaces, and one
+    /// part file came to 650 MB of which **644 MB was indentation**. The whole
+    /// module was 1.8 GB. Capped, that is a 20th of the bytes, for output that
+    /// differs only in the whitespace nobody could have used.
+    const MAX_INDENT: usize = 32;
+
     fn line(&mut self, text: &str) {
         self.lines += 1;
-        for _ in 0..self.depth {
+        for _ in 0..self.depth.min(Self::MAX_INDENT) {
             self.out.push_str("    ");
         }
         self.out.push_str(text);

@@ -763,6 +763,57 @@ fn the_layout_a_module_gets_by_default_follows_its_size() {
     }
 }
 
+/// Indentation stops growing long before the nesting does.
+///
+/// A `br_table` dispatch in the VoIP module nests 1991 blocks, and indenting
+/// each one put 7964 spaces in front of every line inside it: one part file came
+/// to 650 MB, 644 MB of which was whitespace, and the module to 1.8 GB. Nothing
+/// could read that depth off the leading space anyway — the labels are what say
+/// where a `break` goes — so past a limit the space stops and the labels carry
+/// it.
+#[test]
+fn indentation_stops_growing_and_the_module_still_agrees() {
+    const DEPTH: usize = 200;
+    let mut wat = String::from(
+        "(module (memory (export \"memory\") 1)\n  (func (export \"deep\") (param i32) (result i32)\n",
+    );
+    for at in 0..DEPTH {
+        wat.push_str(&format!(
+            "    block\n    local.get 0\n    i32.const {at}\n    i32.eq\n    br_if 0\n"
+        ));
+    }
+    wat.push_str("    local.get 0\n    i32.const 1000\n    i32.add\n    return\n");
+    for _ in 0..DEPTH {
+        wat.push_str("    end\n");
+    }
+    wat.push_str("    local.get 0\n    i32.const 2\n    i32.mul))\n");
+
+    let wasm = common::assemble("deep-nesting", &wat);
+    let code = common::decompile(&wasm);
+    let widest = code
+        .lines()
+        .map(|line| line.len() - line.trim_start_matches(' ').len())
+        .max()
+        .expect("the module generated something");
+    assert!(
+        widest <= 4 * 32,
+        "a line was indented {widest} spaces, so the cap is not holding"
+    );
+    // The nesting is really there — this is a cap on the whitespace, not on the
+    // blocks — and the labels are what say so.
+    assert!(
+        code.contains(&format!("'b{}", DEPTH - 1)),
+        "the blocks themselves were lost"
+    );
+
+    // And the only thing that changed is whitespace, which the engine settles.
+    let calls: Vec<_> = [0, 7, 199, 500, -1]
+        .into_iter()
+        .map(|n| common::call("deep", &[common::Arg::I32(n)]))
+        .collect();
+    common::assert_agrees("deep-nesting", &wasm, &calls);
+}
+
 #[test]
 fn a_zero_sized_split_still_produces_one_function_per_file() {
     // A guard on the arithmetic rather than on the caller: zero per file would
