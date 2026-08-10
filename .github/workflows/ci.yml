@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Monday, early. Only the `captures` job has anything to do here.
+    - cron: '17 5 * * 1'
+
+env:
+  CARGO_TERM_COLOR: always
+  # The harness compiles generated Rust on every run, so a slow debug build is
+  # felt on every test, not only in release.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # Everything a checkout can verify about itself: no network, no captures.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # The reference engine. Every differential test runs the same calls here
+      # and in the generated Rust, and compares both against each other.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # clang builds the wasm32 C fixtures; wasm-ld comes from lld and clang
+      # will not link `--target=wasm32` without it.
+      - name: Install clang and lld
+        run: sudo apt-get update && sudo apt-get install -y clang lld
+
+      - name: Install wasm-tools
+        run: |
+          version=1.254.0
+          url="https://github.com/bytecodealliance/wasm-tools/releases/download/v${version}/wasm-tools-${version}-x86_64-linux.tar.gz"
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "$url" | tar -xz --strip-components=1 -C "$HOME/.local/bin" \
+            "wasm-tools-${version}-x86_64-linux/wasm-tools"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Check the tools the harness needs are all runnable
+        # A missing tool fails the tests rather than skipping them, so proving
+        # they are here first turns "the harness could not run" into its own
+        # error rather than into a test failure that reads like a real one.
+        run: |
+          node --version
+          clang --version | head -1
+          wasm-ld --version
+          wasm-tools --version
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  # The tier that needs the real modules: ~19 MB of captures to download and
+  # about forty minutes of decompiling 10 MiB modules, so it does not run on
+  # every push. Start it by hand from the Actions tab, or let the weekly run
+  # take it — which also catches WhatsApp rolling a capture out of the
+  # published archive, since that is what the fetch script fails on.
+  captures:
+    if: github.event_name != 'push' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fetch the captures
+        run: ./scripts/fetch-captures.sh
+
+      # Decompiling every capture, and what the analysis says about the VoIP
+      # one. The tests that hand generated Rust back to rustc are left out:
+      # they are minutes each, and `check` already proves the emitted code
+      # compiles on the fixtures.
+      - name: Decompile every capture
+        run: cargo test --test captured -- --ignored --nocapture
+             every_capture_either_decompiles_or_says_why_not
+
+      - name: The VoIP module's host, names, registrations and trampolines
+        run: |
+          cargo test --test host --test names --test embind --test trampolines \
+            -- --ignored --nocapture
