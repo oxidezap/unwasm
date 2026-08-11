@@ -132,6 +132,51 @@ memory through the reserved address. And the name section is consulted before
 either: a linker writes `__stack_pointer` there whether or not it exports the
 global, and that is the module saying which one it is.
 
+## Level 1 is opt-in because it gives something up, and it says which
+
+`--level 1` turns a frame slot into a Rust binding. `analysis::promotable_slots`
+decides, and what it asks for is not a heuristic: **every** access to the frame
+has to be one it can see and place. The address never escapes and was never
+copied into a local that could reach a slot; no store goes through an address
+computed at run time; the function has no `memory.fill`/`copy`/`init`, whose
+destination is a value rather than an offset; the slot's accesses all agreed on
+one width and one type; and the slot lies inside the frame and overlaps no
+other.
+
+The emitter's rule has to match the analysis's exactly, or a slot would be a
+binding at one access and memory at another — which is worse than not promoting
+it. So `Value::frame_base` is set only by `local.get $base`, carried through a
+spill (a name for the frame is still the frame), and never by arithmetic; and
+`copied` refuses the whole frame when the address reaches another local that
+could still address a slot. `frame + size` copied in the epilogue does not
+count, since a memarg offset is never negative and that address cannot name
+anything inside the frame — without that exception, level 1 would refuse every
+function an unoptimised clang built.
+
+A binding is filled from the frame on entry, because those bytes belong to
+whatever ran before and a slot read before it is written has to see them. It is
+never written back. **That is the trade, and it is the whole of it**: the
+answers still match the engine, the memory no longer does. `assert_agrees_at_
+level_1` compares the answers and reports the memory rather than asserting it.
+
+Three things follow that a reader should know:
+
+- **A narrow slot is kept zero-extended**, exactly as `load8_u` returns it, so a
+  store masks and a signed load sign-extends. Either one wrong is a wrong
+  answer, and the differential test on a `short`/`signed char` struct is what
+  says which.
+- **A trap moves.** The bindings are filled at entry, so a frame that would trap
+  on its first access traps at the top instead. The values are the same; the
+  point at which a run stops is not.
+- **The aliasing assumption is not proved.** Nothing in a module says a store
+  cannot land below the stack pointer. No compiler emits one — which is an
+  assumption, and is why this level says it is guessing rather than being the
+  default.
+
+And the prize is small, measured on the corpus by `how_much_of_each_capture_
+level_1_can_place`: between 0.2% and 28% of frames have anything promotable at
+all. Compiled C reaches its own frames constantly.
+
 ## Folding is only for expressions that cannot trap
 
 `push_pure` folds an expression into whatever consumes it; `push_temp` gives it
@@ -454,12 +499,11 @@ which build you measured.
 
 ## Open work
 
-1. **Drive the VoIP module.** `unwasm host` writes **106 methods for
-   `JgwtTQVeWPm`, 39 of them still `todo!()`** — re-counted, not carried over
-   from `D5pLH9sfOOl`'s 51 of 102. Its allocator already runs: `captured.rs`
-   compiles a 42-function slice and compares it against the engine, linear
-   memory included. What the remaining 39 are is worth knowing before adding to
-   them:
+1. **Drive the VoIP module.** `unwasm host` writes **103 methods for
+   `JgwtTQVeWPm`, 35 of them still `todo!()`**. Its allocator already runs:
+   `captured.rs` compiles a 42-function slice and compares it against the
+   engine, linear memory included. What the remaining 35 are is worth knowing
+   before adding to them:
 
    - **22 are WhatsApp's own callbacks** — eleven `call_*_js_sync` capture and
      playback drivers, plus `on_call_event_js_sync`, `renderVideoFrame_js`,
@@ -467,20 +511,25 @@ which build you measured.
      answer them.
    - **6 are the C++ catch-matching and primary-exception entry points**,
      refused on purpose — see the note on `__cxa_find_matching_catch_*` above.
-   - **3 are the pthread glue**, which needs a way back into the instance from
-     an import. So do the **3 `mmap` ones**, which allocate through the guest's
-     own `memalign`. That single capability is what six of the thirty-nine are
-     waiting on, and it is the honest next step.
    - **2 are `asm_const`**, JavaScript the module carries.
-   - the rest are `gethostbyname`, the offscreen canvas, and `longjmp`.
+   - the rest are `gethostbyname`, the offscreen canvas, `longjmp`,
+     `emscripten_receive_on_main_thread_js` and the mailbox postmessage.
 
-   What is *not* left is anything a standard already decides. Those were
-   written; adding to the list means adding a capability, not another entry.
-2. **Level 1 proper**: turn shadow-stack slots into named locals, now that the
-   stack pointer is identified. The frame size is in the prologue; what is
-   missing is tracking which offsets from it are distinct variables — with the
-   caveat recorded above about byte-exactness.
-3. **Leave recognised library code out.** `unwasm signatures` names it, but it
-   is still decompiled in full. Stubbing it would cut most of a 9 MiB module —
-   for a run being read, not run, and only as far as the catalogue's recall
-   goes.
+   The last two are the only ones a capability would unblock, and neither is a
+   missing capability — `emscripten_receive_on_main_thread_js` marshals its
+   arguments as *doubles* and relies on JavaScript coercing each one to the
+   callee's parameter type, and reproducing that coercion is a guess about a
+   conversion nobody here can check. It stays a `todo!()` for the same reason
+   `__cxa_find_matching_catch_*` does.
+
+   What is *not* left is anything a standard already decides, or anything that
+   needed the instance. Both of those were written.
+2. **Level 2 — idiomatic, and always speculative.** Structs from access
+   patterns, vtables from `call_indirect` plus the element segments, class names
+   from the C++ RTTI, and what embind's registrations already declare. Level 1
+   is in — `--level 1`, opt-in, and it says at every function what it did and
+   what it gave up.
+3. **Improve what a catalogue recognises.** `--stub-recognised` leaves the
+   bodies out now, so the size of the cut is exactly the catalogue's recall:
+   ~91% across builds of one toolchain and a handful across emscripten
+   versions. The mechanism is not the limit; the fingerprint is.

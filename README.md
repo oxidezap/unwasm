@@ -73,8 +73,11 @@ Concretely:
 - **Imports become a trait.** A host implements `Imports`; the default
   `NoImports` traps on every call, so "nobody supplied a host" never looks like
   "the host returned 0".
-- **Emscripten's `invoke_*` trampolines are generated**, not asked for. On the
-  VoIP module that is 134 of its 242 function imports; see below.
+- **Imports that can only be answered from inside are generated**, not asked
+  for: Emscripten's `invoke_*` trampolines — 134 of the VoIP module's 242
+  function imports — plus `__pthread_create_js`, the main thread's own
+  initialisation, and the `mmap` family, which allocates out of the module's own
+  `memalign` and reads the file through the host's `fd_pread`.
 - **Nothing is skipped.** An opcode with no faithful Rust form is an error
   naming the construct — never a comment in the output, never a stub.
 - **No `unsafe`.** `unsafe_code = "forbid"` for this crate and for what it
@@ -332,14 +335,41 @@ Two things it reports honestly rather than glossing over:
   allocate while it runs. Requiring the write — which this did at first — misses
   every leaf function in a module.
 
-What it does *not* do is turn slots into Rust variables. It could, for the
-frames that do not escape; it would also stop the decompilation being
-byte-exact, because the bytes a promoted slot used to leave in linear memory
-would no longer be there. That is a real property to give up, and not one to
-give up quietly, so it waits for a level that says it is doing so. Across the
-captures, the frames that stay put are 0.7% to 28% of the total — so the prize
-is smaller than it sounds, and would need a real dataflow analysis rather than
-this linear walk to grow.
+Turning those slots into Rust variables is `--level 1`, and it is opt-in
+because it stops the decompilation being byte-exact: the bytes a promoted slot
+used to leave in linear memory are no longer there. That is a real property to
+give up and not one to give up quietly, so the level says it is doing so — at
+every function it changed, and at every function it refused and why:
+
+```rust
+/// **Level 1**: 5 of 5 slots are Rust bindings rather than memory —
+/// `s12` at +12, `s16` at +16, `s20` at +20, `s24` at +24, `s28` at +28.
+/// They are filled from the frame on entry, so a slot read before it is
+/// written still sees what was there; they are never written back, so this
+/// function no longer leaves those bytes in linear memory. That is the
+/// exactness level 1 gives up, and it is given up here.
+```
+
+The answers still match the engine — that is tested, on a struct of `int`,
+`short`, `signed char` and `unsigned char`, because a narrow binding has to mask
+on store and sign-extend on load. The memory does not, and the test reports the
+difference rather than hiding it.
+
+The prize is small, and measured rather than estimated. Across the corpus, the
+frames with anything promotable at all:
+
+| capture | frames with something to promote | slots |
+|---|---|---|
+| `COs9e0Kj0ic` | 64 of 228 | 592 of 1355 |
+| `php8T1oSIZM` | 2 of 86 | 2 of 378 |
+| `a19OxQ3jkd2` | 1316 of 6842 | 4188 of 100119 |
+| `ayqr5HQtlkb` | 10 of 1791 | 19 of 21782 |
+| `rogm88TRRiw` | 2 of 1211 | 3 of 13858 |
+| `JgwtTQVeWPm` | 53 of 4916 | 87 of 30980 |
+
+Compiled C reaches its own frames constantly — it passes `&point` to something,
+indexes an array in it, or packs two variables into a word — and what survives
+all of that is a minority.
 
 ### What is left for a host
 
@@ -873,13 +903,14 @@ import stays the host's to implement.
   Rust across 455 files plus a 106-method host, built in 11m23s and
   instantiating 160 pages of shared memory in 1.45 seconds, with nothing
   answered by a default. Most of that host is written for you: `unwasm host`
-  answers **67 of its 106 methods** — WASI over an in-memory filesystem, the
+  answers **68 of its 103 methods** — WASI over an in-memory filesystem, the
   C++ runtime, Emscripten's runtime, the clock and `strftime`, embind's
-  registrations — and leaves 39. Twenty-two of those are WhatsApp's
-  own callbacks, six are the C++ catch-matching entry points this refuses to
-  guess at, six need a way back into the instance from an import (the pthread
-  glue and `mmap`), and two are `emscripten_asm_const_*`, which runs JavaScript
-  the module carries.
+  registrations — and leaves 35. Twenty-two of those are WhatsApp's own
+  callbacks, six are the C++ catch-matching entry points this refuses to guess
+  at, two are `emscripten_asm_const_*`, which runs JavaScript the module
+  carries, and the rest are a browser canvas, `gethostbyname` and `longjmp`.
+  The ones that had to reach back into the instance — the pthread glue and the
+  `mmap` family — are generated rather than asked for.
 - **Its allocator runs, and agrees with the engine.** `captured.rs` decompiles
   the 42 functions `malloc`, `free` and `memalign` reach, compiles them, and
   compares against V8 running the whole 10.2 MiB file: the pointers returned
@@ -982,20 +1013,20 @@ module's table is declared `9291 9291`, which cannot grow.
 
 ## Where it goes
 
-- **Level 1 — structured.** Recover the shadow stack (the `__stack_pointer`
-  global is right there), so frame slots become named locals. Recover parameter
-  roles from how the code uses them, in the manner of `wa-wasm-oracle`'s
-  `abi.rs`: dereferenced means pointer, and the access width says what it points
-  at.
+- **Level 1 — structured.** Half in: `--level 1` turns the frame slots it can
+  place into Rust bindings, opt-in and saying so. What is still to come is the
+  other half — parameter roles read from how the code uses them, in the manner
+  of `wa-wasm-oracle`'s `abi.rs`: dereferenced means pointer, and the access
+  width says what it points at.
 - **Level 2 — idiomatic, and always speculative.** Structs from access
   patterns, vtables from `call_indirect` plus the element segments, class names
   from the C++ RTTI in the data segments, and embind's `_embind_register_*`
   calls — which are high-level types the binary declares about itself.
-- **Leaving recognised library code out.** `--signatures` names it; it is still
-  decompiled in full. Stubbing it instead would cut most of the output on a
-  9 MiB module — but only for a run that is being read rather than run, and only
-  where the catalogue's recall can be trusted, which across toolchains it
-  cannot.
+- **Recognising more library code.** `--signatures` names it and
+  `--stub-recognised` now leaves the bodies out, so the size of the cut is
+  exactly the catalogue's recall — ~91% across builds of one toolchain and a
+  handful across emscripten versions. The mechanism is not the limit; the
+  fingerprint is.
 
 Every one of those is a guess about intent. They are only worth attempting on
 top of something already known to run — which is what level 0 is for, and why
