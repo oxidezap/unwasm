@@ -293,8 +293,8 @@ Each type id is the address of a `std::type_info` that some other registration
 names, so `std::string` and `bool` come back as themselves rather than as `i32`.
 **This is the only place in a stripped module where a type has a name at all** —
 everything else this crate recovers is what the compiler left behind, and this
-is what the author published. 111 registrations in the VoIP module, 75 named,
-37 with full signatures.
+is what the author published. 114 registrations in `JgwtTQVeWPm`, 81 named, 40
+with full signatures.
 
 Three details that each cost a wrong answer before they were right: a class
 registers three ids for itself (the class, a pointer, a const pointer), so a
@@ -370,6 +370,69 @@ frames with anything promotable at all:
 Compiled C reaches its own frames constantly — it passes `&point` to something,
 indexes an array in it, or packs two variables into a word — and what survives
 all of that is a minority.
+
+### The classes the module declares
+
+`--level 2` is names, and the names are not inferred from behaviour — they are
+read out of a declaration the compiler wrote down. The Itanium ABI puts a
+`type_info` in the data segments for every polymorphic class and a vtable beside
+it, and both are byte layouts: `{vptr, name}` for the first, `{offset-to-top,
+type_info*, slots…}` for the second. `unwasm classes` prints what that says:
+
+```
+692 classes, 482 with vtables, across 5 `type_info` kinds
+  WasmShimErrorHandler                                 vtable 0xf48d8, 12 methods
+      mangled 20WasmShimErrorHandler
+      derives from executorch::extension::DynamicShim
+  std::__2::__shared_ptr_emplace<…>                    vtable 0xf4d60, 5 methods
+      mangled NSt3__220__shared_ptr_emplaceI13canvas_windowNS_9allocatorIS1_EEEE
+      derives from std::__2::__shared_weak_count
+```
+
+A vtable slot is a function, so a class with a vtable names the functions in it:
+`f9821` becomes `f9821_WasmShimErrorHandler_v3`, with a doc comment giving the
+`type_info`'s address, the mangled string, the vtable's address and the slot.
+**The method's own name is nowhere in the module** — only its position is — so
+that is what the name carries, and the index stays in it.
+
+Four refusals keep it honest:
+
+- **A vtable pointer only a couple of `type_info`s share is not one.** Itanium
+  gives every `type_info` a vptr, and a program has a handful — one per *kind*.
+  A pointer 384 candidates agree on is `__class_type_info`; a pointer one
+  candidate has is two words that happened to line up. The floor is 3, swept
+  over the corpus: at 2 two of the three C modules report a class that is not
+  there, at 3 all three report none, and at 4 the VoIP module starts losing
+  real ones.
+- **A function in more than one vtable is named after none of them.**
+  Inheritance puts a base's method in every derived vtable — 204 of the VoIP
+  module's 1813 vtable functions are shared, one of them across 333 vtables —
+  and picking one owner would be a claim the bytes do not make.
+- **A name that cannot be demangled stays mangled.** Template arguments need
+  Itanium's substitution table, and a substitution resolved wrongly is a name
+  that says something the module did not, so `I…E` comes out as `<…>`: the
+  class is named and the instantiation is visibly elided. 31 of `JgwtTQVeWPm`'s
+  692 come back as their mangled string rather than as a guess.
+- **What the module says about itself wins.** A function the name section
+  already names, or a catalogue already recognised, keeps that name.
+
+Measured across the corpus — where the three C modules are the control, and
+their zeroes are what give the rest their meaning:
+
+| capture | classes | with vtables | kinds | functions named |
+|---|---|---|---|---|
+| `COs9e0Kj0ic` | 105 | 83 | 2 | 107 of 478 |
+| `php8T1oSIZM` | 5 | 2 | 1 | 6 of 321 |
+| `a19OxQ3jkd2` | 0 | 0 | 0 | 0 of 9093 |
+| `ayqr5HQtlkb` | 0 | 0 | 0 | 0 of 3055 |
+| `rogm88TRRiw` | 0 | 0 | 0 | 0 of 2157 |
+| `JgwtTQVeWPm` | 692 | 482 | 5 | 1609 of 14733 |
+
+Level 2 gives up nothing. Level 1 trades byte-exactness for readability and says
+so; level 2 is identifiers and comments, and the differential test runs the
+whole thing again with the names on — same calls, same trap, same linear memory.
+A class name that changed a result would be a bug of the same severity as wrong
+arithmetic.
 
 ### What is left for a host
 
@@ -659,8 +722,10 @@ caller asked for.
 ```console
 $ unwasm inspect module.wasm      # what the module contains
 $ unwasm table module.wasm        # what each table slot holds
+$ unwasm classes module.wasm      # the C++ classes it declares, and their vtables
 $ unwasm host module.wasm         # the skeleton of what a host must answer
 $ unwasm decompile module.wasm    # to stdout
+$ unwasm decompile module.wasm --level 2      # and names from the RTTI
 $ unwasm decompile module.wasm -o out.rs      # one file
 $ unwasm decompile module.wasm -o out/        # mod.rs, parts, names.json
 $ unwasm decompile module.wasm -o out/ --only 10532,12114
@@ -1018,16 +1083,19 @@ module's table is declared `9291 9291`, which cannot grow.
   other half — parameter roles read from how the code uses them, in the manner
   of `wa-wasm-oracle`'s `abi.rs`: dereferenced means pointer, and the access
   width says what it points at.
-- **Level 2 — idiomatic, and always speculative.** Structs from access
-  patterns, vtables from `call_indirect` plus the element segments, class names
-  from the C++ RTTI in the data segments, and embind's `_embind_register_*`
-  calls — which are high-level types the binary declares about itself.
+- **Level 2 — idiomatic.** Half in as well, and it is the half that is not
+  speculative at all: `--level 2` names classes and their virtual methods from
+  the C++ RTTI in the data segments, and the embind registrations are read
+  whatever the level. Both are things the binary declares about itself. What is
+  still to come is the part that must be inferred — structs from access
+  patterns, and which `call_indirect` sites a vtable slot answers.
 - **Recognising more library code.** `--signatures` names it and
   `--stub-recognised` now leaves the bodies out, so the size of the cut is
   exactly the catalogue's recall — ~91% across builds of one toolchain and a
   handful across emscripten versions. The mechanism is not the limit; the
   fingerprint is.
 
-Every one of those is a guess about intent. They are only worth attempting on
-top of something already known to run — which is what level 0 is for, and why
-it came first.
+What remains in those is a guess about intent, and only worth attempting on top
+of something already known to run — which is what level 0 is for, and why it
+came first. What is already in was worth doing first for the opposite reason:
+a name the module wrote down costs nothing to be right about.

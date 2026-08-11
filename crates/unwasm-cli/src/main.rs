@@ -22,6 +22,7 @@ usage:
   unwasm table     <module.wasm> [--type <signature>]
   unwasm calls     <module.wasm> <index>
   unwasm signatures <module.wasm> [-o <sigs.txt>]
+  unwasm classes   <module.wasm> [--methods]
   unwasm frames    <module.wasm> [--outside]
   unwasm bytes     <module.wasm> <offset> <length>
   unwasm constants <module.wasm> <value>
@@ -46,7 +47,9 @@ usage:
                  incomplete; a stub it reaches says which function to add
   --level <n>    0 (default) is a faithful translation; 1 also turns the frame
                  slots it can place into Rust bindings, which stops the output
-                 being byte-exact and says so at every function it did it to
+                 being byte-exact and says so at every function it did it to;
+                 2 also names functions from the C++ RTTI the module carries,
+                 which changes nothing it does
   --signatures <file>  name library code using a catalogue from `signatures`
   --stub-recognised  with --signatures: leave the bodies of the functions the
                  catalogue named out, keeping their names and signatures. For
@@ -72,6 +75,12 @@ things that move between builds left out. It matches ~91% across builds of the
 same toolchain and only a handful across different emscripten versions, so it
 is worth generating from a build of your own rather than expecting it to
 recognise someone else's.
+
+`classes` reads the C++ RTTI: every class the module declares a `type_info`
+for, its name as the compiler mangled it, and the functions its vtable holds.
+That is a declaration rather than an inference — the ABI writes both down — and
+it is what `decompile --level 2` names functions after. `--methods` lists the
+vtable slot by slot.
 
 `constants` finds every site that pushes a value, with the file offset and the
 encoded length of each — all of them, which a hand-counted subset is not. An
@@ -139,6 +148,7 @@ fn run(arguments: &[String]) -> Result<String, String> {
         Some("table") => table(&arguments[1..]),
         Some("calls") => calls(&arguments[1..]),
         Some("signatures") => signatures(&arguments[1..]),
+        Some("classes") => classes(&arguments[1..]),
         Some("frames") => frames(&arguments[1..]),
         Some("bytes") => bytes(&arguments[1..]),
         Some("patch") => patch(&arguments[1..]),
@@ -204,9 +214,11 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
                 level = match value.as_str() {
                     "0" => 0,
                     "1" => 1,
+                    "2" => 2,
                     other => {
                         return Err(format!(
-                            "--level is 0 (faithful) or 1 (frame slots as bindings), not `{other}`"
+                            "--level is 0 (faithful), 1 (frame slots as bindings) or 2 (and \
+                             names from the C++ RTTI), not `{other}`"
                         ));
                     }
                 };
@@ -314,6 +326,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
                 map_offsets,
                 stub_recognised,
                 promote_frames: level >= 1,
+                name_classes: level >= 2,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -343,6 +356,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
             map_offsets,
             stub_recognised,
             promote_frames: level >= 1,
+            name_classes: level >= 2,
         },
     )
     .map_err(|error| error.to_string())?;
@@ -669,6 +683,72 @@ fn bytes(arguments: &[String]) -> Result<String, String> {
             " — a pattern patch would hit all of them"
         }
     ))
+}
+
+/// `classes`: what the C++ ABI wrote down about the module's own types.
+fn classes(arguments: &[String]) -> Result<String, String> {
+    let path = arguments.first().ok_or("classes needs a module path")?;
+    let mut methods = false;
+    for argument in &arguments[1..] {
+        match argument.as_str() {
+            "--methods" => methods = true,
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+    }
+    let module = read(path)?;
+    let analysis = unwasm_core::analysis::analyse(&module);
+    let (classes, evidence) = unwasm_core::analysis::classes(&module, &analysis.placements);
+    if classes.is_empty() {
+        return Ok(format!(
+            "{path} declares no C++ classes: no `type_info` object here is pointed at\nby enough others to be one. A module built from C has none.\n"
+        ));
+    }
+
+    let mut out = format!(
+        "{} classes, {} with vtables, across {} `type_info` {}\n",
+        evidence.classes,
+        evidence.with_vtables,
+        evidence.kinds,
+        if evidence.kinds == 1 { "kind" } else { "kinds" }
+    );
+    if evidence.by_base > 0 {
+        let _ = writeln!(
+            out,
+            "  {} of them named by a derived class rather than by the count",
+            evidence.by_base
+        );
+    }
+    let named: std::collections::BTreeMap<i32, &str> = classes
+        .iter()
+        .map(|class| (class.type_info, class.name.as_str()))
+        .collect();
+    for class in &classes {
+        let _ = writeln!(
+            out,
+            "  {:<60} {}",
+            class.name,
+            match class.vtable {
+                Some(at) => format!("vtable {at:#x}, {} methods", class.methods.len()),
+                None => "no vtable".to_string(),
+            }
+        );
+        // The mangled form when the readable one is not the whole story, so a
+        // reader can check the name against the bytes.
+        if class.name != class.mangled {
+            let _ = writeln!(out, "      mangled {}", class.mangled);
+        }
+        // Only single inheritance is written down as a pointer, so a class with
+        // no line here may still have bases — see `analysis::Class::base`.
+        if let Some(base) = class.base.and_then(|at| named.get(&at)) {
+            let _ = writeln!(out, "      derives from {base}");
+        }
+        if methods {
+            for (slot, func) in class.methods.iter().enumerate() {
+                let _ = writeln!(out, "      slot {slot:<3} f{func}");
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn frames(arguments: &[String]) -> Result<String, String> {

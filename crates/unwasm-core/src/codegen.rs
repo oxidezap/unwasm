@@ -802,6 +802,13 @@ pub struct Options {
     /// the doc comment each promoted function carries for what a run of it no
     /// longer matches.
     pub promote_frames: bool,
+    /// **Level 2**: name functions from the C++ RTTI the module carries.
+    ///
+    /// A class's `type_info` and its vtable are written down by the ABI, so a
+    /// function in exactly one vtable belongs to exactly one class. Changes no
+    /// behaviour — it is a name and a doc comment — but it is a level 2 name:
+    /// the *method* has no name in the module, only a position.
+    pub name_classes: bool,
 }
 
 /// Which functions a catalogue names, by index.
@@ -863,6 +870,7 @@ pub fn generate_options(module: &Module, options: &Options) -> Result<Vec<Genera
     generator.map_offsets = options.map_offsets;
     generator.stub_recognised = options.stub_recognised;
     generator.promote_frames = options.promote_frames;
+    generator.name_classes = options.name_classes;
     generator.run()
 }
 
@@ -975,6 +983,22 @@ struct Generator<'a> {
     stub_recognised: bool,
     /// Whether frame slots become Rust bindings — level 1.
     promote_frames: bool,
+    /// Whether the C++ RTTI names the functions it declares — level 2.
+    name_classes: bool,
+    /// The classes recovered, when it did.
+    classes: Vec<crate::analysis::Class>,
+    /// What that recovery rested on.
+    class_evidence: Option<crate::analysis::ClassEvidence>,
+    /// Each virtual method: which class, and which slot of its vtable.
+    class_methods: std::collections::BTreeMap<u32, (usize, usize)>,
+    /// The functions whose *name* a vtable supplied.
+    ///
+    /// Not the same set as `class_methods`: a function a catalogue already named
+    /// keeps that name and is still a virtual method. Which of the two named it
+    /// decides what the doc comment credits — and, more than cosmetically,
+    /// whether `--stub-recognised` may leave its body out. A vtable says who
+    /// owns a function, never that its body is readable somewhere else.
+    class_named: BTreeSet<u32>,
     /// Per function: its index, how many lines of its chunk come before its
     /// body, and the body's own line-to-bytes spans.
     spans: Vec<FunctionSpans>,
@@ -997,6 +1021,11 @@ impl<'a> Generator<'a> {
             map_offsets: false,
             stub_recognised: false,
             promote_frames: false,
+            name_classes: false,
+            classes: Vec::new(),
+            class_evidence: None,
+            class_methods: Default::default(),
+            class_named: BTreeSet::new(),
             spans: Vec::new(),
             located: Vec::new(),
         }
@@ -1040,9 +1069,163 @@ impl<'a> Generator<'a> {
         self.recognised = recognised_functions(self.module, &self.signatures);
     }
 
+    /// Level 2: names taken from what the C++ ABI writes down.
+    ///
+    /// A class's `type_info` carries its name and its vtable carries the table
+    /// slots its virtual calls land on, so a function in exactly one vtable
+    /// belongs to exactly one class and can say so. That is reading a
+    /// declaration, not inferring one — but it is still a level 2 name, because
+    /// which *method* it is has no name anywhere and the index is all there is.
+    ///
+    /// A function in several vtables is named after none of them. Inheritance
+    /// puts a base's method in every derived vtable — one of them is in 333, of
+    /// 239 different classes — and picking one would be a claim the bytes do not
+    /// make. Same rule as the fingerprint catalogue, for the same reason.
+    fn name_from_classes(&mut self) {
+        if !self.name_classes {
+            return;
+        }
+        let (classes, evidence) = analysis::classes(self.module, &self.analysis.placements);
+        let mut owners: std::collections::BTreeMap<u32, Vec<usize>> = Default::default();
+        for (at, class) in classes.iter().enumerate() {
+            for func in &class.methods {
+                owners.entry(*func).or_default().push(at);
+            }
+        }
+        for (func, owning) in owners {
+            let [only] = owning[..] else { continue };
+            let class = &classes[only];
+            let Some(slot) = class.methods.iter().position(|method| *method == func) else {
+                continue;
+            };
+            self.class_methods.insert(func, (only, slot));
+            // What the module says about itself still wins, and so does a
+            // catalogue that named the function rather than its owner. Only a
+            // name this actually supplied is recorded as one.
+            if self.module.func_name(func).is_none()
+                && let std::collections::btree_map::Entry::Vacant(slot_for_name) =
+                    self.recognised.entry(func)
+            {
+                slot_for_name.insert(format!("{}_v{slot}", class.short));
+                self.class_named.insert(func);
+            }
+        }
+        self.classes = classes;
+        self.class_evidence = Some(evidence);
+    }
+
+    /// What the class recovery found, said once at the top.
+    ///
+    /// The counts *are* the evidence. Itanium gives every `type_info` a vtable
+    /// pointer and there are only a handful of them in a program — one per kind
+    /// of `type_info` — so a pointer hundreds of candidates agree on is one, and
+    /// a pointer one candidate has is two words that happened to line up. The
+    /// summary says how many kinds and how many classes, because a run that
+    /// found four classes across four kinds found nothing.
+    fn class_summary(&mut self) {
+        let Some(evidence) = self.class_evidence else {
+            return;
+        };
+        // Nothing found is a result, and it is not the same sentence: a table of
+        // zeros reads as a failure to look.
+        if evidence.classes == 0 {
+            self.out.push_str(concat!(
+                "// Level 2 read the data segments and found no C++ RTTI: no `type_info`\n",
+                "// object here is pointed at by enough others to be one. A module built\n",
+                "// from C has none, and nothing below is named from a class.\n",
+                "//\n\n",
+            ));
+            return;
+        }
+        let named = self.class_methods.len();
+        let _ = writeln!(
+            self.out,
+            "// Level 2: {} classes read out of the C++ RTTI — {} of them with a\n\
+             // vtable, across {} `type_info` {} — and {named} functions named after\n\
+             // the class whose vtable holds them. A function in more than one vtable is\n\
+             // named after none of them: inheritance puts a base's method in every\n\
+             // derived vtable, and picking one would be a claim these bytes do not make.",
+            evidence.classes,
+            evidence.with_vtables,
+            evidence.kinds,
+            if evidence.kinds == 1 { "kind" } else { "kinds" }
+        );
+        if evidence.by_base > 0 {
+            let _ = writeln!(
+                self.out,
+                "// {} of them {} named by a derived class that points at {} as its base,\n\
+                 // rather than by the count of what shares their kind.",
+                evidence.by_base,
+                if evidence.by_base == 1 { "was" } else { "were" },
+                if evidence.by_base == 1 { "it" } else { "them" }
+            );
+        }
+        let _ = writeln!(self.out, "//");
+        self.out.push('\n');
+    }
+
+    /// The doc comment a virtual method carries: which class, and what says so.
+    fn class_note(&self, index: u32) -> String {
+        let Some((class, slot)) = self.class_methods.get(&index) else {
+            return String::new();
+        };
+        let class = &self.classes[*class];
+        let mut out = String::new();
+        let _ = writeln!(out, "    ///");
+        let _ = writeln!(
+            out,
+            "    /// **Level 2**: virtual method {slot} of `{}`.",
+            class.name
+        );
+        let vtable = match class.vtable {
+            Some(at) => format!("{at:#x}"),
+            None => "no address".to_string(),
+        };
+        let _ = writeln!(out, "    ///");
+        let _ = writeln!(
+            out,
+            "    /// The evidence is the C++ ABI's own: a `type_info` at {:#x}",
+            class.type_info
+        );
+        let _ = writeln!(
+            out,
+            "    /// named `{}`, and a vtable at {vtable} that holds this function",
+            escape_doc(&class.mangled)
+        );
+        let _ = writeln!(
+            out,
+            "    /// at slot {slot}. The method's own name is nowhere in the module —"
+        );
+        let _ = writeln!(
+            out,
+            "    /// only its position is — so that is what the name carries."
+        );
+        // A base is worth saying because it says where the slot came from: a
+        // method at a slot the base also has is an override of it.
+        if let Some(base) = class
+            .base
+            .and_then(|at| self.classes.iter().find(|other| other.type_info == at))
+        {
+            let _ = writeln!(out, "    ///");
+            let _ = writeln!(
+                out,
+                "    /// `{}` derives from `{}`, which the same object says at",
+                class.name, base.name
+            );
+            let _ = writeln!(
+                out,
+                "    /// {:#x}: Itanium writes a single base into the `type_info` itself.",
+                class.type_info + 8
+            );
+        }
+        out
+    }
+
     fn run(mut self) -> Result<Vec<GeneratedFile>> {
         self.recognise();
+        self.name_from_classes();
         self.header();
+        self.class_summary();
         self.registered_api();
         self.shared_state();
         self.embed_runtime();
@@ -1140,6 +1323,8 @@ impl<'a> Generator<'a> {
                 .collect();
             let source = if self.module.func_name(*index).is_some() {
                 "name section"
+            } else if self.class_named.contains(index) {
+                "vtable"
             } else if self.recognised.contains_key(index) {
                 "signature"
             } else {
@@ -1177,11 +1362,31 @@ impl<'a> Generator<'a> {
         self.out.push_str(concat!(
             "// Generated by unwasm. Do not edit: regenerate from the module.\n",
             "//\n",
-            "// This is level 0 — a faithful translation. Linear memory is a byte\n",
+            "// The base is level 0 — a faithful translation. Linear memory is a byte\n",
             "// vector and every wasm value type is its Rust counterpart, so the\n",
             "// arithmetic, the traps and the memory layout are the module's own.\n",
             "// Names come from the module where it kept them and from indices\n",
             "// where it did not.\n",
+        ));
+        // What was asked for on top of it, named where it applies rather than
+        // claimed here: a level is only in the output if a function shows it.
+        if self.promote_frames {
+            self.out.push_str(concat!(
+                "//\n",
+                "// Level 1 is on: a frame slot this could place is a Rust binding rather\n",
+                "// than a shadow-stack write, so the stack bytes are no longer the\n",
+                "// module's. Every function it did that to says so, and says which slots.\n",
+            ));
+        }
+        if self.name_classes {
+            self.out.push_str(concat!(
+                "//\n",
+                "// Level 2 is on: names read out of the C++ RTTI the module carries.\n",
+                "// Those are identifiers and comments — a level 2 run and a level 0 run\n",
+                "// compute the same thing.\n",
+            ));
+        }
+        self.out.push_str(concat!(
             "\n",
             "#![allow(\n",
             "    dead_code,\n",
@@ -2484,14 +2689,23 @@ impl<'a> Generator<'a> {
         if let Some(name) = self.module.func_name(index) {
             let _ = writeln!(out, "    /// `{}`", escape_doc(name));
         } else if let Some(name) = self.recognised.get(&index) {
-            // Recognised by its shape, not by anything the module said. The
-            // catalogue is only as good as the toolchain it came from, so the
-            // comment says where the name is from.
-            let _ = writeln!(
-                out,
-                "    /// Function #{index}, recognised as `{}`: its body fingerprints\n    /// identically to that function in the signature catalogue.",
-                escape_doc(name)
-            );
+            // Two things fill this map, and they are not the same claim. The
+            // catalogue recognised the *function*; a vtable named its *owner*.
+            // Saying "fingerprints identically" about the second would credit
+            // the wrong evidence.
+            if self.class_named.contains(&index) {
+                let _ = writeln!(
+                    out,
+                    "    /// Function #{index}, named `{}` after the class whose vtable holds it.",
+                    escape_doc(name)
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "    /// Function #{index}, recognised as `{}`: its body fingerprints\n    /// identically to that function in the signature catalogue.",
+                    escape_doc(name)
+                );
+            }
         } else if let Some(derived) = self.analysis.derived_names.get(&index) {
             // The name is a guess, so the reason travels with it. Without the
             // evidence a reader has to take `parse_xmpp_offer` on trust, and
@@ -2561,6 +2775,7 @@ impl<'a> Generator<'a> {
         }
 
         out.push_str(&self.cross_reference(index, &slots));
+        out.push_str(&self.class_note(index));
 
         let frame = self.analysis.frames.get(&index);
         if let Some(frame) = frame {
@@ -2592,10 +2807,14 @@ impl<'a> Generator<'a> {
         // A recognised function is left out first: `--stub-recognised` says the
         // body is already readable under its own name somewhere else, and that
         // is a different reason from `--only`, so the stub says which.
+        // A vtable-supplied name is not a catalogue hit: nothing says this
+        // function's body is written out under that name anywhere else, so
+        // stubbing it would drop a body no reader can recover.
         let library = self
             .stub_recognised
             .then(|| self.recognised.get(&index))
             .flatten()
+            .filter(|_| !self.class_named.contains(&index))
             .cloned();
         let asked_for =
             library.is_none() && self.only.as_ref().is_none_or(|only| only.contains(&index));

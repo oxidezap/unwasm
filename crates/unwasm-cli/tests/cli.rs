@@ -1,5 +1,6 @@
 //! The command line, driven the way a user drives it.
 
+use std::fmt::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -505,7 +506,7 @@ fn decompiling_a_deeply_nested_module_says_what_rustc_will_need() {
 }
 
 #[test]
-fn the_level_is_zero_unless_asked_and_only_zero_or_one_exist() {
+fn the_level_is_zero_unless_asked_and_only_zero_to_two_exist() {
     let path = fixture("sample-level", SAMPLE);
     let (ok, stdout, stderr) = run(&[
         "decompile",
@@ -515,15 +516,32 @@ fn the_level_is_zero_unless_asked_and_only_zero_or_one_exist() {
     ]);
     assert!(ok, "{stderr}");
     assert!(!stdout.contains("Level 1"), "{stdout}");
+    assert!(!stdout.contains("Level 2"), "{stdout}");
 
-    let (ok, _, stderr) = run(&[
+    // Level 2 says it is on even where the module carries no RTTI to read: what
+    // was asked for is not the same claim as what was found.
+    let (ok, stdout, stderr) = run(&[
         "decompile",
         path.to_str().expect("utf-8 path"),
         "--level",
         "2",
     ]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("Level 1 is on"), "{stdout}");
+    assert!(stdout.contains("Level 2 is on"), "{stdout}");
+    assert!(
+        !stdout.contains("classes read out of the C++ RTTI"),
+        "a wat fixture declares none: {stdout}"
+    );
+
+    let (ok, _, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--level",
+        "3",
+    ]);
     assert!(!ok);
-    assert!(stderr.contains("--level is 0 (faithful) or 1"), "{stderr}");
+    assert!(stderr.contains("--level is 0 (faithful), 1"), "{stderr}");
 
     let (ok, _, stderr) = run(&["decompile", path.to_str().expect("utf-8 path"), "--level"]);
     assert!(!ok);
@@ -1661,4 +1679,108 @@ fn patch_refuses_a_constant_that_does_not_decode() {
     ]);
     assert!(!ok);
     assert!(stderr.contains("does not decode"), "{stderr}");
+}
+
+// ---- classes ----
+
+/// A module carrying the C++ ABI's own layout, written out by hand.
+///
+/// Compiling C++ would need a toolchain this crate's tests do not have, and the
+/// bytes are the whole point: laying them out here says exactly which ones the
+/// reader is claimed to be reading.
+fn rtti_fixture() -> PathBuf {
+    const BASE: i32 = 1024;
+    let mut bytes: Vec<u8> = Vec::new();
+    let word = |bytes: &mut Vec<u8>, value: i32| bytes.extend_from_slice(&value.to_le_bytes());
+
+    // Something for the `type_info`s' vptr to point at. All three agree on it,
+    // which is what makes it a kind rather than a coincidence.
+    let kind = BASE;
+    word(&mut bytes, 0);
+    word(&mut bytes, 0);
+
+    let mut names = Vec::new();
+    for name in ["5Alpha", "4Beta", "5Gamma"] {
+        names.push(BASE + bytes.len() as i32);
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(0);
+        while !bytes.len().is_multiple_of(4) {
+            bytes.push(0);
+        }
+    }
+
+    let mut infos = Vec::new();
+    for name in &names {
+        infos.push(BASE + bytes.len() as i32);
+        word(&mut bytes, kind);
+        word(&mut bytes, *name);
+    }
+
+    // Alpha's vtable: Itanium's `{offset-to-top, type_info*, slots…}`, with two
+    // slots that are really in the table.
+    word(&mut bytes, 0);
+    word(&mut bytes, infos[0]);
+    word(&mut bytes, 1);
+    word(&mut bytes, 2);
+    word(&mut bytes, 0); // and a word that is not a slot, which ends the run
+
+    let mut data = String::new();
+    for byte in &bytes {
+        let _ = write!(data, "\\{byte:02x}");
+    }
+    fixture(
+        "sample-rtti",
+        &format!(
+            r#"(module
+    (memory (export "memory") 2)
+    (table 3 funcref)
+    (elem (i32.const 1) $one $two)
+    (data (i32.const {BASE}) "{data}")
+    (func $one (result i32) i32.const 1)
+    (func $two (result i32) i32.const 2)
+    (func (export "go") (result i32) call $one))"#
+        ),
+    )
+}
+
+#[test]
+fn classes_reads_the_cplusplus_rtti_and_says_what_it_rests_on() {
+    let path = rtti_fixture();
+    let (ok, stdout, stderr) = run(&["classes", path.to_str().expect("utf-8 path")]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("3 classes, 1 with vtables, across 1 `type_info` kind\n"),
+        "{stdout}"
+    );
+    for name in ["Alpha", "Beta", "Gamma"] {
+        assert!(stdout.contains(name), "{stdout}");
+    }
+    // The vtable's address is what the claim rests on, so it is printed.
+    assert!(stdout.contains("vtable 0x"), "{stdout}");
+    assert!(stdout.contains("2 methods"), "{stdout}");
+    assert!(
+        !stdout.contains("slot 0"),
+        "not without --methods: {stdout}"
+    );
+
+    let (ok, stdout, stderr) = run(&["classes", path.to_str().expect("utf-8 path"), "--methods"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("slot 0"), "{stdout}");
+    assert!(stdout.contains("slot 1"), "{stdout}");
+}
+
+#[test]
+fn classes_says_so_when_a_module_declares_none() {
+    let path = fixture("sample-no-rtti", SAMPLE);
+    let (ok, stdout, stderr) = run(&["classes", path.to_str().expect("utf-8 path")]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("declares no C++ classes"), "{stdout}");
+
+    let (ok, _, stderr) = run(&["classes"]);
+    assert!(!ok);
+    assert!(stderr.contains("classes needs a module path"), "{stderr}");
+
+    let (ok, _, stderr) = run(&["classes", path.to_str().expect("utf-8 path"), "--all"]);
+    assert!(!ok);
+    assert!(stderr.contains("unexpected argument `--all`"), "{stderr}");
 }

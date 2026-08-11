@@ -1729,3 +1729,168 @@ fn main() {
     }
     assert_eq!(output.trim(), expected.join(","));
 }
+
+// ---- level 2 ----
+
+/// The C++ ABI's layout, written out by hand so the test says exactly which
+/// bytes the naming is claimed to rest on.
+///
+/// Four `type_info`s share a vptr, which is what confirms the kind; three of
+/// them point at the fourth as their base, which is what confirms that the third
+/// word is a base pointer. One function sits in all four vtables, which is what
+/// inheritance does and what must therefore stay unnamed.
+fn rtti_module() -> Vec<u8> {
+    const BASE: i32 = 1024;
+    let mut bytes: Vec<u8> = Vec::new();
+    let word = |bytes: &mut Vec<u8>, value: i32| bytes.extend_from_slice(&value.to_le_bytes());
+    let text = |bytes: &mut Vec<u8>, value: &str| {
+        let at = BASE + bytes.len() as i32;
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(0);
+        while !bytes.len().is_multiple_of(4) {
+            bytes.push(0);
+        }
+        at
+    };
+
+    let kind = BASE;
+    word(&mut bytes, 0);
+    word(&mut bytes, 0);
+
+    let base_name = text(&mut bytes, "4Base");
+    let base = BASE + bytes.len() as i32;
+    word(&mut bytes, kind);
+    word(&mut bytes, base_name);
+
+    // Three derived classes, because the base pointer is only read for a kind
+    // where enough members carry one — one derived class is not a group.
+    let mut derived = Vec::new();
+    for name in ["7Derived", "5Other", "5Third"] {
+        let name_at = text(&mut bytes, name);
+        derived.push(BASE + bytes.len() as i32);
+        word(&mut bytes, kind);
+        word(&mut bytes, name_at);
+        word(&mut bytes, base); // Itanium's single-base pointer
+    }
+
+    // A vtable each. Slot 1 is in all four — `Base`'s method, inherited — and
+    // slots 2 to 5 are each in one.
+    for (info, own) in [(base, 2)]
+        .into_iter()
+        .chain(derived.iter().copied().zip(3..))
+    {
+        word(&mut bytes, 0);
+        word(&mut bytes, info);
+        word(&mut bytes, 1);
+        word(&mut bytes, own);
+        word(&mut bytes, 0);
+    }
+
+    let mut data = String::new();
+    for byte in &bytes {
+        data.push_str(&format!("\\{byte:02x}"));
+    }
+    common::assemble(
+        "rtti-classes",
+        &format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (table 6 funcref)
+                (elem (i32.const 1) 0 1 2 3 4)
+                (data (i32.const {BASE}) "{data}")
+                (func (result i32) i32.const 1)
+                (func (result i32) i32.const 2)
+                (func (result i32) i32.const 3)
+                (func (result i32) i32.const 4)
+                (func (result i32) i32.const 5)
+                (func (export "go") (result i32) call 1))"#
+        ),
+    )
+}
+
+#[test]
+fn level_2_names_a_virtual_method_after_the_one_class_that_holds_it() {
+    let wasm = rtti_module();
+    let module = Module::parse(&wasm).expect("parses");
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            name_classes: true,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+    let code = &files[0].contents;
+
+    assert!(
+        code.contains("// Level 2 is on"),
+        "the header says so:\n{code}"
+    );
+    assert!(
+        code.contains("4 classes read out of the C++ RTTI"),
+        "and the summary counts them:\n{code}"
+    );
+    assert!(
+        code.contains("4 of them with a"),
+        "each with a vtable:\n{code}"
+    );
+
+    // A function one vtable holds is named after that class; the one three
+    // vtables hold is named after none of them.
+    for (function, name) in [
+        (1, "_Base_v1"),
+        (2, "_Derived_v1"),
+        (3, "_Other_v1"),
+        (4, "_Third_v1"),
+    ] {
+        assert!(
+            code.contains(&format!("fn f{function}{name}")),
+            "f{function} is {name}:\n{code}"
+        );
+    }
+    assert!(
+        !code.contains("f0_"),
+        "the inherited method is in all four, so it keeps its index:\n{code}"
+    );
+
+    // And the note carries the addresses, the mangled name and the base.
+    assert!(code.contains("**Level 2**: virtual method 1 of `Derived`"));
+    assert!(code.contains("named `7Derived`"));
+    assert!(code.contains("`Derived` derives from `Base`"));
+}
+
+#[test]
+fn level_2_on_a_module_with_no_rtti_says_it_found_none() {
+    let wasm = common::assemble(
+        "rtti-none",
+        r#"(module
+            (memory (export "memory") 1)
+            (data (i32.const 0) "hello, world\00")
+            (func (export "go") (result i32) i32.const 1))"#,
+    );
+    let module = Module::parse(&wasm).expect("parses");
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            name_classes: true,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+    let code = &files[0].contents;
+    assert!(code.contains("// Level 2 is on"), "{code}");
+    assert!(code.contains("found no C++ RTTI"), "{code}");
+    assert!(
+        !code.contains("classes read out of the C++ RTTI"),
+        "a table of zeros reads as a failure to look:\n{code}"
+    );
+}
+
+/// Level 2 is names. The module must do exactly what it did without them.
+#[test]
+fn level_2_changes_nothing_the_module_does() {
+    let wasm = rtti_module();
+    common::assert_agrees_at_level_2("rtti-classes", &wasm, &[common::call("go", &[])]);
+}

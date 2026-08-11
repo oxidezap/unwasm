@@ -153,6 +153,90 @@ fn how_much_of_each_capture_level_1_can_place() {
     );
 }
 
+/// What level 2 recovers from each capture, and — the part that matters — what
+/// it recovers from the ones that have no C++ in them at all.
+///
+/// A recogniser that finds classes everywhere has found none: the three C
+/// modules here are the control, and they must come back empty. Their emptiness
+/// is what gives the VoIP module's 692 classes their meaning, so it is asserted
+/// rather than printed.
+#[test]
+#[ignore = "reads the capture directory"]
+fn what_level_2_reads_out_of_each_capture() {
+    // Which captures were built from C++ is not this test's guess: it is what
+    // the modules' own mangled names say, and a module with none has none.
+    const CPLUSPLUS: &[&str] = &[
+        "php8T1oSIZM",
+        common::captures::SMALLEST,
+        common::captures::VOIP,
+    ];
+    let mut missing = Vec::new();
+    for (id, description) in CAPTURES {
+        let Some(bytes) = common::captured(id) else {
+            missing.push(*id);
+            continue;
+        };
+        let module = Module::parse(&bytes).expect("parses");
+        let analysis = unwasm_core::analysis::analyse(&module);
+        let (classes, evidence) = unwasm_core::analysis::classes(&module, &analysis.placements);
+        let unreadable = classes
+            .iter()
+            .filter(|class| class.name == class.mangled)
+            .count();
+        let with_base = classes.iter().filter(|class| class.base.is_some()).count();
+        // What a reader actually gets: a function one vtable holds is named
+        // after that class, and a function several hold is named after none of
+        // them. Inheritance puts a base's method in every derived vtable, so
+        // the second number is not small and dropping it is the point.
+        let mut owners: std::collections::BTreeMap<u32, usize> = Default::default();
+        for class in &classes {
+            for func in &class.methods {
+                *owners.entry(*func).or_default() += 1;
+            }
+        }
+        let named = owners.values().filter(|count| **count == 1).count();
+        eprintln!(
+            "{id}: {} classes, {} with vtables, {with_base} with a base, \
+             {} kinds, {unreadable} names unreadable, {} named only by a \
+             derived class; {named} of {} functions named, {} shared between \
+             vtables — {description}",
+            evidence.classes,
+            evidence.with_vtables,
+            evidence.kinds,
+            evidence.by_base,
+            module.funcs.len(),
+            owners.len() - named
+        );
+
+        if CPLUSPLUS.contains(id) {
+            assert!(evidence.classes > 0, "{id} is a C++ module");
+            // Every class carries the mangled string it was read from, so a
+            // name that could not be demangled is visibly the mangled one
+            // rather than a guess.
+            assert!(
+                classes
+                    .iter()
+                    .all(|class| !class.name.is_empty() && !class.short.is_empty())
+            );
+        } else {
+            assert_eq!(
+                evidence.classes,
+                0,
+                "{id} was built from C and has no RTTI: {:?}",
+                classes
+                    .iter()
+                    .map(|class| &class.mangled)
+                    .take(8)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "these captures were not found: {missing:?}"
+    );
+}
+
 /// The VoIP module's own allocator, run.
 ///
 /// Everything else in this tier reads the big capture or compiles a small one.

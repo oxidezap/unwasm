@@ -700,6 +700,51 @@ pub fn assert_agrees_at_level_1(name: &str, wasm: &[u8], calls: &[Call]) -> bool
     memory_matches
 }
 
+/// As [`assert_agrees`], with level 2's names on.
+///
+/// Level 2 is names and comments, so this is the test of that claim: the same
+/// calls, the whole of linear memory, and the level-0 assertion unweakened.
+/// Where level 1 gives up byte-exactness and says so, level 2 gives up nothing
+/// — a class name that changed a result would be a bug of the same severity as
+/// wrong arithmetic, and the memory comparison is what would catch it.
+///
+/// It also compiles the renamed output, which is the other thing that can go
+/// wrong: a demangled name reaching an identifier position unsanitised, or two
+/// classes naming one function the same way.
+///
+/// # Panics
+///
+/// Panics with the first disagreement, naming the call that produced it.
+pub fn assert_agrees_at_level_2(name: &str, wasm: &[u8], calls: &[Call]) {
+    let module = Module::parse(wasm).expect("parsing the module under test");
+    let engine = run_in_node(name, wasm, calls, &module);
+    let ours = run_in_rust_options(
+        name,
+        &module,
+        calls,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            name_classes: true,
+            ..codegen::Options::default()
+        },
+    );
+
+    assert_eq!(
+        engine.len(),
+        ours.len(),
+        "the two sides produced different numbers of lines\nengine: {engine:#?}\nours: {ours:#?}"
+    );
+    for (at, (expected, actual)) in engine.iter().zip(ours.iter()).enumerate() {
+        let what = calls
+            .get(at)
+            .map_or_else(|| "linear memory".to_string(), |call| format!("{call:?}"));
+        assert_eq!(
+            expected, actual,
+            "level 2 disagrees with the engine on {what} — a name changed a result"
+        );
+    }
+}
+
 /// Decompiles and compiles, without running. For modules with no callable
 /// entry point worth driving, where the claim under test is only that the
 /// output builds.

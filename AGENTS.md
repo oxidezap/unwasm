@@ -177,6 +177,60 @@ And the prize is small, measured on the corpus by `how_much_of_each_capture_
 level_1_can_place`: between 0.2% and 28% of frames have anything promotable at
 all. Compiled C reaches its own frames constantly.
 
+## Level 2 reads a declaration, it does not infer one
+
+`--level 2` names functions from the C++ RTTI. That is not the guess the level
+model's word "speculative" suggests, and the distinction is the whole design:
+Itanium's ABI *writes the names down*. A `type_info` is `{vptr, name}` in the
+data segments, a vtable is `{offset-to-top, type_info*, slots…}` beside it, and
+a slot is a table index that resolves to a function. `analysis::classes` reads
+those bytes; nothing in it looks at what any function does.
+
+What keeps it from finding classes in modules that have none is counted rather
+than assumed:
+
+- **`TYPE_INFO_KIND_FLOOR`** is how many `type_info` candidates must share a
+  vptr before that vptr is a kind. It is 3, and 3 was swept, not picked: at 2
+  two of the three C captures report a class that is not there; at 3 all three
+  report none; at 4 `JgwtTQVeWPm` loses three real classes and a whole kind. The C
+  modules coming back empty is what gives the 692 their meaning, so
+  `what_level_2_reads_out_of_each_capture` asserts it rather than printing it.
+- **The single-inheritance kind is counted too.** Itanium's third word is the
+  base's `type_info`, but only for `__si_class_type_info`, and which kind that
+  is is not knowable from a vptr value. So it is the group that answers: a kind
+  with at least `TYPE_INFO_KIND_FLOOR` members whose third word points at
+  another candidate is that kind. A pointer into the object's own twelve bytes
+  is excluded — an object cannot contain its own base — which is a bound, not a
+  heuristic.
+- **A base a confirmed class names is a class.** That is the one route by which
+  a `type_info` the count missed still gets named, and it is the module's own
+  statement rather than an inference from it. One hop only: an admitted class's
+  kind was never confirmed, so its third word is not read as a base. On the
+  corpus this adds nothing at all (`by_base` is 0 for all six); on a small
+  fixture it is the difference between finding `Square` and finding `Square`
+  and `Shape`, which is why the emscripten test is where it earns its keep.
+- **A function in more than one vtable is named after none of them.**
+  Inheritance puts a base's method in every derived vtable — 204 of
+  `JgwtTQVeWPm`'s 1813 vtable functions are shared, the worst across 333
+  vtables — so an owner picked from several is a claim the bytes do not make.
+- **A name that cannot be demangled stays mangled**, for the reason the
+  fingerprint catalogue drops an ambiguous name: a wrong name is worse than
+  `f8421`. `demangle_type` reads nested names, source names and `St`, and elides
+  a template argument list as `<…>` rather than resolving substitutions it
+  cannot check. Skipping an argument list is the part that goes wrong quietly:
+  the anonymous namespace is a source name holding an `N`, and counting that as
+  structure runs the skip past the `E` closing the name around it — which reads
+  as a demangling that worked. Ten of `JgwtTQVeWPm`'s names were readable only
+  by that accident; with source names, substitutions and `St` handled, 661 of
+  its 692 read and 31 stay mangled.
+
+And unlike level 1, **level 2 gives nothing up**. It is identifiers and doc
+comments, so `assert_agrees_at_level_2` is the level-0 assertion unweakened —
+the same calls, the trap, and the whole of linear memory — run again with the
+names on. It also compiles the renamed output, which is the other way a name can
+go wrong: `sanitize` is what stands between a demangled string and an identifier
+position.
+
 ## Folding is only for expressions that cannot trap
 
 `push_pure` folds an expression into whatever consumes it; `push_temp` gives it
@@ -263,9 +317,16 @@ mistaken for the enclosing frame's.
 
 ## Coverage is a floor, not a target
 
-**99.68% of lines — 30 of 9438**, on a checkout with the `#[ignore]`d tiers not
-running: `module.rs` 20, `codegen.rs` 7, `hostlib.rs` 2, `rt.rs` 1. `analysis.rs`,
-`main.rs`, `error.rs` and `ops.rs` are complete.
+**99.06% of lines — 99 of 10578**, on a checkout with the `#[ignore]`d tiers not
+running: `codegen.rs` 40, `analysis.rs` 30, `module.rs` 20, `main.rs` 6,
+`hostlib.rs` 3. `rt.rs`, `error.rs` and `ops.rs` are complete.
+
+It was 99.68% before level 2, and the drop is the level's own doing: the class
+recovery's evidence lives in real modules, so the paths that read a *placed*
+segment or a name it cannot demangle are reached by the `#[ignore]`d tiers and
+not by this number. What the fast tier does cover is a hand-laid RTTI image in
+`backend.rs` and `analysis.rs`'s own tests, which is why it is 99.06% and not
+the 98.27% the first level-2 draft measured.
 
 The number was **99.5%** here and **99.6%** in the README before either was
 re-measured, and **99.20%** after. Re-measure before quoting it; a coverage
@@ -286,12 +347,10 @@ What is left is almost all unreachable rather than untested. In `module.rs`:
 Three of `codegen.rs`'s are in the table-type map: a table entry whose function
 index has no type, a type index past `u16::MAX`, and a signature missing from
 the type section. All three are malformed-module defences that `wasm-tools` will
-not assemble, and the third is unreachable by construction. `hostlib.rs`'s two
-are the same shape — a directory key already ending in `/`, and a descriptor
-number overflowing `i32` — and `rt.rs`'s one is the retry arm of `grow`'s
-compare-exchange, which needs a race to reach and is covered only when one
-happens. The rest is ordinary uncovered code and is not claimed to be anything
-else.
+not assemble, and the third is unreachable by construction. `hostlib.rs`'s are
+the same shape — a directory key already ending in `/`, and a descriptor number
+overflowing `i32`. The rest is ordinary uncovered code and is not claimed to be
+anything else.
 
 Keep the defences. Deleting one to raise a percentage is how a decoder change
 becomes a panic two years later, and the tests record which layer rejects each
@@ -524,11 +583,14 @@ which build you measured.
 
    What is *not* left is anything a standard already decides, or anything that
    needed the instance. Both of those were written.
-2. **Level 2 — idiomatic, and always speculative.** Structs from access
-   patterns, vtables from `call_indirect` plus the element segments, class names
-   from the C++ RTTI, and what embind's registrations already declare. Level 1
-   is in — `--level 1`, opt-in, and it says at every function what it did and
-   what it gave up.
+2. **Level 2 — the rest of it.** The half that is in is the half the module
+   writes down: class names and vtables from the C++ RTTI (`--level 2`,
+   `unwasm classes`), and what embind's registrations declare. What is still
+   open is the half that has to be inferred — structs from access patterns, and
+   parameter roles read from how the code uses them, in the manner of
+   `wa-wasm-oracle`'s `abi.rs`: dereferenced means pointer, and the access width
+   says what it points at. That half *is* speculative, and it needs the same
+   treatment level 1 got — opt-in, and saying at every site what it rests on.
 3. **Improve what a catalogue recognises.** `--stub-recognised` leaves the
    bodies out now, so the size of the cut is exactly the catalogue's recall:
    ~91% across builds of one toolchain and a handful across emscripten

@@ -2090,6 +2090,515 @@ fn find_stack_pointer(module: &Module) -> Option<StackPointer> {
     })
 }
 
+// ---- what a C++ module declares about its own classes ----
+
+/// A C++ class the module declares, and what it declares about it.
+///
+/// This is not inference from how the code behaves. Itanium's ABI puts a
+/// `type_info` object in the data segments for every polymorphic class and a
+/// vtable beside it, and both are *written down*: the class's name is a string
+/// the compiler emitted, and the vtable's entries are the table slots its
+/// virtual calls land on. Recovering them is reading a declaration, not
+/// guessing at one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Class {
+    /// Where the `type_info` object sits.
+    pub type_info: i32,
+    /// The name exactly as the module wrote it, mangled.
+    ///
+    /// Kept beside the readable form because it is the evidence: a demangling
+    /// this could not do in full is still checkable against the bytes.
+    pub mangled: String,
+    /// The readable form, as far as it could be read. The mangled string when
+    /// it could not be read at all.
+    pub name: String,
+    /// The last component of the name, without template arguments — what a
+    /// function derived from this class is named after.
+    pub short: String,
+    /// The `type_info` of the class this one derives from, when the module
+    /// writes one down.
+    ///
+    /// `None` covers both "no base" and "more than one": Itanium spells single
+    /// inheritance as a third word and everything else as a variable-length
+    /// record this does not read, so an absent base is *unstated*, not stated
+    /// to be absent.
+    pub base: Option<i32>,
+    /// Where the vtable sits, when one points at this `type_info`.
+    pub vtable: Option<i32>,
+    /// The functions the vtable holds, in order, by function index.
+    pub methods: Vec<u32>,
+}
+
+/// What the class recovery rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClassEvidence {
+    /// How many distinct `__class_type_info` vtables the classes share.
+    ///
+    /// Itanium gives every `type_info` a vtable pointer, and there are only a
+    /// handful of them in a program — one per *kind* of type_info. So a pointer
+    /// hundreds of `type_info` objects agree on is that; one a single candidate
+    /// has is two words that happened to look like a pair.
+    pub kinds: usize,
+    /// How many classes were confirmed that way.
+    pub classes: usize,
+    /// How many of them a vtable points at.
+    pub with_vtables: usize,
+    /// How many of them the count alone missed, and a confirmed class named as
+    /// its base.
+    pub by_base: usize,
+}
+
+/// How many `type_info` candidates have to share a vtable pointer before it is
+/// one.
+///
+/// Measured rather than picked. The floor was swept over the whole corpus: at 2
+/// two of the three C modules — which declare no classes at all — each report a
+/// kind and two classes, and both are accidents; at 3 all three report none,
+/// while the C++ modules and the tiny emscripten fixture are unchanged. Raising
+/// it further only loses real ones: at 4 `JgwtTQVeWPm` drops three classes and
+/// one of its five kinds. So 3 is the lowest value that admits no accident,
+/// which is the side to err on — a wrong class name is worse than none.
+const TYPE_INFO_KIND_FLOOR: usize = 3;
+
+/// The classes a module declares, and what they rest on.
+///
+/// Not part of [`analyse`]: it reads every four-byte-aligned word of the data
+/// segments, which on a 10 MiB module is worth doing when asked and not on
+/// every run.
+#[must_use]
+pub fn classes(
+    module: &Module,
+    placements: &std::collections::BTreeMap<u32, Placement>,
+) -> (Vec<Class>, ClassEvidence) {
+    let image = DataImage::of(module, placements);
+    let table = read_table(module);
+
+    // Every `{something, name}` pair whose second word points at a mangled
+    // type name. Most are real; the rest are two words that happened to line up.
+    let mut candidates: Vec<(i32, i32, String)> = Vec::new();
+    for (base, bytes) in &image.segments {
+        let mut at = base.next_multiple_of(4);
+        while (at as u64) + 8 <= u64::from(*base) + bytes.len() as u64 {
+            if let (Some(kind), Some(name_at)) =
+                (image.read32(at as i32), image.read32(at as i32 + 4))
+                && kind != 0
+                && let Some(name) = image.cstring(name_at)
+                && is_mangled_type(&name)
+            {
+                candidates.push((at as i32, kind, name));
+            }
+            at += 4;
+        }
+    }
+
+    // The counted evidence: a vtable pointer only a few candidates share is not
+    // `__class_type_info`, it is a coincidence.
+    let mut kinds: std::collections::BTreeMap<i32, usize> = Default::default();
+    for (_, kind, _) in &candidates {
+        *kinds.entry(*kind).or_default() += 1;
+    }
+    kinds.retain(|kind, count| {
+        *count >= TYPE_INFO_KIND_FLOOR && image.holds(*kind) && image.holds(*kind + 4)
+    });
+
+    let by_address: std::collections::BTreeMap<i32, (i32, String)> = candidates
+        .iter()
+        .map(|(at, kind, mangled)| (*at, (*kind, mangled.clone())))
+        .collect();
+
+    let mut classes: std::collections::BTreeMap<i32, Class> = Default::default();
+    let mut confirmed_kind: std::collections::BTreeMap<i32, i32> = Default::default();
+    for (at, kind, mangled) in candidates {
+        if !kinds.contains_key(&kind) {
+            continue;
+        }
+        confirmed_kind.insert(at, kind);
+        let (name, short) = demangle_type(&mangled);
+        classes.insert(
+            at,
+            Class {
+                type_info: at,
+                mangled,
+                name,
+                short,
+                base: None,
+                vtable: None,
+                methods: Vec::new(),
+            },
+        );
+    }
+
+    // Itanium gives a singly-inherited class a third word: its base's
+    // `type_info`. Which of the confirmed kinds that is, is counted rather than
+    // assumed — the single-inheritance kind has members whose third word points
+    // at another `type_info`, and a kind of two-word objects does not.
+    //
+    // The one reading that has to be excluded is a pointer into the object
+    // itself: a three-word `type_info` occupies `[at, at + 12)`, so a "base"
+    // at one of those addresses would be the object overlapping itself. That
+    // is a coincidence rather than a base, and what says so is the object's
+    // own bounds rather than a guess about how the segments are laid out.
+    let base_of = |at: i32| -> Option<i32> {
+        let base = image.read32(at + 8)?;
+        (by_address.contains_key(&base) && !(at..at + 12).contains(&base)).then_some(base)
+    };
+    let single_inheritance: std::collections::BTreeSet<i32> = kinds
+        .keys()
+        .copied()
+        .filter(|kind| {
+            confirmed_kind
+                .iter()
+                .filter(|(at, member)| *member == kind && base_of(**at).is_some())
+                .count()
+                >= TYPE_INFO_KIND_FLOOR
+        })
+        .collect();
+
+    // Which is also the one way a class the count missed still gets named: a
+    // base named by a confirmed derived class is written down by the module, not
+    // inferred from it. One hop only — the admitted class's own kind was never
+    // confirmed, so its third word is not read as a base.
+    let mut adopt: Vec<(i32, i32)> = Vec::new();
+    for (at, kind) in &confirmed_kind {
+        if !single_inheritance.contains(kind) {
+            continue;
+        }
+        if let Some(base) = base_of(*at) {
+            adopt.push((*at, base));
+        }
+    }
+    let mut by_base = 0usize;
+    for (at, base) in adopt {
+        if let Some(class) = classes.get_mut(&at) {
+            class.base = Some(base);
+        }
+        if classes.contains_key(&base) {
+            continue;
+        }
+        let (_, mangled) = &by_address[&base];
+        let (name, short) = demangle_type(mangled);
+        classes.insert(
+            base,
+            Class {
+                type_info: base,
+                mangled: mangled.clone(),
+                name,
+                short,
+                base: None,
+                vtable: None,
+                methods: Vec::new(),
+            },
+        );
+        by_base += 1;
+    }
+
+    // And the vtables: `{offset-to-top, type_info*, slot, slot, …}`, which is
+    // Itanium's layout. Three independent things have to agree — a zero, a
+    // `type_info` already confirmed, and a run of live table slots — which is
+    // what makes a vtable recognisable at all.
+    let highest = table.keys().max().copied().unwrap_or(0);
+    for (base, bytes) in &image.segments {
+        let mut at = base.next_multiple_of(4);
+        while (at as u64) + 8 <= u64::from(*base) + bytes.len() as u64 {
+            let here = at as i32;
+            at += 4;
+            if image.read32(here) != Some(0) {
+                continue;
+            }
+            let Some(info) = image.read32(here + 4) else {
+                continue;
+            };
+            if !classes.contains_key(&info) {
+                continue;
+            }
+            let mut methods = Vec::new();
+            let mut cursor = here + 8;
+            while let Some(slot) = image.read32(cursor) {
+                if slot <= 0 || slot as u32 > highest {
+                    break;
+                }
+                let Some(func) = table.get(&(slot as u32)) else {
+                    break;
+                };
+                methods.push(*func);
+                cursor += 4;
+            }
+            if methods.is_empty() {
+                continue;
+            }
+            // The first vtable wins. A class has one; a second match at another
+            // address is a construction-vtable or an accident, and picking
+            // between them is not something the bytes decide.
+            let class = classes.get_mut(&info).expect("just checked");
+            if class.vtable.is_none() {
+                class.vtable = Some(here);
+                class.methods = methods;
+            }
+        }
+    }
+
+    let classes: Vec<Class> = classes.into_values().collect();
+    let evidence = ClassEvidence {
+        kinds: kinds.len(),
+        classes: classes.len(),
+        with_vtables: classes
+            .iter()
+            .filter(|class| class.vtable.is_some())
+            .count(),
+        by_base,
+    };
+    (classes, evidence)
+}
+
+/// Whether a string is the shape `_ZTS` holds for a class type.
+///
+/// A leading digit is a source name and a leading `N` a nested one; those two
+/// are the class types, which are the ones a vtable belongs to. Anything else —
+/// a builtin, a pointer, a function type — is not something to name a class
+/// after.
+fn is_mangled_type(name: &str) -> bool {
+    name.len() >= 3
+        && name
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'N')
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' || ch == '.')
+}
+
+/// Reads an Itanium type name into something a person can read, and says so
+/// only as far as it got.
+///
+/// Returns `(readable, short)` — the whole path, and its last component without
+/// template arguments, which is what a function derived from the class is
+/// named after. When the name cannot be read at all, both are the mangled
+/// string: **a wrong name is worse than a mangled one**, and this is the same
+/// rule the fingerprint catalogue follows.
+///
+/// What it reads is the part that carries the meaning: nested names, source
+/// names, and `St` for `std`. What it deliberately does *not* read is the
+/// inside of a template argument list, because that needs Itanium's
+/// substitution table — `NS_9allocatorIS1_EE` refers back to components by
+/// number — and a substitution resolved wrongly is a name that says something
+/// the module did not. So `I…E` comes out as `<…>`: the class is named, and the
+/// instantiation is visibly elided rather than invented.
+fn demangle_type(mangled: &str) -> (String, String) {
+    let unreadable = || (mangled.to_string(), mangled.to_string());
+    let bytes = mangled.as_bytes();
+    let mut at = 0usize;
+
+    // A bare source name: `20WasmShimErrorHandler`.
+    let source_name = |at: &mut usize| -> Option<String> {
+        let start = *at;
+        while bytes.get(*at).is_some_and(u8::is_ascii_digit) {
+            *at += 1;
+        }
+        if *at == start {
+            return None;
+        }
+        let length: usize = mangled[start..*at].parse().ok()?;
+        let end = at.checked_add(length)?;
+        let name = mangled.get(*at..end)?;
+        *at = end;
+        Some(name.to_string())
+    };
+
+    // `I … E`, skipped as a whole: what is inside needs the substitution table,
+    // and finding the end is counting rather than parsing.
+    //
+    // Counting bytes is not enough, though. A source name's *text* can hold any
+    // letter — `12_GLOBAL__N_1` is the anonymous namespace, and it carries an
+    // `N` — so a scan that counts letters wherever it finds them goes out of
+    // step and swallows the `E` that closes the name around the list. Ten names
+    // in the VoIP module read as demangled that way, correctly by luck. So a
+    // source name is skipped by its length, and only the five characters that
+    // really open a scope are counted.
+    let skip_template = |at: &mut usize| -> Option<()> {
+        let mut depth = 0usize;
+        loop {
+            let byte = *bytes.get(*at)?;
+            if byte.is_ascii_digit() {
+                let start = *at;
+                while bytes.get(*at).is_some_and(u8::is_ascii_digit) {
+                    *at += 1;
+                }
+                let length: usize = mangled[start..*at].parse().ok()?;
+                *at = at.checked_add(length)?;
+                if *at > bytes.len() {
+                    return None;
+                }
+                continue;
+            }
+            // A substitution is `S <seq-id> _`, and its sequence id is base 36 —
+            // so it holds letters that would otherwise read as openers, and
+            // digits that would otherwise read as a source name's length.
+            if byte == b'S' {
+                *at += 1;
+                let id = *at;
+                while bytes
+                    .get(*at)
+                    .is_some_and(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+                {
+                    *at += 1;
+                }
+                if bytes.get(*at) == Some(&b'_') {
+                    *at += 1;
+                } else if *at == id {
+                    // `St`, `Sa`, `Ss` — the fixed abbreviations, two characters
+                    // and no underscore. `St3__2` is one of them followed by a
+                    // source name, and reading the `3` as an id loses both.
+                    *at += 1;
+                }
+                continue;
+            }
+            match byte {
+                // `I` a template list, `N` a nested name, `J` an argument pack,
+                // `Z` a local name, `L` a literal, `F` a function type — each
+                // closed by `E`.
+                b'I' | b'N' | b'J' | b'Z' | b'L' | b'F' => depth += 1,
+                b'E' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        *at += 1;
+                        return Some(());
+                    }
+                }
+                _ => {}
+            }
+            *at += 1;
+        }
+    };
+
+    let mut components: Vec<String> = Vec::new();
+    let nested = bytes.first() == Some(&b'N');
+    if nested {
+        at += 1;
+    }
+    // `N` opens a scope `E` closes. A scope that never closes is a name that
+    // ran out, not a name that ended, and the two must not read the same.
+    let mut closed = !nested;
+    loop {
+        match bytes.get(at) {
+            None => break,
+            Some(b'E') if nested => {
+                at += 1;
+                closed = true;
+                break;
+            }
+            // `St` is `std`, and the only substitution with a fixed meaning.
+            Some(b'S') if bytes.get(at + 1) == Some(&b't') => {
+                at += 2;
+                components.push("std".to_string());
+            }
+            Some(b'I') => {
+                // A template argument list belongs to the component before it.
+                if skip_template(&mut at).is_none() {
+                    return unreadable();
+                }
+                match components.last_mut() {
+                    Some(last) => last.push_str("<…>"),
+                    None => return unreadable(),
+                }
+            }
+            Some(byte) if byte.is_ascii_digit() => match source_name(&mut at) {
+                Some(name) => components.push(name),
+                None => return unreadable(),
+            },
+            // Anything else — a substitution, a qualifier, a builtin — is a
+            // construct this does not read, and guessing at it is the one thing
+            // it must not do.
+            Some(_) => return unreadable(),
+        }
+    }
+    if components.is_empty() || at != bytes.len() || !closed {
+        return unreadable();
+    }
+    let short = components
+        .last()
+        .expect("just checked")
+        .split('<')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    (components.join("::"), short)
+}
+
+/// The data segments as one addressable image.
+struct DataImage<'a> {
+    /// Each placed segment: where it starts, and its bytes.
+    segments: Vec<(u32, &'a [u8])>,
+}
+
+impl<'a> DataImage<'a> {
+    fn of(module: &'a Module, placements: &std::collections::BTreeMap<u32, Placement>) -> Self {
+        let mut segments = Vec::new();
+        for (index, segment) in module.datas.iter().enumerate() {
+            let base = match segment.offset {
+                Some(ConstExpr::I32(base)) => base as u32,
+                Some(_) => continue,
+                None => match placements.get(&(index as u32)) {
+                    // The placement records where a *part* of the segment went;
+                    // the segment's own start is that much earlier.
+                    Some(placement) => {
+                        match (placement.address as u32).checked_sub(placement.offset) {
+                            Some(base) => base,
+                            None => continue,
+                        }
+                    }
+                    None => continue,
+                },
+            };
+            if !segment.bytes.is_empty() {
+                segments.push((base, segment.bytes.as_slice()));
+            }
+        }
+        segments.sort_by_key(|(base, _)| *base);
+        Self { segments }
+    }
+
+    /// The bytes at an address, if a segment covers them.
+    fn bytes(&self, address: i32, length: usize) -> Option<&'a [u8]> {
+        let address = address as u32;
+        let at = self
+            .segments
+            .partition_point(|(base, _)| *base <= address)
+            .checked_sub(1)?;
+        let (base, bytes) = self.segments[at];
+        let within = (address - base) as usize;
+        bytes.get(within..within + length)
+    }
+
+    fn read32(&self, address: i32) -> Option<i32> {
+        let bytes = self.bytes(address, 4)?;
+        Some(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn holds(&self, address: i32) -> bool {
+        self.bytes(address, 1).is_some()
+    }
+
+    /// The NUL-terminated printable text at an address.
+    fn cstring(&self, address: i32) -> Option<String> {
+        let bytes = self.bytes(address, 1)?;
+        let _ = bytes;
+        let mut out = Vec::new();
+        let mut cursor = address;
+        loop {
+            let byte = *self.bytes(cursor, 1)?.first()?;
+            if byte == 0 {
+                break;
+            }
+            if !byte.is_ascii_graphic() || out.len() >= 512 {
+                return None;
+            }
+            out.push(byte);
+            cursor += 1;
+        }
+        (!out.is_empty()).then(|| String::from_utf8_lossy(&out).into_owned())
+    }
+}
+
 /// The NUL-terminated text at an address, if a data segment puts text there.
 ///
 /// This is what makes a minified module readable at all: the constants that
@@ -3637,5 +4146,255 @@ mod tests {
             ..Module::default()
         };
         assert_eq!(static_text(&module, 0), None);
+    }
+
+    // ---- the C++ RTTI, laid out by hand ----
+
+    /// Lays out an image the way the Itanium ABI does, so the rules below are
+    /// tested against a layout rather than against a module nobody can edit.
+    ///
+    /// The base is 1024 because address 0 is not a `type_info` anywhere — a null
+    /// vptr is how "no kind" is spelled, and starting at 0 would make the first
+    /// object indistinguishable from it.
+    struct Image {
+        bytes: Vec<u8>,
+    }
+
+    impl Image {
+        const BASE: i32 = 1024;
+
+        fn new() -> Self {
+            Self { bytes: Vec::new() }
+        }
+
+        fn here(&self) -> i32 {
+            Self::BASE + self.bytes.len() as i32
+        }
+
+        fn word(&mut self, value: i32) -> i32 {
+            let at = self.here();
+            self.bytes.extend_from_slice(&value.to_le_bytes());
+            at
+        }
+
+        fn text(&mut self, value: &str) -> i32 {
+            let at = self.here();
+            self.bytes.extend_from_slice(value.as_bytes());
+            self.bytes.push(0);
+            while !self.bytes.len().is_multiple_of(4) {
+                self.bytes.push(0);
+            }
+            at
+        }
+
+        /// Somewhere for a `type_info`'s vptr to point at. It has to be inside
+        /// the image — a vptr that addresses nothing is not one — and two zero
+        /// words are not a `type_info` themselves.
+        fn vtable(&mut self) -> i32 {
+            let at = self.word(0);
+            self.word(0);
+            at
+        }
+
+        /// `{vptr, name}` — a class with no base, which is what Itanium's
+        /// `__class_type_info` is.
+        fn plain(&mut self, kind: i32, name: &str) -> i32 {
+            let name_at = self.text(name);
+            let at = self.word(kind);
+            self.word(name_at);
+            at
+        }
+
+        /// `{vptr, name, base}` — `__si_class_type_info`.
+        fn derived(&mut self, kind: i32, name: &str, base: i32) -> i32 {
+            let at = self.plain(kind, name);
+            self.word(base);
+            at
+        }
+
+        fn module(self) -> Module {
+            module_with_data(Self::BASE, &self.bytes)
+        }
+    }
+
+    fn class_names(module: &Module) -> Vec<String> {
+        let (classes, _) = classes(module, &Default::default());
+        classes.into_iter().map(|class| class.name).collect()
+    }
+
+    #[test]
+    fn a_vtable_pointer_too_few_type_infos_share_is_not_one() {
+        // Two candidates agreeing on a word is two words that lined up. The
+        // floor is what separates that from a `__class_type_info` vtable, and
+        // it is the whole defence against naming a class that is not there.
+        let mut image = Image::new();
+        let kind = image.vtable();
+        image.plain(kind, "5Alpha");
+        image.plain(kind, "4Beta");
+        assert_eq!(class_names(&image.module()), Vec::<String>::new());
+
+        let mut image = Image::new();
+        let kind = image.vtable();
+        image.plain(kind, "5Alpha");
+        image.plain(kind, "4Beta");
+        image.plain(kind, "5Gamma");
+        assert_eq!(class_names(&image.module()), ["Alpha", "Beta", "Gamma"]);
+    }
+
+    #[test]
+    fn a_base_a_confirmed_class_names_is_a_class_the_count_missed() {
+        // Three derived classes confirm their kind; the base each of them points
+        // at has a kind of its own that nothing else shares, so only the base
+        // pointers can name it. That is a statement the module makes, not one
+        // this inferred.
+        let mut image = Image::new();
+        let (si, alone) = (image.vtable(), image.vtable());
+        let base = image.plain(alone, "5Shape");
+        for name in ["6Square", "6Circle", "9Rectangle"] {
+            image.derived(si, name, base);
+        }
+        let module = image.module();
+        let (classes, evidence) = classes(&module, &Default::default());
+
+        let names: Vec<&str> = classes.iter().map(|class| class.name.as_str()).collect();
+        assert_eq!(names, ["Shape", "Square", "Circle", "Rectangle"]);
+        assert_eq!(evidence.by_base, 1, "one of them the count did not reach");
+        assert_eq!(evidence.kinds, 1, "and only one kind was ever confirmed");
+        let square = classes
+            .iter()
+            .find(|class| class.name == "Square")
+            .expect("declared");
+        assert_eq!(square.base, Some(base));
+        let shape = classes
+            .iter()
+            .find(|class| class.name == "Shape")
+            .expect("named by its derived classes");
+        assert_eq!(
+            shape.base, None,
+            "one hop: an admitted class's own third word is not read as a base"
+        );
+    }
+
+    #[test]
+    fn a_kind_whose_members_carry_no_base_pointer_reads_none() {
+        // Three two-word objects are packed, so each one's third word is the
+        // next one's first. Reading that as a base would give every class in the
+        // module a bogus parent, and the last one a parent past the segment.
+        let mut image = Image::new();
+        let kind = image.vtable();
+        for name in ["5Alpha", "4Beta", "5Gamma"] {
+            image.plain(kind, name);
+        }
+        let module = image.module();
+        let (classes, evidence) = classes(&module, &Default::default());
+        assert_eq!(classes.len(), 3);
+        assert!(
+            classes.iter().all(|class| class.base.is_none()),
+            "{classes:?}"
+        );
+        assert_eq!(evidence.by_base, 0);
+    }
+
+    #[test]
+    fn a_base_pointing_inside_its_own_object_is_not_a_base() {
+        // A three-word `type_info` occupies twelve bytes, so a base pointer into
+        // those twelve is the object overlapping itself. The three that do point
+        // outside are enough to confirm the kind, which is what makes the fourth
+        // a rejection rather than a group that never formed.
+        let mut image = Image::new();
+        let (si, alone) = (image.vtable(), image.vtable());
+        let base = image.plain(alone, "5Shape");
+        for name in ["6Square", "6Circle", "9Rectangle"] {
+            image.derived(si, name, base);
+        }
+        let liar = image.here() + 8; // the object itself, past its own name
+        image.derived(si, "5Wrong", liar);
+
+        let module = image.module();
+        let (classes, _) = classes(&module, &Default::default());
+        let wrong = classes
+            .iter()
+            .find(|class| class.name == "Wrong")
+            .expect("still a class: its kind was confirmed");
+        assert_eq!(wrong.base, None, "but the word inside it is not a base");
+    }
+
+    #[test]
+    fn a_mangled_type_reads_as_far_as_it_can_and_no_further() {
+        // What it reads: source names, nesting, `St`, and a template argument
+        // list elided as a whole.
+        assert_eq!(
+            demangle_type("20WasmShimErrorHandler"),
+            (
+                "WasmShimErrorHandler".to_string(),
+                "WasmShimErrorHandler".to_string()
+            )
+        );
+        assert_eq!(
+            demangle_type("N10__cxxabiv120__si_class_type_infoE"),
+            (
+                "__cxxabiv1::__si_class_type_info".to_string(),
+                "__si_class_type_info".to_string()
+            )
+        );
+        let (name, short) =
+            demangle_type("NSt3__212basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEE");
+        assert_eq!(name, "std::__2::basic_string<…>");
+        assert_eq!(short, "basic_string", "the short name drops the arguments");
+
+        // Skipping the argument list is where this can go wrong quietly. The
+        // anonymous namespace is a *source name* holding an `N`, a substitution
+        // holds base-36 digits, and `St` is two characters with no `_` — count
+        // any of those as structure and the skip runs past the `E` that closes
+        // the name, which reads as a demangling that worked.
+        assert_eq!(
+            demangle_type(
+                "N5folly6detail30StaticSingletonManagerWithRtti3SrcINS_11ThreadLocalINS_20Single\
+                 tonThreadLocalINS_12_GLOBAL__N_120BufferedRandomDeviceENS5_9RandomTagEvS7_E7Wr\
+                 apperES7_vEES7_EE"
+            )
+            .0,
+            "folly::detail::StaticSingletonManagerWithRtti::Src<…>"
+        );
+        assert_eq!(
+            demangle_type("N5folly5tag_tIJvEEE").0,
+            "folly::tag_t<…>",
+            "`J` opens an argument pack"
+        );
+        assert_eq!(
+            demangle_type("NSt3__210__function6__baseIFvmEEE").0,
+            "std::__2::__function::__base<…>",
+            "`F` opens a function type"
+        );
+
+        // And what it refuses. A substitution refers back to a component by
+        // number; resolving one wrongly is a name that says something the
+        // module did not, so the mangled string comes back untouched.
+        for mangled in [
+            "NS_9allocatorIS1_EE", // a substitution
+            "PKc",                 // a pointer, not a class
+            "N10__cxxabiv1",       // nesting that never closes
+            "12Truncated",         // a length past the end of the string
+            "IcE",                 // arguments with nothing to attach them to
+            "3AbcE",               // an `E` with nothing open
+        ] {
+            assert_eq!(
+                demangle_type(mangled),
+                (mangled.to_string(), mangled.to_string()),
+                "{mangled} is not something this can read"
+            );
+        }
+    }
+
+    #[test]
+    fn a_type_info_whose_name_is_not_a_type_is_not_a_candidate() {
+        // `_ZTS` holds a mangled type; a word pointing at ordinary text is a
+        // word pointing at ordinary text.
+        let mut image = Image::new();
+        let kind = image.vtable();
+        for name in ["hello, world", "GET /index.html", "%s: %d\n"] {
+            image.plain(kind, name);
+        }
+        assert_eq!(class_names(&image.module()), Vec::<String>::new());
     }
 }
