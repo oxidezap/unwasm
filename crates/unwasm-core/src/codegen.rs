@@ -780,6 +780,62 @@ pub struct Options {
     /// Write `offsets.json` beside the output: which bytes of the wasm file
     /// produced each generated line.
     pub map_offsets: bool,
+    /// Leave out the bodies of functions the signature catalogue recognised.
+    ///
+    /// A library function that has been named is one whose source is already
+    /// readable somewhere else, and on a 9 MiB module it is most of the output.
+    /// The name, the signature and the cross-references stay, so the result
+    /// still compiles and the index still finds it — what goes is the body.
+    ///
+    /// For a run being *read*. Anything that calls a stub stops there, which is
+    /// why this is not the default and never applies without `signatures`.
+    pub stub_recognised: bool,
+}
+
+/// Which functions a catalogue names, by index.
+///
+/// Public because the answer is worth having on its own: `--stub-recognised`
+/// reports how much of a module it left out, and a caller deciding whether a
+/// catalogue is worth applying wants the count before the output.
+///
+/// A fingerprint that occurs twice *in this module* names nothing, for the same
+/// reason one that occurs twice in the catalogue does: the fingerprint is a
+/// deliberately coarse equivalence class, and two functions in it are two
+/// functions. And what the module says about itself always wins — a name
+/// section entry is a declaration, a fingerprint match is a guess.
+#[must_use]
+pub fn recognised_functions(
+    module: &Module,
+    signatures: &Signatures,
+) -> std::collections::BTreeMap<u32, String> {
+    let mut recognised = std::collections::BTreeMap::new();
+    if signatures.is_empty() {
+        return recognised;
+    }
+    let import_count = module.func_imports.len() as u32;
+    let mut seen: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for func in &module.funcs {
+        if func.body.len() >= analysis::FINGERPRINT_FLOOR {
+            *seen.entry(analysis::fingerprint(module, func)).or_default() += 1;
+        }
+    }
+    for (at, func) in module.funcs.iter().enumerate() {
+        if func.body.len() < analysis::FINGERPRINT_FLOOR {
+            continue;
+        }
+        let index = import_count + at as u32;
+        if module.func_name(index).is_some() {
+            continue;
+        }
+        let fingerprint = analysis::fingerprint(module, func);
+        if seen.get(&fingerprint).copied().unwrap_or_default() > 1 {
+            continue;
+        }
+        if let Some(name) = signatures.get(&fingerprint) {
+            recognised.insert(index, name.clone());
+        }
+    }
+    recognised
 }
 
 /// Generates with [`Options`].
@@ -793,6 +849,7 @@ pub fn generate_options(module: &Module, options: &Options) -> Result<Vec<Genera
     generator.signatures = options.signatures.clone();
     generator.instrument = options.instrument_stores;
     generator.map_offsets = options.map_offsets;
+    generator.stub_recognised = options.stub_recognised;
     generator.run()
 }
 
@@ -901,6 +958,8 @@ struct Generator<'a> {
     instrument: bool,
     /// Whether to build the line-to-bytes map.
     map_offsets: bool,
+    /// Whether a recognised function keeps its body.
+    stub_recognised: bool,
     /// Per function: its index, how many lines of its chunk come before its
     /// body, and the body's own line-to-bytes spans.
     spans: Vec<FunctionSpans>,
@@ -921,6 +980,7 @@ impl<'a> Generator<'a> {
             recognised: Default::default(),
             instrument: false,
             map_offsets: false,
+            stub_recognised: false,
             spans: Vec::new(),
             located: Vec::new(),
         }
@@ -961,35 +1021,7 @@ impl<'a> Generator<'a> {
     /// two functions. Deduplicating only the catalogue would put one library
     /// name on every member of the class.
     fn recognise(&mut self) {
-        if self.signatures.is_empty() {
-            return;
-        }
-        let import_count = self.module.func_imports.len() as u32;
-        let mut seen: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
-        for func in &self.module.funcs {
-            if func.body.len() >= analysis::FINGERPRINT_FLOOR {
-                *seen
-                    .entry(analysis::fingerprint(self.module, func))
-                    .or_default() += 1;
-            }
-        }
-        for (at, func) in self.module.funcs.iter().enumerate() {
-            if func.body.len() < analysis::FINGERPRINT_FLOOR {
-                continue;
-            }
-            let index = import_count + at as u32;
-            // What the module says about itself wins; this fills gaps.
-            if self.module.func_name(index).is_some() {
-                continue;
-            }
-            let fingerprint = analysis::fingerprint(self.module, func);
-            if seen.get(&fingerprint).copied().unwrap_or_default() > 1 {
-                continue;
-            }
-            if let Some(name) = self.signatures.get(&fingerprint) {
-                self.recognised.insert(index, name.clone());
-            }
-        }
+        self.recognised = recognised_functions(self.module, &self.signatures);
     }
 
     fn run(mut self) -> Result<Vec<GeneratedFile>> {
@@ -2362,7 +2394,16 @@ impl<'a> Generator<'a> {
             return_type(ty)
         );
 
-        let asked_for = self.only.as_ref().is_none_or(|only| only.contains(&index));
+        // A recognised function is left out first: `--stub-recognised` says the
+        // body is already readable under its own name somewhere else, and that
+        // is a different reason from `--only`, so the stub says which.
+        let library = self
+            .stub_recognised
+            .then(|| self.recognised.get(&index))
+            .flatten()
+            .cloned();
+        let asked_for =
+            library.is_none() && self.only.as_ref().is_none_or(|only| only.contains(&index));
         if asked_for {
             // The body's lines start after everything written above.
             let before_body = out.matches('\n').count();
@@ -2382,10 +2423,16 @@ impl<'a> Generator<'a> {
             // Not decompiled, and saying so rather than looking decompiled. The
             // signature and the name stay, so callers still compile and the
             // index still finds it.
-            let _ = writeln!(
-                out,
-                "        unimplemented!(\"function #{index} was not decompiled: --only\")"
-            );
+            let _ = match &library {
+                Some(name) => writeln!(
+                    out,
+                    "        unimplemented!(\"function #{index} is `{name}`, left out by --stub-recognised\")"
+                ),
+                None => writeln!(
+                    out,
+                    "        unimplemented!(\"function #{index} was not decompiled: --only\")"
+                ),
+            };
         }
         out.push_str("    }\n\n");
         Ok(out)

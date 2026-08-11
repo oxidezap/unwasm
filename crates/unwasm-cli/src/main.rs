@@ -16,7 +16,7 @@ unwasm — a WebAssembly decompiler whose output compiles
 usage:
   unwasm decompile <module.wasm> [-o <out>] [--split <n>] [--only <indices>]
                    [--reachable-from <indices>] [--signatures <file>]
-                   [--instrument-stores] [--offsets]
+                   [--stub-recognised] [--instrument-stores] [--offsets]
   unwasm host      <module.wasm> [-o <host.rs>] [--defaults]
   unwasm table     <module.wasm> [--type <signature>]
   unwasm calls     <module.wasm> <index>
@@ -44,6 +44,9 @@ usage:
   --direct-only  with --reachable-from: follow direct calls only. Smaller and
                  incomplete; a stub it reaches says which function to add
   --signatures <file>  name library code using a catalogue from `signatures`
+  --stub-recognised  with --signatures: leave the bodies of the functions the
+                 catalogue named out, keeping their names and signatures. For
+                 reading, not running — anything that calls one stops there
   --instrument-stores  route every memory write through the watchpoint runtime,
                  so `instance.memory.watch(addr, len)` reports who wrote it
   --offsets      also write offsets.json: which wasm bytes made each line,
@@ -146,6 +149,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
     let mut reachable_from: Vec<u32> = Vec::new();
     let mut direct_only = false;
     let mut instrument = false;
+    let mut stub_recognised = false;
     let mut map_offsets = false;
     let mut rest = arguments[1..].iter();
     while let Some(argument) = rest.next() {
@@ -183,6 +187,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
                 }
             }
             "--instrument-stores" => instrument = true,
+            "--stub-recognised" => stub_recognised = true,
             "--offsets" => map_offsets = true,
             "--only" => {
                 let value = rest.next().ok_or("--only needs a list of indices")?;
@@ -248,6 +253,21 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
         only.extend(callees);
     }
 
+    // A catalogue is the only thing that recognises anything, so asking to
+    // leave the recognised out without one leaves nothing out — and would
+    // report success having done nothing.
+    if stub_recognised && catalogue.is_none() {
+        return Err(
+            "--stub-recognised needs --signatures: without a catalogue nothing is recognised"
+                .to_string(),
+        );
+    }
+    let stubbed = if stub_recognised {
+        codegen::recognised_functions(&module, catalogue.as_ref().expect("just checked")).len()
+    } else {
+        0
+    };
+
     let Some(destination) = destination else {
         if split.is_some() {
             return Err("--split writes several files, so it needs -o <directory>".to_string());
@@ -269,6 +289,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
                 signatures: catalogue.clone().unwrap_or_default(),
                 instrument_stores: instrument,
                 map_offsets,
+                stub_recognised,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -296,6 +317,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
             signatures: catalogue.unwrap_or_default(),
             instrument_stores: instrument,
             map_offsets,
+            stub_recognised,
         },
     )
     .map_err(|error| error.to_string())?;
@@ -305,6 +327,14 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
     // rustc parses that recursively: past a couple of thousand blocks it
     // overflows its stack and dies with SIGSEGV, which reads as a compiler bug
     // rather than as a file that needs a bigger stack to parse.
+    let stubbed = if stubbed > 0 {
+        format!(
+            "left {stubbed} of {} functions out as recognised library code\n",
+            module.funcs.len()
+        )
+    } else {
+        String::new()
+    };
     let note = match unwasm_core::analysis::deepest_nesting(&module) {
         Some((func, depth)) if depth > unwasm_core::analysis::NESTING_RUSTC_HANDLES => format!(
             "note: function #{func} nests {depth} blocks, and rustc parses nesting \
@@ -320,7 +350,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
         std::fs::write(&destination, &files[0].contents)
             .map_err(|error| format!("writing {destination}: {error}"))?;
         return Ok(format!(
-            "wrote {destination} ({} lines, {} functions)\n{note}",
+            "wrote {destination} ({} lines, {} functions)\n{stubbed}{note}",
             files[0].contents.lines().count(),
             module.funcs.len()
         ));
@@ -335,7 +365,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
             .map_err(|error| format!("writing {}: {error}", at.display()))?;
     }
     Ok(format!(
-        "wrote {destination}/ ({} Rust files plus names.json, {lines} lines, {} functions)\n{note}",
+        "wrote {destination}/ ({} Rust files plus names.json, {lines} lines, {} functions)\n{stubbed}{note}",
         files.len() - 1,
         module.funcs.len()
     ))

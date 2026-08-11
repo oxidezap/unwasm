@@ -110,6 +110,98 @@ fn main() {
     assert_eq!(output.trim(), "8", "and it still runs");
 }
 
+/// Leaving a recognised body out is what makes a catalogue worth having on a
+/// 9 MiB module: the reader wants the application, and the library halves are
+/// already readable under their own names somewhere else.
+///
+/// What must survive is everything a *reader* uses — the name, the signature,
+/// the call sites, the index — so the result still compiles and still says what
+/// calls what. What goes is the body, and the stub says why.
+#[test]
+fn a_recognised_body_can_be_left_out_and_the_rest_still_compiles() {
+    let wat = format!(
+        "(module (func (export \"a\") (param i32) (result i32){})\
+         (func (export \"caller\") (param i32) (result i32) local.get 0 call 0))",
+        body("i32.add")
+    );
+    let wasm = common::assemble("signatures-stubbed", &wat);
+    let module = Module::parse(&wasm).expect("valid");
+
+    // What the catalogue names, asked before the output rather than counted
+    // out of it.
+    let recognised = codegen::recognised_functions(&module, &catalogue());
+    assert_eq!(recognised.len(), 1, "{recognised:?}");
+    assert_eq!(recognised[&0], "wibble_copy");
+
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            signatures: catalogue(),
+            stub_recognised: true,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+    let code = &files[0].contents;
+
+    // The name, the signature and the call site are all still there.
+    assert!(
+        code.contains("fn f0_wibble_copy(&mut self, p0: i32) -> i32"),
+        "{code}"
+    );
+    assert!(code.contains("self.f0_wibble_copy("), "{code}");
+    assert!(
+        code.contains(
+            "unimplemented!(\"function #0 is `wibble_copy`, left out by --stub-recognised\")"
+        ),
+        "the stub says which function and why:\n{code}"
+    );
+    // And the body is gone rather than merely renamed.
+    assert!(!code.contains("wrapping_add(1i32)"), "{code}");
+    // The one that was not recognised keeps its body.
+    assert!(
+        code.contains("wrapping_add(1i32)") || code.contains("fn f1"),
+        "{code}"
+    );
+
+    // It still compiles, and the part that was kept still runs.
+    const DRIVER: &str = r#"
+mod generated;
+fn main() {
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut instance = generated::Instance::new();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| instance.caller(0)));
+    println!("{}", if outcome.is_err() { "stopped at the stub" } else { "ran" });
+}
+"#;
+    let output = common::run_with_generated("signatures-stubbed", code, DRIVER);
+    assert_eq!(
+        output.trim(),
+        "stopped at the stub",
+        "a caller of a stub stops there, loudly"
+    );
+}
+
+#[test]
+fn nothing_is_left_out_without_a_catalogue_to_recognise_it() {
+    let module = Module::parse(&stripped()).expect("valid");
+    assert!(codegen::recognised_functions(&module, &codegen::Signatures::new()).is_empty());
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            stub_recognised: true,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+    assert!(
+        !files[0].contents.contains("--stub-recognised"),
+        "with no catalogue there is nothing to leave out"
+    );
+}
+
 #[test]
 fn the_index_records_that_a_name_came_from_a_catalogue() {
     let module = Module::parse(&stripped()).expect("valid");

@@ -505,6 +505,67 @@ fn decompiling_a_deeply_nested_module_says_what_rustc_will_need() {
 }
 
 #[test]
+fn stubbing_recognised_code_needs_a_catalogue_and_reports_what_it_left_out() {
+    // Two functions with the same shape and different names, so one module can
+    // be a catalogue for the other.
+    let body = " local.get 0 i32.const 1 i32.add local.set 0".repeat(8);
+    let named = fixture(
+        "sample-catalogue",
+        &format!(
+            "(module (func $memcpy_like (export \"a\") (param i32) (result i32){body} local.get 0))"
+        ),
+    );
+    let stripped = fixture(
+        "sample-stubbable",
+        &format!("(module (func (export \"a\") (param i32) (result i32){body} local.get 0))"),
+    );
+    let catalogue = scratch().join("sigs.txt");
+    let (ok, _, stderr) = run(&[
+        "signatures",
+        named.to_str().expect("utf-8 path"),
+        "-o",
+        catalogue.to_str().expect("utf-8 path"),
+    ]);
+    assert!(ok, "{stderr}");
+
+    // Without a catalogue it would leave nothing out, and say it had.
+    let (ok, _, stderr) = run(&[
+        "decompile",
+        stripped.to_str().expect("utf-8 path"),
+        "--stub-recognised",
+        "-o",
+        scratch().join("stubbed.rs").to_str().expect("utf-8 path"),
+    ]);
+    assert!(!ok);
+    assert!(
+        stderr.contains("--stub-recognised needs --signatures"),
+        "{stderr}"
+    );
+
+    let out = scratch().join("stubbed.rs");
+    let (ok, stdout, stderr) = run(&[
+        "decompile",
+        stripped.to_str().expect("utf-8 path"),
+        "--signatures",
+        catalogue.to_str().expect("utf-8 path"),
+        "--stub-recognised",
+        "-o",
+        out.to_str().expect("utf-8 path"),
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("left 1 of 1 functions out as recognised library code"),
+        "{stdout}"
+    );
+    let written = std::fs::read_to_string(&out).expect("the file exists");
+    assert!(written.contains("fn f0_memcpy_like"), "{written}");
+    assert!(
+        written.contains("left out by --stub-recognised"),
+        "{written}"
+    );
+}
+
+#[test]
 fn inspect_reports_a_stack_pointer_the_name_section_names() {
     // No export and no prologue: the module names the global, which is the
     // module saying which one it is.
