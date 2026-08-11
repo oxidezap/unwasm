@@ -398,6 +398,7 @@ fn known_import(field: &str, ty: &crate::module::FuncType) -> Option<&'static st
         // when `Atomics.waitAsync` is unavailable — the comment there says so
         // — and that is the branch this is.
         ("_emscripten_thread_cleanup", "i->")
+        | ("__emscripten_thread_cleanup", "i->")
         | ("_emscripten_thread_set_strongref", "i->")
         | ("_emscripten_thread_mailbox_await", "i->") => "()",
         ("abort", "->") => "rt::trap(\"the module called abort\")",
@@ -618,6 +619,9 @@ pub fn generate_host_with(module: &Module, defaults: bool) -> Result<String> {
             || analysis
                 .init_main_thread
                 .is_some_and(|init| init.import == index as u32)
+            || analysis
+                .mmap
+                .is_some_and(|mmap| [mmap.map, mmap.sync, mmap.unmap].contains(&Some(index as u32)))
         {
             continue;
         }
@@ -1320,6 +1324,10 @@ impl<'a> Generator<'a> {
                 .analysis
                 .init_main_thread
                 .is_some_and(|init| init.import == index as u32)
+            || self
+                .analysis
+                .mmap
+                .is_some_and(|mmap| [mmap.map, mmap.sync, mmap.unmap].contains(&Some(index as u32)))
     }
 
     fn imports_trait(&mut self) {
@@ -1575,6 +1583,9 @@ impl<'a> Generator<'a> {
 
         self.export_wrappers();
         self.import_thunks();
+        if let Some(mmap) = self.analysis.mmap {
+            self.mmap_trampolines(mmap);
+        }
         self.indirect_dispatchers()?;
         // Closes the `impl` block, and emits the functions either inside it or
         // into part files beside it.
@@ -1791,6 +1802,11 @@ impl<'a> Generator<'a> {
                 self.init_main_thread_trampoline(init);
                 continue;
             }
+            // The `mmap` family is emitted as a group, since the three share
+            // the allocator and the scratch they read an iovec out of.
+            if self.is_generated(index) {
+                continue;
+            }
             let args: Vec<String> = (0..ty.params.len()).map(|at| format!("p{at}")).collect();
             // The caller is the first argument, so the rest need the comma the
             // trait signature already carries.
@@ -1808,6 +1824,148 @@ impl<'a> Generator<'a> {
                 return_type(ty),
                 import_ident(import.module.as_str(), import.field.as_str()),
                 rest
+            );
+        }
+    }
+
+    /// A memory write from a trampoline, instrumented like every other one.
+    ///
+    /// The site is the import's own index, so `memory.watch` names the
+    /// trampoline rather than reporting a write nothing accounts for.
+    fn trampoline_store(&self, index: u32) -> String {
+        if self.instrument {
+            format!("store32_at({index}, 0, ")
+        } else {
+            "store32(".to_string()
+        }
+    }
+
+    /// The `mmap` family, generated rather than asked of the host.
+    ///
+    /// Emscripten's glue answers `__mmap_js` out of the module's *own*
+    /// allocator and then reads the file into what it got back. A host cannot
+    /// do either: it has no way to ask the guest for memory, and no way to call
+    /// back into it. So this is generated, like the pthread glue and for the
+    /// same reason — every part of it is already here.
+    ///
+    /// The order is the glue's: allocate a page-aligned mapping, zero it, read
+    /// the file into it through the host's own `fd_pread`, and report the
+    /// address and that it was allocated. `msync` writes the range back through
+    /// `fd_pwrite`, and `munmap` is `msync` when the mapping was writable and
+    /// nothing otherwise — the *freeing* is musl's, not the glue's, so this
+    /// does not free the mapping.
+    ///
+    /// The read goes through the host rather than around it. Inventing the
+    /// contents would put a page of zeros where a file was and call it a
+    /// mapping, and nothing downstream could tell.
+    fn mmap_trampolines(&mut self, mmap: crate::analysis::Mmap) {
+        let memalign = function_ident_with(mmap.memalign, &self.analysis, &self.recognised);
+        let free = function_ident_with(mmap.free, &self.analysis, &self.recognised);
+        let import_method = |index: u32| {
+            let import = &self.module.func_imports[index as usize];
+            import_ident(&import.module, &import.field)
+        };
+        let pread = import_method(mmap.pread);
+
+        if let Some(index) = mmap.map {
+            let store = self.trampoline_store(index);
+            let _ = writeln!(
+                self.out,
+                "    /// `env::_mmap_js`, generated: the mapping comes out of the module's\n\
+                 \x20   /// own allocator and the file comes through the host's own `fd_pread`.\n\
+                 \x20   ///\n\
+                 \x20   /// `(len, prot, flags, fd, offset, allocated_out, addr_out) -> errno`.\n\
+                 \x20   /// The protection and the flags decide nothing here: this filesystem\n\
+                 \x20   /// has no shared mappings, so every mapping is a private copy.\n\
+                 \x20   pub(crate) fn f{index}(&mut self, p0: i32, p1: i32, p2: i32, p3: i32, p4: i64, p5: i32, p6: i32) -> i32 {{\n\
+                 \x20       let _ = (p1, p2);\n\
+                 \x20       let mapped = self.{memalign}(65536, p0);\n\
+                 \x20       if mapped == 0 {{\n\
+                 \x20           return -48;\n\
+                 \x20       }}\n\
+                 \x20       self.memory.fill(mapped, 0, p0);\n\
+                 \x20       // An iovec and a place for the count, because `fd_pread` reads\n\
+                 \x20       // both out of guest memory — the same way the guest would have\n\
+                 \x20       // had to hand them over.\n\
+                 \x20       let scratch = self.{memalign}(4, 12);\n\
+                 \x20       if scratch == 0 {{\n\
+                 \x20           self.{free}(mapped);\n\
+                 \x20           return -48;\n\
+                 \x20       }}\n\
+                 \x20       self.memory.{store}scratch, 0, i64::from(mapped));\n\
+                 \x20       self.memory.{store}scratch, 4, i64::from(p0));\n\
+                 \x20       {{\n\
+                 \x20           let mut caller = rt::Caller {{\n\
+                 \x20               memory: &mut self.memory,\n\
+                 \x20           }};\n\
+                 \x20           self.host.{pread}(&mut caller, p3, scratch, 1, p4, scratch + 8);\n\
+                 \x20       }}\n\
+                 \x20       self.{free}(scratch);\n\
+                 \x20       self.memory.{store}p5, 0, 1i64);\n\
+                 \x20       self.memory.{store}p6, 0, i64::from(mapped));\n\
+                 \x20       0\n\
+                 \x20   }}\n"
+            );
+        }
+
+        let Some(pwrite) = mmap.pwrite.map(import_method) else {
+            return;
+        };
+        let write_back = |index: u32, store: &str, guard: &str| {
+            format!(
+                "{guard}\
+                 \x20       let scratch = self.{memalign}(4, 12);\n\
+                 \x20       if scratch == 0 {{\n\
+                 \x20           return -48;\n\
+                 \x20       }}\n\
+                 \x20       self.memory.{store}scratch, 0, i64::from(p0));\n\
+                 \x20       self.memory.{store}scratch, 4, i64::from(p1));\n\
+                 \x20       {{\n\
+                 \x20           let mut caller = rt::Caller {{\n\
+                 \x20               memory: &mut self.memory,\n\
+                 \x20           }};\n\
+                 \x20           self.host.{pwrite}(&mut caller, p4, scratch, 1, p5, scratch + 8);\n\
+                 \x20       }}\n\
+                 \x20       self.{free}(scratch);\n\
+                 \x20       let _ = {index};\n"
+            )
+        };
+
+        if let Some(index) = mmap.sync {
+            let store = self.trampoline_store(index);
+            let body = write_back(index, &store, "        let _ = (p2, p3);\n");
+            let _ = writeln!(
+                self.out,
+                "    /// `env::_msync_js`, generated: the mapped range goes back to the file\n\
+                 \x20   /// through the host's own `fd_pwrite`.\n\
+                 \x20   ///\n\
+                 \x20   /// `(addr, len, prot, flags, fd, offset) -> errno`.\n\
+                 \x20   pub(crate) fn f{index}(&mut self, p0: i32, p1: i32, p2: i32, p3: i32, p4: i32, p5: i64) -> i32 {{\n{body}\
+                 \x20       0\n\
+                 \x20   }}\n"
+            );
+        }
+
+        if let Some(index) = mmap.unmap {
+            let store = self.trampoline_store(index);
+            // `PROT_WRITE` is 2. A read-only mapping has nothing to write back,
+            // and the mapping itself is freed by musl rather than here.
+            let body = write_back(
+                index,
+                &store,
+                "        if p2 & 2 == 0 {\n            return 0;\n        }\n",
+            );
+            let _ = writeln!(
+                self.out,
+                "    /// `env::_munmap_js`, generated: a writable mapping is written back,\n\
+                 \x20   /// and a read-only one has nothing to do. The mapping is freed by\n\
+                 \x20   /// the module's own `munmap`, not here — which is where the glue\n\
+                 \x20   /// frees it too.\n\
+                 \x20   ///\n\
+                 \x20   /// `(addr, len, prot, flags, fd, offset) -> errno`.\n\
+                 \x20   pub(crate) fn f{index}(&mut self, p0: i32, p1: i32, p2: i32, p3: i32, p4: i32, p5: i64) -> i32 {{\n{body}\
+                 \x20       0\n\
+                 \x20   }}\n"
             );
         }
     }

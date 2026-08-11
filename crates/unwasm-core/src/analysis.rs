@@ -238,6 +238,83 @@ pub struct Spawn {
     pub entry_type: u32,
 }
 
+/// The `mmap` family, when the module supplies everything they need.
+///
+/// Emscripten's glue answers `__mmap_js` by allocating with the module's *own*
+/// allocator and reading the file into it — so it reaches back into the
+/// instance, which is what makes it something to generate rather than to ask a
+/// host for. Same shape as the pthread glue: the parts are named, checked, and
+/// if any is missing the import stays the host's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mmap {
+    /// `env::_mmap_js`, if the module imports it.
+    pub map: Option<u32>,
+    /// `env::_munmap_js`.
+    pub unmap: Option<u32>,
+    /// `env::_msync_js`.
+    pub sync: Option<u32>,
+    /// The exported `emscripten_builtin_memalign`, which is where the mapping
+    /// comes from. Without it there is nowhere to put a file.
+    pub memalign: u32,
+    /// The exported `free`, which releases the scratch an iovec needs and the
+    /// mapping `munmap` gives back.
+    pub free: u32,
+    /// The imported `fd_pread`, which is how the bytes get in. A mapping
+    /// invented without reading the file is a page of zeros presented as a
+    /// file, which is worse than saying it is not written.
+    pub pread: u32,
+    /// The imported `fd_pwrite`, which is how `msync` gets them out.
+    pub pwrite: Option<u32>,
+}
+
+/// Finds the `mmap` glue, if every part of it is there.
+fn find_mmap(module: &Module) -> Option<Mmap> {
+    let import = |field: &str, params: &[ValType], results: &[ValType]| -> Option<u32> {
+        let at = module
+            .func_imports
+            .iter()
+            .position(|import| import.field == field)? as u32;
+        let ty = module
+            .types
+            .get(module.func_imports[at as usize].type_index as usize)?;
+        (ty.params == params && ty.results == results).then_some(at)
+    };
+    use ValType::{I32, I64};
+
+    // `__mmap_js(len, prot, flags, fd, offset, allocated, addr) -> errno`, and
+    // the two that unwind it. A different shape is a different function, and
+    // reading the wrong argument as a file descriptor is exactly the kind of
+    // mistake a signature check exists to stop.
+    let map = import("_mmap_js", &[I32, I32, I32, I32, I64, I32, I32], &[I32]);
+    let unmap = import("_munmap_js", &[I32, I32, I32, I32, I32, I64], &[I32]);
+    let sync = import("_msync_js", &[I32, I32, I32, I32, I32, I64], &[I32]);
+    if map.is_none() && unmap.is_none() && sync.is_none() {
+        return None;
+    }
+
+    let memalign = find_export(module, &["emscripten_builtin_memalign", "memalign"])?;
+    let free = find_export(module, &["free"])?;
+    if func_type_of(module, memalign)?.params != vec![I32, I32]
+        || func_type_of(module, memalign)?.results != vec![I32]
+        || func_type_of(module, free)?.params != vec![I32]
+        || !func_type_of(module, free)?.results.is_empty()
+    {
+        return None;
+    }
+    let pread = import("fd_pread", &[I32, I32, I32, I64, I32], &[I32])?;
+    let pwrite = import("fd_pwrite", &[I32, I32, I32, I64, I32], &[I32]);
+
+    Some(Mmap {
+        map,
+        unmap,
+        sync,
+        memalign,
+        free,
+        pread,
+        pwrite,
+    })
+}
+
 /// `__emscripten_init_main_thread_js`, which is the main thread's version of
 /// what a worker does before it runs anything.
 ///
@@ -500,6 +577,9 @@ pub struct Analysis {
     pub spawn: Option<Spawn>,
     /// The main thread's own initialisation, when the module asks for it.
     pub init_main_thread: Option<InitMainThread>,
+    /// The `mmap` glue, when the module supplies the allocator and the reads
+    /// it needs.
+    pub mmap: Option<Mmap>,
     /// Where each passive data segment is placed, by segment index, when the
     /// module places it at a constant address.
     pub placements: std::collections::BTreeMap<u32, Placement>,
@@ -613,6 +693,7 @@ pub fn analyse(module: &Module) -> Analysis {
         registrations: find_registrations(module, &placements),
         spawn: find_spawn(module),
         init_main_thread: find_init_main_thread(module),
+        mmap: find_mmap(module),
         table: read_table(module),
         hot_addresses: find_hot_addresses(module, &placements),
         call_graph: read_call_graph(module),

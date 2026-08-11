@@ -281,9 +281,16 @@ fn the_voip_module_generates_all_of_its_trampolines() {
     // Counting only the `invoke_*` ones was right until those were added, and
     // this assertion has been off by exactly two ever since. Nothing caught it
     // because no documented command runs this tier.
+    let mmap = analysis.mmap.map_or(0, |mmap| {
+        [mmap.map, mmap.sync, mmap.unmap]
+            .iter()
+            .filter(|import| import.is_some())
+            .count()
+    });
     let generated = named
         + usize::from(analysis.spawn.is_some())
-        + usize::from(analysis.init_main_thread.is_some());
+        + usize::from(analysis.init_main_thread.is_some())
+        + mmap;
 
     let code = codegen::generate(&module).expect("generates");
     let asked_of_the_host = code
@@ -599,4 +606,183 @@ fn a_threaded_module_asks_its_host_to_cross_threads() {
         !host.contains("__pthread_create_js"),
         "the trampoline is generated, not asked for"
     );
+}
+
+/// `mmap` reaches back into the instance, so it is generated — and this runs it.
+///
+/// The fixture is the shape a real module has: it imports the three `*_js`
+/// hooks and `fd_pread`/`fd_pwrite`, and exports a bump allocator called
+/// `emscripten_builtin_memalign` and a `free`. What the trampoline has to do is
+/// ask *that* allocator for the mapping and the host for the bytes, which is
+/// the part no host could have done for itself.
+const MMAP_MODULE: &str = r#"(module
+    (import "env" "_mmap_js" (func $mmap (param i32 i32 i32 i32 i64 i32 i32) (result i32)))
+    (import "env" "_msync_js" (func $msync (param i32 i32 i32 i32 i32 i64) (result i32)))
+    (import "env" "_munmap_js" (func $munmap (param i32 i32 i32 i32 i32 i64) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_pread"
+        (func (param i32 i32 i32 i64 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_pwrite"
+        (func (param i32 i32 i32 i64 i32) (result i32)))
+    (memory (export "memory") 2)
+    (global $next (mut i32) (i32.const 1024))
+
+    ;; A bump allocator, aligned up to the alignment asked for.
+    (func $memalign (export "emscripten_builtin_memalign") (param i32 i32) (result i32)
+        (local $at i32)
+        global.get $next
+        local.get 0
+        i32.add
+        i32.const 1
+        i32.sub
+        local.get 0
+        i32.const 1
+        i32.sub
+        i32.const -1
+        i32.xor
+        i32.and
+        local.set $at
+        local.get $at
+        local.get 1
+        i32.add
+        global.set $next
+        local.get $at)
+    (func (export "free") (param i32))
+
+    ;; Map 8 bytes of fd 4 at offset 0 and return the first four of them.
+    (func (export "map_and_read") (result i32)
+        (local $out i32)
+        i32.const 8 i32.const 3 i32.const 1 i32.const 4 i64.const 0
+        i32.const 512 i32.const 516
+        call $mmap
+        drop
+        i32.const 516
+        i32.load
+        local.set $out
+        local.get $out
+        i32.load)
+
+    ;; And where it landed, plus whether the host said it was allocated.
+    (func (export "mapped_at") (result i32) i32.const 516 i32.load)
+    (func (export "allocated") (result i32) i32.const 512 i32.load)
+
+    ;; Write the mapping back through msync.
+    (func (export "sync_back") (param i32) (result i32)
+        i32.const 516 i32.load
+        local.get 0
+        i32.store
+        i32.const 516 i32.load
+        i32.const 8
+        i32.const 3
+        i32.const 1
+        i32.const 4
+        i64.const 0
+        call $msync)
+    (func (export "unmap_readonly") (result i32)
+        i32.const 516 i32.load i32.const 8 i32.const 1 i32.const 1 i32.const 4 i64.const 0
+        call $munmap))"#;
+
+#[test]
+fn the_generated_mmap_asks_the_guest_for_memory_and_the_host_for_the_bytes() {
+    let wasm = common::assemble("mmap", MMAP_MODULE);
+    let module = Module::parse(&wasm).expect("valid");
+    let analysis = analysis::analyse(&module);
+    let mmap = analysis.mmap.expect("every part of the glue is here");
+    assert_eq!(mmap.map, Some(0));
+    assert_eq!(mmap.sync, Some(1));
+    assert_eq!(mmap.unmap, Some(2));
+
+    // None of the three is asked of the host.
+    let skeleton = codegen::generate_host(&module).expect("generates");
+    for absent in ["fn env__mmap_js", "fn env__msync_js", "fn env__munmap_js"] {
+        assert!(
+            !skeleton.contains(absent),
+            "{absent} should be generated rather than asked for"
+        );
+    }
+    assert!(
+        skeleton.contains("fn wasi_snapshot_preview1_fd_pread"),
+        "but the read is still the host's"
+    );
+
+    const DRIVER: &str = r#"
+mod generated;
+use generated::Imports;
+
+/// A host with one file, served through `fd_pread` and written by `fd_pwrite`.
+#[derive(Default)]
+struct Host { file: Vec<u8> }
+
+impl generated::Imports for Host {
+    fn wasi_snapshot_preview1_fd_pread(
+        &mut self,
+        caller: &mut generated::rt::Caller<'_>,
+        _fd: i32, iovs: i32, _count: i32, offset: i64, read: i32,
+    ) -> i32 {
+        let at = caller.read_i32(iovs);
+        let len = caller.read_i32(iovs + 4) as usize;
+        let from = offset as usize;
+        let taken = self.file[from.min(self.file.len())..].len().min(len);
+        let bytes = self.file[from..from + taken].to_vec();
+        caller.write(at, &bytes);
+        caller.write_i32(read, taken as i32);
+        0
+    }
+    fn wasi_snapshot_preview1_fd_pwrite(
+        &mut self,
+        caller: &mut generated::rt::Caller<'_>,
+        _fd: i32, iovs: i32, _count: i32, offset: i64, written: i32,
+    ) -> i32 {
+        let at = caller.read_i32(iovs);
+        let len = caller.read_i32(iovs + 4);
+        let bytes = caller.bytes(at, len);
+        let from = offset as usize;
+        if self.file.len() < from + bytes.len() { self.file.resize(from + bytes.len(), 0); }
+        self.file[from..from + bytes.len()].copy_from_slice(&bytes);
+        caller.write_i32(written, len);
+        0
+    }
+}
+
+fn main() {
+    let host = Host { file: vec![0x78, 0x56, 0x34, 0x12, 9, 9, 9, 9] };
+    let mut instance = generated::Instance::with_host(host);
+    println!("read {:#x}", instance.map_and_read());
+    println!("allocated {}", instance.allocated());
+    // The mapping is a page-aligned address the *guest's* allocator gave out.
+    println!("aligned {}", instance.mapped_at() % 65536 == 0);
+    // Writing it back reaches the host's file.
+    println!("sync {}", instance.sync_back(0x11223344));
+    println!("file {:#x}", u32::from_le_bytes(instance.host.file[..4].try_into().unwrap()));
+    // A read-only unmap writes nothing back.
+    instance.host.file[0] = 0xEE;
+    println!("unmap {}", instance.unmap_readonly());
+    println!("untouched {:#x}", instance.host.file[0]);
+}
+"#;
+    let output = common::run_with_driver("mmap", &wasm, DRIVER);
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines[0], "read 0x12345678", "the file reached the mapping");
+    assert_eq!(lines[1], "allocated 1");
+    assert_eq!(lines[2], "aligned true");
+    assert_eq!(lines[3], "sync 0");
+    assert_eq!(lines[4], "file 0x11223344", "and msync reached the file");
+    assert_eq!(lines[5], "unmap 0");
+    assert_eq!(
+        lines[6], "untouched 0xee",
+        "a read-only unmap writes nothing back"
+    );
+}
+
+#[test]
+fn without_an_allocator_the_mmap_glue_stays_the_hosts() {
+    // The mapping has to come from somewhere. A module that imports the hooks
+    // but exports no allocator gets `todo!()`, not a mapping out of thin air.
+    let wat = MMAP_MODULE
+        .replace("(export \"emscripten_builtin_memalign\")", "")
+        .replace("(func (export \"free\") (param i32))", "(func (param i32))");
+    let wasm = common::assemble("mmap-noalloc", &wat);
+    let module = Module::parse(&wasm).expect("valid");
+    assert!(analysis::analyse(&module).mmap.is_none());
+    let skeleton = codegen::generate_host(&module).expect("generates");
+    assert!(skeleton.contains(r#"todo!("env::_mmap_js")"#), "{skeleton}");
 }

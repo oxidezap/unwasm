@@ -292,14 +292,21 @@ fn the_voip_module_leaves_every_import_that_is_not_a_trampoline() {
     let implementation = imports_impl(&skeleton);
     let methods = trait_methods(implementation);
 
-    // Stated as the arithmetic rather than as a number read off a run: 242
-    // imports, 136 of them generated — 134 `invoke_*` plus the two that have to
-    // reach back into the instance — and the host is asked for the other 106. A
-    // capture that rolls changes both sides together, which a bare
-    // `assert_eq!(methods, 106)` would not have said.
+    // Stated as the arithmetic rather than as a number read off a run: every
+    // import is either generated — 134 `invoke_*`, the two pthread ones and the
+    // three `mmap` ones, all of which have to reach back into the instance — or
+    // asked of the host. A capture that rolls changes both sides together,
+    // which a bare `assert_eq!(methods, 103)` would not have said.
+    let mmap = analysis.mmap.map_or(0, |mmap| {
+        [mmap.map, mmap.sync, mmap.unmap]
+            .iter()
+            .filter(|import| import.is_some())
+            .count()
+    });
     let generated = analysis.invokes.len()
         + usize::from(analysis.spawn.is_some())
-        + usize::from(analysis.init_main_thread.is_some());
+        + usize::from(analysis.init_main_thread.is_some())
+        + mmap;
     assert_eq!(
         methods,
         module.func_imports.len() - generated,
