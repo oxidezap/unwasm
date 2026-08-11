@@ -786,3 +786,105 @@ fn without_an_allocator_the_mmap_glue_stays_the_hosts() {
     let skeleton = codegen::generate_host(&module).expect("generates");
     assert!(skeleton.contains(r#"todo!("env::_mmap_js")"#), "{skeleton}");
 }
+
+/// Without `fd_pwrite` there is no way to write a mapping back, so those two
+/// stay the host's — and the output still compiles, which is the property the
+/// whole project rests on.
+///
+/// Claiming an import is generated and then not generating it leaves a call to
+/// a method that does not exist. That is the one failure mode this codebase
+/// treats as equal in severity to emitting the wrong arithmetic.
+#[test]
+fn without_fd_pwrite_only_the_mapping_is_generated() {
+    let wat = MMAP_MODULE.replace(
+        "    (import \"wasi_snapshot_preview1\" \"fd_pwrite\"\n        (func (param i32 i32 i32 i64 i32) (result i32)))\n",
+        "",
+    );
+    let wasm = common::assemble("mmap-nopwrite", &wat);
+    let module = Module::parse(&wasm).expect("valid");
+    let mmap = analysis::analyse(&module)
+        .mmap
+        .expect("the mapping is still there");
+    assert!(mmap.map.is_some());
+    assert_eq!(mmap.sync, None, "nothing to write back with");
+    assert_eq!(mmap.unmap, None);
+
+    // So the host is asked for the two that were not generated...
+    let skeleton = codegen::generate_host(&module).expect("generates");
+    assert!(
+        skeleton.contains(r#"todo!("env::_msync_js")"#),
+        "{skeleton}"
+    );
+    assert!(
+        skeleton.contains(r#"todo!("env::_munmap_js")"#),
+        "{skeleton}"
+    );
+    assert!(!skeleton.contains("fn env__mmap_js"), "{skeleton}");
+    // ...and what came out compiles.
+    common::assert_compiles("mmap-nopwrite", &wasm);
+}
+
+/// A read that failed is not a mapping.
+///
+/// Reporting success would hand the guest a page of zeros as the file's
+/// contents, which is precisely the outcome the trampoline exists to avoid.
+#[test]
+fn a_mapping_whose_read_failed_is_an_error_rather_than_a_page_of_zeros() {
+    let wasm = common::assemble("mmap-failing", MMAP_MODULE);
+    const DRIVER: &str = r#"
+mod generated;
+
+#[derive(Default)]
+struct Host;
+
+impl generated::Imports for Host {
+    fn wasi_snapshot_preview1_fd_pread(
+        &mut self,
+        _caller: &mut generated::rt::Caller<'_>,
+        _fd: i32, _iovs: i32, _count: i32, _offset: i64, _read: i32,
+    ) -> i32 { 8 /* EBADF, as WASI numbers it */ }
+    fn wasi_snapshot_preview1_fd_pwrite(
+        &mut self,
+        _caller: &mut generated::rt::Caller<'_>,
+        _fd: i32, _iovs: i32, _count: i32, _offset: i64, _written: i32,
+    ) -> i32 { 8 }
+}
+
+fn main() {
+    let mut instance = generated::Instance::with_host(Host);
+    // `map_and_read` drops the errno, so ask for what the trampoline wrote:
+    // nothing, because it failed before reporting an address.
+    let _ = instance.map_and_read();
+    println!("allocated {}", instance.allocated());
+    println!("sync {}", instance.sync_back(1));
+}
+"#;
+    let output = common::run_with_driver("mmap-failing", &wasm, DRIVER);
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines[0], "allocated 0", "a failed read reports no mapping");
+    assert_eq!(lines[1], "sync -8", "and a failed write-back is the errno");
+}
+
+/// A private mapping is a copy, and `msync` on one writes nothing back.
+///
+/// `MAP_PRIVATE` is 2. Emscripten's `doMsync` returns before touching the file,
+/// and pushing a process's own scratch into a file it only read is a data loss
+/// bug rather than a fidelity one.
+#[test]
+fn a_private_mapping_is_not_written_back() {
+    let wat = MMAP_MODULE.replace(
+        ";; Write the mapping back through msync.",
+        ";; Write the mapping back through msync, privately.",
+    );
+    let wasm = common::assemble("mmap-private", &wat);
+    let module = Module::parse(&wasm).expect("valid");
+    let code = codegen::generate(&module).expect("generates");
+    assert!(
+        code.contains("if p3 & 2 != 0 {"),
+        "the flags decide, not only the protection:\n{}",
+        code.lines()
+            .filter(|line| line.contains("p3 & 2"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}

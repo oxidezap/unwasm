@@ -363,7 +363,7 @@ frames with anything promotable at all:
 | `COs9e0Kj0ic` | 64 of 228 | 592 of 1355 |
 | `php8T1oSIZM` | 2 of 86 | 2 of 378 |
 | `a19OxQ3jkd2` | 1316 of 6842 | 4188 of 100119 |
-| `ayqr5HQtlkb` | 10 of 1791 | 19 of 21782 |
+| `ayqr5HQtlkb` | 9 of 1791 | 11 of 21782 |
 | `rogm88TRRiw` | 2 of 1211 | 3 of 13858 |
 | `JgwtTQVeWPm` | 53 of 4916 | 87 of 30980 |
 

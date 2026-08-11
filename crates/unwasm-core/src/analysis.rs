@@ -68,6 +68,14 @@ pub struct Slot {
     /// Set once two accesses disagreed, so a third that happens to match the
     /// first cannot put [`Self::uniform`] back.
     pub mixed: bool,
+    /// Whether any access reached this offset by arithmetic rather than by the
+    /// base local and a static offset.
+    ///
+    /// `frame + 8` computed with an `i32.add` names the same byte as a memarg
+    /// of 8, and the walk resolves both — but only the second is a shape the
+    /// emitter recognises. A slot reached both ways would be a binding at one
+    /// access and memory at the other, so level 1 refuses it.
+    pub indirect: bool,
 }
 
 impl Slot {
@@ -303,6 +311,18 @@ fn find_mmap(module: &Module) -> Option<Mmap> {
     }
     let pread = import("fd_pread", &[I32, I32, I32, I64, I32], &[I32])?;
     let pwrite = import("fd_pwrite", &[I32, I32, I32, I64, I32], &[I32]);
+
+    // Writing a mapping back needs `fd_pwrite`. Without it those two stay the
+    // host's — claiming them and then emitting nothing would leave a call to a
+    // method that does not exist, and the output has to compile.
+    let (sync, unmap) = if pwrite.is_some() {
+        (sync, unmap)
+    } else {
+        (None, None)
+    };
+    if map.is_none() && sync.is_none() && unmap.is_none() {
+        return None;
+    }
 
     Some(Mmap {
         map,
@@ -736,6 +756,12 @@ pub fn promotable_slots(
         return promoted;
     }
     for (offset, slot) in &frame.slots {
+        // Reached by arithmetic somewhere, so the emitter cannot see every
+        // access to it: `frame + 8` computed with an `i32.add` names the same
+        // byte a memarg of 8 does, and only the second is a shape it matches.
+        if slot.indirect {
+            continue;
+        }
         let Some((width, ty)) = slot.uniform else {
             continue;
         };
@@ -1696,6 +1722,7 @@ fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame>
                     let offset = at + mem.offset as i32;
                     let slot = frame.slots.entry(offset).or_default();
                     slot.observe(width_of_load(*kind), kind.result());
+                    slot.indirect |= at != 0;
                     slot.reads += 1;
                 }
                 stack.push(Tracked::Other);
@@ -1712,6 +1739,7 @@ fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame>
                     let offset = at + mem.offset as i32;
                     let slot = frame.slots.entry(offset).or_default();
                     slot.observe(width_of_store(*kind), type_of_store(*kind));
+                    slot.indirect |= at != 0;
                     slot.writes += 1;
                 }
                 if matches!(address, Tracked::Derived) {
@@ -2842,6 +2870,7 @@ mod tests {
                 writes: 2,
                 uniform: Some((4, ValType::I32)),
                 mixed: false,
+                indirect: false,
             }
         );
         assert_eq!(
@@ -2852,6 +2881,7 @@ mod tests {
                 writes: 0,
                 uniform: Some((4, ValType::I32)),
                 mixed: false,
+                indirect: false,
             }
         );
         assert_eq!(
@@ -2862,6 +2892,7 @@ mod tests {
                 writes: 1,
                 uniform: Some((1, ValType::I32)),
                 mixed: false,
+                indirect: false,
             }
         );
     }
@@ -3013,6 +3044,7 @@ mod tests {
                 writes: 1,
                 uniform: Some((4, ValType::I32)),
                 mixed: false,
+                indirect: false,
             }
         );
     }

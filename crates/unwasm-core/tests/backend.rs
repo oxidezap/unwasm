@@ -1216,6 +1216,98 @@ fn level_1_refuses_a_frame_it_cannot_see_every_access_to() {
     assert!(code.contains("self.memory.store8"), "{code}");
 }
 
+/// A slot reached both ways is not promoted.
+///
+/// `frame + 8` computed with an `i32.add` and a memarg of 8 name the same byte.
+/// The walk resolves both; the emitter matches only the second. Promoting on
+/// the walk's count alone made the store go to memory and the load read a stale
+/// binding, and the function returned 0 where the engine returned its argument.
+#[test]
+fn level_1_refuses_a_slot_that_arithmetic_also_reaches() {
+    let wasm = common::assemble(
+        "level1-arith",
+        r#"(module
+            (memory (export "memory") 1)
+            (global $sp (export "__stack_pointer") (mut i32) (i32.const 65536))
+            (func (export "both_ways") (param i32) (result i32)
+                (local $frame i32)
+                global.get $sp i32.const 16 i32.sub local.tee $frame global.set $sp
+                ;; written through `frame + 8`, computed
+                local.get $frame i32.const 8 i32.add
+                local.get 0
+                i32.store
+                ;; read through the base and a static offset
+                local.get $frame
+                i32.load offset=8
+                local.get $frame i32.const 16 i32.add global.set $sp))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            promote_frames: true,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+    let code = &files[0].contents;
+    assert!(
+        code.contains("a slot is reached by arithmetic as well as by a static offset"),
+        "the refusal names the reason:\n{code}"
+    );
+    assert!(
+        !code.contains("let mut s8"),
+        "and nothing was promoted:\n{code}"
+    );
+    // Which is the point: it still agrees with the engine.
+    common::assert_agrees_at_level_1(
+        "level1-arith",
+        &wasm,
+        &[
+            common::call("both_ways", &[common::Arg::I32(7)]),
+            common::call("both_ways", &[common::Arg::I32(-1)]),
+        ],
+    );
+}
+
+/// And the refusal names the real blocker rather than the last one in the list.
+#[test]
+fn level_1_names_the_condition_that_actually_stopped_it() {
+    // One uniform slot, reached only by a static offset, inside the frame — and
+    // a `memory.fill` whose destination this cannot place.
+    let wasm = common::assemble(
+        "level1-bulk",
+        r#"(module
+            (memory (export "memory") 1)
+            (global $sp (export "__stack_pointer") (mut i32) (i32.const 65536))
+            (func (export "fills") (param i32) (result i32)
+                (local $frame i32)
+                global.get $sp i32.const 16 i32.sub local.tee $frame global.set $sp
+                local.get $frame local.get 0 i32.store offset=4
+                local.get 0 i32.const 0 i32.const 4 memory.fill
+                local.get $frame i32.load offset=4
+                local.get $frame i32.const 16 i32.add global.set $sp))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            promote_frames: true,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+    assert!(
+        files[0]
+            .contents
+            .contains("`memory.fill`, `copy` or `init`"),
+        "{}",
+        files[0].contents
+    );
+}
+
 /// Level 0 is unchanged by any of this.
 #[test]
 fn level_0_is_what_it_was() {

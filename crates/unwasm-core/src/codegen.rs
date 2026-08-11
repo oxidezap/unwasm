@@ -1894,13 +1894,19 @@ impl<'a> Generator<'a> {
                  \x20       }}\n\
                  \x20       self.memory.{store}scratch, 0, i64::from(mapped));\n\
                  \x20       self.memory.{store}scratch, 4, i64::from(p0));\n\
-                 \x20       {{\n\
+                 \x20       let errno = {{\n\
                  \x20           let mut caller = rt::Caller {{\n\
                  \x20               memory: &mut self.memory,\n\
                  \x20           }};\n\
-                 \x20           self.host.{pread}(&mut caller, p3, scratch, 1, p4, scratch + 8);\n\
-                 \x20       }}\n\
+                 \x20           self.host.{pread}(&mut caller, p3, scratch, 1, p4, scratch + 8)\n\
+                 \x20       }};\n\
                  \x20       self.{free}(scratch);\n\
+                 \x20       // A read that failed is not a mapping. Reporting success here\n\
+                 \x20       // would hand back a page of zeros as the file's contents.\n\
+                 \x20       if errno != 0 {{\n\
+                 \x20           self.{free}(mapped);\n\
+                 \x20           return -errno;\n\
+                 \x20       }}\n\
                  \x20       self.memory.{store}p5, 0, 1i64);\n\
                  \x20       self.memory.{store}p6, 0, i64::from(mapped));\n\
                  \x20       0\n\
@@ -1911,29 +1917,37 @@ impl<'a> Generator<'a> {
         let Some(pwrite) = mmap.pwrite.map(import_method) else {
             return;
         };
-        let write_back = |index: u32, store: &str, guard: &str| {
+        // `MAP_PRIVATE` is 2, and a private mapping is a copy: Emscripten's
+        // `doMsync` returns before writing anything back, and so does this.
+        // Writing it back would push a process's own scratch into the file.
+        let write_back = |store: &str, guard: &str| {
             format!(
                 "{guard}\
+                 \x20       if p3 & 2 != 0 {{\n\
+                 \x20           return 0;\n\
+                 \x20       }}\n\
                  \x20       let scratch = self.{memalign}(4, 12);\n\
                  \x20       if scratch == 0 {{\n\
                  \x20           return -48;\n\
                  \x20       }}\n\
                  \x20       self.memory.{store}scratch, 0, i64::from(p0));\n\
                  \x20       self.memory.{store}scratch, 4, i64::from(p1));\n\
-                 \x20       {{\n\
+                 \x20       let errno = {{\n\
                  \x20           let mut caller = rt::Caller {{\n\
                  \x20               memory: &mut self.memory,\n\
                  \x20           }};\n\
-                 \x20           self.host.{pwrite}(&mut caller, p4, scratch, 1, p5, scratch + 8);\n\
-                 \x20       }}\n\
+                 \x20           self.host.{pwrite}(&mut caller, p4, scratch, 1, p5, scratch + 8)\n\
+                 \x20       }};\n\
                  \x20       self.{free}(scratch);\n\
-                 \x20       let _ = {index};\n"
+                 \x20       if errno != 0 {{\n\
+                 \x20           return -errno;\n\
+                 \x20       }}\n"
             )
         };
 
         if let Some(index) = mmap.sync {
             let store = self.trampoline_store(index);
-            let body = write_back(index, &store, "        let _ = (p2, p3);\n");
+            let body = write_back(&store, "        let _ = p2;\n");
             let _ = writeln!(
                 self.out,
                 "    /// `env::_msync_js`, generated: the mapped range goes back to the file\n\
@@ -1951,7 +1965,6 @@ impl<'a> Generator<'a> {
             // `PROT_WRITE` is 2. A read-only mapping has nothing to write back,
             // and the mapping itself is freed by musl rather than here.
             let body = write_back(
-                index,
                 &store,
                 "        if p2 & 2 == 0 {\n            return 0;\n        }\n",
             );
@@ -2554,7 +2567,15 @@ impl<'a> Generator<'a> {
             out.push_str(&frame_summary(frame));
             if self.promote_frames {
                 let promoted = analysis::promotable_slots(frame, &func.body);
-                out.push_str(&promotion_note(frame, &promoted));
+                let bulk = func.body.iter().any(|op| {
+                    matches!(
+                        op,
+                        crate::module::Op::MemoryFill
+                            | crate::module::Op::MemoryCopy
+                            | crate::module::Op::MemoryInit(_)
+                    )
+                });
+                out.push_str(&promotion_note(frame, &promoted, bulk));
             }
         }
         // `pub(crate)` rather than private: under a split layout the callers
@@ -4081,19 +4102,42 @@ pub fn exported_functions(module: &Module) -> Vec<(&crate::module::Export, Strin
 fn promotion_note(
     frame: &StackFrame,
     promoted: &std::collections::BTreeMap<i32, (u32, ValType)>,
+    bulk: bool,
 ) -> String {
     let mut out = String::new();
     if promoted.is_empty() {
         // Worth saying which of the conditions it failed: "level 1 did nothing
-        // here" is a result, and the reason is the interesting part.
+        // here" is a result, and the reason is the interesting part. So the
+        // reason is read off the frame rather than assumed to be the last one
+        // in the list — a note that names the wrong blocker sends a reader
+        // looking at the wrong thing.
+        let slot_reason = || {
+            if frame.slots.iter().any(|(_, slot)| slot.indirect) {
+                "a slot is reached by arithmetic as well as by a static offset"
+            } else if frame.slots.iter().any(|(_, slot)| slot.mixed) {
+                "a slot's accesses disagree about its width or its type"
+            } else if frame
+                .slots
+                .keys()
+                .any(|offset| *offset < 0 || *offset >= frame.size)
+            {
+                "a slot lies outside the frame it reserved"
+            } else if frame.slots.is_empty() {
+                "the frame is never read or written"
+            } else {
+                "the slots overlap each other"
+            }
+        };
         let why = if frame.escapes {
             "the address leaves this function"
         } else if frame.computed_writes > 0 {
             "a write goes through an address computed at run time"
         } else if frame.copied {
             "the address is copied into another local"
+        } else if bulk {
+            "the function has a `memory.fill`, `copy` or `init`, whose destination \n    /// this cannot place"
         } else {
-            "no slot's accesses agreed on one width and type inside the frame"
+            slot_reason()
         };
         let _ = writeln!(
             out,
