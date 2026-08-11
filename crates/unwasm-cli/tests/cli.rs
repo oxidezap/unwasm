@@ -505,6 +505,32 @@ fn decompiling_a_deeply_nested_module_says_what_rustc_will_need() {
 }
 
 #[test]
+fn the_level_is_zero_unless_asked_and_only_zero_or_one_exist() {
+    let path = fixture("sample-level", SAMPLE);
+    let (ok, stdout, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--level",
+        "0",
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(!stdout.contains("Level 1"), "{stdout}");
+
+    let (ok, _, stderr) = run(&[
+        "decompile",
+        path.to_str().expect("utf-8 path"),
+        "--level",
+        "2",
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("--level is 0 (faithful) or 1"), "{stderr}");
+
+    let (ok, _, stderr) = run(&["decompile", path.to_str().expect("utf-8 path"), "--level"]);
+    assert!(!ok);
+    assert!(stderr.contains("--level needs a number"), "{stderr}");
+}
+
+#[test]
 fn stubbing_recognised_code_needs_a_catalogue_and_reports_what_it_left_out() {
     // Two functions with the same shape and different names, so one module can
     // be a catalogue for the other.

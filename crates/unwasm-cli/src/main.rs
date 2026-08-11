@@ -14,9 +14,10 @@ const USAGE: &str = "\
 unwasm — a WebAssembly decompiler whose output compiles
 
 usage:
-  unwasm decompile <module.wasm> [-o <out>] [--split <n>] [--only <indices>]
-                   [--reachable-from <indices>] [--signatures <file>]
-                   [--stub-recognised] [--instrument-stores] [--offsets]
+  unwasm decompile <module.wasm> [-o <out>] [--level <n>] [--split <n>]
+                   [--only <indices>] [--reachable-from <indices>]
+                   [--signatures <file>] [--stub-recognised]
+                   [--instrument-stores] [--offsets]
   unwasm host      <module.wasm> [-o <host.rs>] [--defaults]
   unwasm table     <module.wasm> [--type <signature>]
   unwasm calls     <module.wasm> <index>
@@ -43,6 +44,9 @@ usage:
                  entry an indirect call could land on
   --direct-only  with --reachable-from: follow direct calls only. Smaller and
                  incomplete; a stub it reaches says which function to add
+  --level <n>    0 (default) is a faithful translation; 1 also turns the frame
+                 slots it can place into Rust bindings, which stops the output
+                 being byte-exact and says so at every function it did it to
   --signatures <file>  name library code using a catalogue from `signatures`
   --stub-recognised  with --signatures: leave the bodies of the functions the
                  catalogue named out, keeping their names and signatures. For
@@ -102,6 +106,12 @@ boundaries, so half a million lines in one file becomes one enormous unit.
 Decompilation is faithful, not idiomatic: linear memory stays a byte vector and
 every trap stays a trap, so the result can be run against the module it came
 from. Anything unsupported is an error, never a silent omission.
+
+`--level 1` is the one exception, and it is opt-in for that reason. A frame slot
+it promotes is a Rust binding rather than bytes in linear memory, so a run no
+longer leaves those bytes behind — the answers still match the engine, the
+memory no longer does. Every function it changed says so in its doc comment,
+and every function it refused says why it refused.
 ";
 
 fn main() -> ExitCode {
@@ -150,6 +160,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
     let mut direct_only = false;
     let mut instrument = false;
     let mut stub_recognised = false;
+    let mut level = 0u8;
     let mut map_offsets = false;
     let mut rest = arguments[1..].iter();
     while let Some(argument) = rest.next() {
@@ -188,6 +199,18 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
             }
             "--instrument-stores" => instrument = true,
             "--stub-recognised" => stub_recognised = true,
+            "--level" => {
+                let value = rest.next().ok_or("--level needs a number")?;
+                level = match value.as_str() {
+                    "0" => 0,
+                    "1" => 1,
+                    other => {
+                        return Err(format!(
+                            "--level is 0 (faithful) or 1 (frame slots as bindings), not `{other}`"
+                        ));
+                    }
+                };
+            }
             "--offsets" => map_offsets = true,
             "--only" => {
                 let value = rest.next().ok_or("--only needs a list of indices")?;
@@ -278,7 +301,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
                     .to_string(),
             );
         }
-        if only.is_empty() && catalogue.is_none() && !instrument {
+        if only.is_empty() && catalogue.is_none() && !instrument && level == 0 {
             return codegen::generate(&module).map_err(|error| error.to_string());
         }
         let files = codegen::generate_options(
@@ -290,6 +313,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
                 instrument_stores: instrument,
                 map_offsets,
                 stub_recognised,
+                promote_frames: level >= 1,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -318,6 +342,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
             instrument_stores: instrument,
             map_offsets,
             stub_recognised,
+            promote_frames: level >= 1,
         },
     )
     .map_err(|error| error.to_string())?;

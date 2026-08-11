@@ -790,6 +790,14 @@ pub struct Options {
     /// For a run being *read*. Anything that calls a stub stops there, which is
     /// why this is not the default and never applies without `signatures`.
     pub stub_recognised: bool,
+    /// **Level 1**: keep the frame slots that can be placed in Rust bindings
+    /// rather than in linear memory.
+    ///
+    /// This gives up byte-exactness, deliberately and only when asked. See
+    /// [`analysis::promotable_slots`] for what a slot has to prove first, and
+    /// the doc comment each promoted function carries for what a run of it no
+    /// longer matches.
+    pub promote_frames: bool,
 }
 
 /// Which functions a catalogue names, by index.
@@ -850,6 +858,7 @@ pub fn generate_options(module: &Module, options: &Options) -> Result<Vec<Genera
     generator.instrument = options.instrument_stores;
     generator.map_offsets = options.map_offsets;
     generator.stub_recognised = options.stub_recognised;
+    generator.promote_frames = options.promote_frames;
     generator.run()
 }
 
@@ -960,6 +969,8 @@ struct Generator<'a> {
     map_offsets: bool,
     /// Whether a recognised function keeps its body.
     stub_recognised: bool,
+    /// Whether frame slots become Rust bindings — level 1.
+    promote_frames: bool,
     /// Per function: its index, how many lines of its chunk come before its
     /// body, and the body's own line-to-bytes spans.
     spans: Vec<FunctionSpans>,
@@ -981,6 +992,7 @@ impl<'a> Generator<'a> {
             instrument: false,
             map_offsets: false,
             stub_recognised: false,
+            promote_frames: false,
             spans: Vec::new(),
             located: Vec::new(),
         }
@@ -2382,6 +2394,10 @@ impl<'a> Generator<'a> {
         let frame = self.analysis.frames.get(&index);
         if let Some(frame) = frame {
             out.push_str(&frame_summary(frame));
+            if self.promote_frames {
+                let promoted = analysis::promotable_slots(frame, &func.body);
+                out.push_str(&promotion_note(frame, &promoted));
+            }
         }
         // `pub(crate)` rather than private: under a split layout the callers
         // live in sibling modules, and a private method would be visible only
@@ -2413,6 +2429,7 @@ impl<'a> Generator<'a> {
                 recognised: &self.recognised,
                 instrument: self.instrument,
                 map_offsets: self.map_offsets,
+                promote: self.promote_frames,
             };
             let (body, spans) = Body::new(context, func, ty, index).emit()?;
             out.push_str(&body);
@@ -2461,6 +2478,8 @@ struct Context<'a> {
     recognised: &'a std::collections::BTreeMap<u32, String>,
     instrument: bool,
     map_offsets: bool,
+    /// Level 1: promote what can be promoted out of the shadow stack.
+    promote: bool,
 }
 
 /// A value sitting on the operand stack, and how it may be used.
@@ -2477,6 +2496,13 @@ struct Value {
     folded: bool,
     /// What a folded expression reads, and therefore what can invalidate it.
     reads: Reads,
+    /// Whether this value *is* the frame base address, unmodified.
+    ///
+    /// Only `local.get $base` sets it, and only a spill carries it — `let t5 =
+    /// frame;` is still the frame. Arithmetic on it does not, which is the
+    /// point: level 1 promotes a slot only when it can see every access to it,
+    /// and an address it cannot place is an access it cannot see.
+    frame_base: bool,
 }
 
 /// What an expression on the stack depends on.
@@ -2641,6 +2667,9 @@ struct Body<'a> {
     here: u32,
     /// This function's C stack frame, when it has one.
     frame: Option<&'a StackFrame>,
+    /// The frame slots this function keeps in Rust bindings rather than in
+    /// linear memory. Empty at level 0, which is every slot in memory.
+    promoted: std::collections::BTreeMap<i32, Promoted>,
     func: &'a Func,
     ty: &'a crate::module::FuncType,
     index: u32,
@@ -2671,6 +2700,7 @@ impl<'a> Body<'a> {
             recognised,
             instrument,
             map_offsets,
+            promote,
         } = context;
         Self {
             module,
@@ -2683,6 +2713,23 @@ impl<'a> Body<'a> {
             lines: 0,
             here: 0,
             frame: analysis.frames.get(&index),
+            promoted: promote
+                .then(|| analysis.frames.get(&index))
+                .flatten()
+                .map(|frame| {
+                    analysis::promotable_slots(frame, &func.body)
+                        .into_iter()
+                        .map(|(offset, (width, ty))| {
+                            let name = if offset < 0 {
+                                format!("s_{}", -offset)
+                            } else {
+                                format!("s{offset}")
+                            };
+                            (offset, Promoted { name, width, ty })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             func,
             ty,
             index,
@@ -2700,6 +2747,53 @@ impl<'a> Body<'a> {
 
     fn location(&self) -> String {
         format!("function #{}", self.index)
+    }
+
+    /// The promoted slot an access reaches, if this access is one of them.
+    ///
+    /// Two conditions, and both are exact rather than heuristic: the address is
+    /// the frame base itself, and the static offset names a slot that was
+    /// promoted. `promotable_slots` only promotes when nothing else in the
+    /// function can reach the frame, so an access this does not recognise is an
+    /// access to a slot that was not promoted.
+    fn promoted_at(&self, address: &Value, offset: u64) -> Option<Promoted> {
+        if !address.frame_base {
+            return None;
+        }
+        let at = i32::try_from(offset).ok()?;
+        self.promoted.get(&at).cloned()
+    }
+
+    /// The bindings a promoted frame declares, and the doc comment saying what
+    /// they cost.
+    ///
+    /// Declared zeroed at the top and filled from memory once the prologue has
+    /// computed the frame address — because the bytes at those offsets belong
+    /// to whatever ran before, and a slot read before it is written has to see
+    /// them.
+    fn declare_promoted(&mut self) {
+        if self.promoted.is_empty() {
+            return;
+        }
+        for slot in self.promoted.values().cloned().collect::<Vec<_>>() {
+            self.line(&format!(
+                "let mut {}: {} = {};",
+                slot.name,
+                slot.ty.rust_name(),
+                slot.ty.zero()
+            ));
+        }
+    }
+
+    /// Fills them, at the first point the frame address exists.
+    fn fill_promoted(&mut self) {
+        for (offset, slot) in self.promoted.clone() {
+            self.line(&format!(
+                "{} = self.memory.{}(frame, {offset});",
+                slot.name,
+                slot.initialiser()
+            ));
+        }
     }
 
     /// The opening of a call to a memory write: `store32(` normally, and
@@ -2743,7 +2837,11 @@ impl<'a> Body<'a> {
                 local.zero()
             ));
         }
+        self.declare_promoted();
 
+        // Where the frame address becomes valid, and so the earliest point the
+        // bindings can be filled from what is already at those offsets.
+        let prologue = self.frame.map_or(0, |frame| frame.prologue);
         let body = self.func.body.clone();
         for (at, op) in body.iter().enumerate() {
             // The next instruction is worth having for one reason: a Rust
@@ -2757,6 +2855,9 @@ impl<'a> Body<'a> {
                 self.pending = span.map(|(offset, _)| offset);
             }
             self.op(op)?;
+            if at + 1 == prologue {
+                self.fill_promoted();
+            }
             if self.map_offsets && self.emitted_lines() > before {
                 if let (Some(start), Some((offset, length))) = (self.pending, span) {
                     self.spans.push((before, start, offset + length - start));
@@ -2816,6 +2917,7 @@ impl<'a> Body<'a> {
             ty,
             folded,
             reads,
+            frame_base: false,
         });
     }
 
@@ -2932,6 +3034,11 @@ impl<'a> Body<'a> {
                 ty: value.ty,
                 folded: false,
                 reads: Reads::default(),
+                // A name for the frame address is still the frame address.
+                // Losing that here would let a slot be promoted at one access
+                // and left in memory at another, which is worse than not
+                // promoting it at all.
+                frame_base: value.frame_base,
             };
         }
     }
@@ -3175,6 +3282,11 @@ impl<'a> Body<'a> {
             Op::LocalGet(index) => {
                 let ty = self.local_type(*index)?;
                 self.push(self.local_ident(*index), ty, true, Reads::local(*index));
+                if self.frame.is_some_and(|frame| frame.base_local == *index)
+                    && let Some(value) = self.stack.last_mut()
+                {
+                    value.frame_base = true;
+                }
             }
             Op::LocalSet(index) => {
                 let value = self.pop()?;
@@ -3253,6 +3365,15 @@ impl<'a> Body<'a> {
             }
             Op::Load { kind, mem } => {
                 let address = self.pop()?;
+                // Level 1: a promoted slot is a binding, and reading it is
+                // reading the binding. `push_temp` rather than folding, for the
+                // same reason a load is named — a store to the slot between
+                // here and the consumer would otherwise be read back.
+                if let Some(slot) = self.promoted_at(&address, mem.offset) {
+                    let code = read_promoted(&slot, *kind);
+                    self.push_temp(&code, kind.result());
+                    return Ok(());
+                }
                 let method = load_method(*kind);
                 self.push_temp(
                     &format!("self.memory.{method}({}, {})", address.code, mem.offset),
@@ -3261,6 +3382,14 @@ impl<'a> Body<'a> {
             }
             Op::Store { kind, mem } => {
                 let mut values = self.pop_n(2)?;
+                if let Some(slot) = self.promoted_at(&values[0], mem.offset) {
+                    // Nothing folded can read a promoted slot: every read of one
+                    // is given a name as it happens. So there is nothing to
+                    // spill before writing it.
+                    let code = write_promoted(&slot, *kind, &values[1].code);
+                    self.line(&code);
+                    return Ok(());
+                }
                 self.spill_operands(&mut values);
                 // Nothing folded reads memory, so a memory write invalidates nothing.
                 let (method, cast) = store_method(*kind);
@@ -3623,6 +3752,78 @@ impl<'a> Body<'a> {
     }
 }
 
+/// A frame slot that became a Rust binding: its name, and the width and type
+/// every access to it agreed on.
+#[derive(Debug, Clone)]
+struct Promoted {
+    name: String,
+    width: u32,
+    ty: ValType,
+}
+
+impl Promoted {
+    /// Whether the binding holds fewer bytes than its Rust type.
+    ///
+    /// A narrow slot is kept zero-extended — exactly what a `load8_u` would
+    /// return — so a store masks and a signed load sign-extends. Keeping it any
+    /// other way would make one of the two wrong.
+    fn narrow(&self) -> bool {
+        self.width < if self.ty == ValType::I64 { 8 } else { 4 }
+    }
+
+    /// The runtime load that fills it from memory, zero-extended.
+    fn initialiser(&self) -> &'static str {
+        match (self.width, self.ty) {
+            (1, ValType::I32) => "load8_u",
+            (2, ValType::I32) => "load16_u",
+            (1, ValType::I64) => "load8_u_i64",
+            (2, ValType::I64) => "load16_u_i64",
+            (4, ValType::I64) => "load32_u_i64",
+            (_, ValType::I64) => "load64",
+            (_, ValType::F32) => "load_f32",
+            (_, ValType::F64) => "load_f64",
+            (_, ValType::I32) => "load32",
+        }
+    }
+}
+
+/// Reading a promoted slot: the binding, widened the way the load asks for.
+fn read_promoted(slot: &Promoted, kind: LoadKind) -> String {
+    let name = &slot.name;
+    if !slot.narrow() {
+        return name.clone();
+    }
+    // The binding holds the bytes zero-extended, so an unsigned load is the
+    // binding and a signed one has to sign-extend from the stored width.
+    match kind {
+        LoadKind::I32Load8S => format!("(({name} as u8) as i8) as i32"),
+        LoadKind::I32Load16S => format!("(({name} as u16) as i16) as i32"),
+        LoadKind::I64Load8S => format!("(({name} as u8) as i8) as i64"),
+        LoadKind::I64Load16S => format!("(({name} as u16) as i16) as i64"),
+        LoadKind::I64Load32S => format!("(({name} as u32) as i32) as i64"),
+        _ => name.clone(),
+    }
+}
+
+/// Writing a promoted slot, keeping it zero-extended from the stored width.
+fn write_promoted(slot: &Promoted, kind: StoreKind, value: &str) -> String {
+    let name = &slot.name;
+    if !slot.narrow() {
+        return format!("{name} = {value};");
+    }
+    let mask = match kind {
+        StoreKind::I32Store8 | StoreKind::I64Store8 => "0xff",
+        StoreKind::I32Store16 | StoreKind::I64Store16 => "0xffff",
+        _ => "0xffff_ffff",
+    };
+    let suffix = if slot.ty == ValType::I64 {
+        "i64"
+    } else {
+        "i32"
+    };
+    format!("{name} = ({value}) & {mask}{suffix};")
+}
+
 fn load_method(kind: LoadKind) -> &'static str {
     match kind {
         LoadKind::I32 => "load32",
@@ -3711,6 +3912,48 @@ pub fn exported_functions(module: &Module) -> Vec<(&crate::module::Export, Strin
         }
         out.push((export, name));
     }
+    out
+}
+
+/// The doc comment a promoted frame carries, and what it costs.
+///
+/// Said at the function rather than once in the header, because it is a
+/// property of *this* function: which offsets left memory, and therefore which
+/// bytes a run of it no longer leaves behind.
+fn promotion_note(
+    frame: &StackFrame,
+    promoted: &std::collections::BTreeMap<i32, (u32, ValType)>,
+) -> String {
+    let mut out = String::new();
+    if promoted.is_empty() {
+        // Worth saying which of the conditions it failed: "level 1 did nothing
+        // here" is a result, and the reason is the interesting part.
+        let why = if frame.escapes {
+            "the address leaves this function"
+        } else if frame.computed_writes > 0 {
+            "a write goes through an address computed at run time"
+        } else if frame.copied {
+            "the address is copied into another local"
+        } else {
+            "no slot's accesses agreed on one width and type inside the frame"
+        };
+        let _ = writeln!(
+            out,
+            "    ///\n    /// Level 1 promoted nothing here: {why}."
+        );
+        return out;
+    }
+    let _ = writeln!(
+        out,
+        "    ///\n    /// **Level 1**: {} of {} slots are Rust bindings rather than memory —\n    /// {}. They are filled from the frame on entry, so a slot read before\n    /// it is written still sees what was there; they are never written back,\n    /// so this function no longer leaves those bytes in linear memory. That is\n    /// the exactness level 1 gives up, and it is given up here.",
+        promoted.len(),
+        frame.slots.len(),
+        promoted
+            .keys()
+            .map(|offset| format!("`s{offset}` at +{offset}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     out
 }
 
@@ -4056,6 +4299,7 @@ mod tests {
     #[test]
     fn an_operand_brackets_itself_when_it_has_to() {
         let name = Value {
+            frame_base: false,
             code: "l3".to_string(),
             ty: ValType::I32,
             folded: true,
@@ -4063,6 +4307,7 @@ mod tests {
         };
         assert_eq!(name.as_operand(), "l3");
         let compound = Value {
+            frame_base: false,
             code: "l3 as u32".to_string(),
             ty: ValType::I32,
             folded: true,
@@ -4077,6 +4322,8 @@ mod tests {
         // else could be worked out. Printing an empty table would read as "no
         // slots", which is a different claim.
         let summary = frame_summary(&StackFrame {
+            copied: false,
+            prologue: 5,
             size: 16,
             base_local: 0,
             slots: std::collections::BTreeMap::new(),

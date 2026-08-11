@@ -1077,6 +1077,183 @@ fn a_leaf_frame_is_marked_as_not_published() {
     );
 }
 
+/// Level 1: the frame slots that can be placed become Rust bindings.
+///
+/// This is the level that says it is giving something up. The struct in the C
+/// source below lives in the shadow stack at `-O0`, and at level 1 its fields
+/// are `let mut` bindings — so the function computes the same answers and stops
+/// leaving those bytes in linear memory. The differential test is what makes
+/// that sentence checkable: the *answers* are compared against the engine, and
+/// the memory is compared and reported rather than asserted.
+#[test]
+fn level_1_promotes_a_struct_out_of_the_shadow_stack() {
+    const SOURCE: &str = r#"
+        struct Point { int x; int y; int z; };
+        __attribute__((export_name("through_the_stack")))
+        int through_the_stack(int a, int b) {
+            struct Point point = { a, b, a ^ b };
+            point.z += point.x;
+            return point.x + point.y + point.z;
+        }
+    "#;
+    let wasm = common::compile_c("level1-struct", SOURCE, "-O0");
+
+    let plain = common::decompile(&wasm);
+    assert!(
+        plain.contains("self.memory.store32"),
+        "at level 0 the struct is memory:\n{}",
+        &plain[..plain.len().min(400)]
+    );
+
+    let module = Module::parse(&wasm).expect("valid");
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            promote_frames: true,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+    let code = &files[0].contents;
+
+    // The bindings, and the note that says what they cost.
+    assert!(code.contains("let mut s12: i32 = 0;"), "{code}");
+    assert!(code.contains("**Level 1**:"), "{code}");
+    assert!(
+        code.contains("never written back"),
+        "the cost is stated at the function:\n{code}"
+    );
+    // Filled from the frame on entry, so a slot read before it is written sees
+    // what was there.
+    assert!(
+        code.contains("s12 = self.memory.load32(frame, 12);"),
+        "{code}"
+    );
+
+    let calls: Vec<_> = [(0, 0), (1, 2), (-3, 7), (i32::MIN, -1)]
+        .into_iter()
+        .map(|(a, b)| {
+            common::call(
+                "through_the_stack",
+                &[common::Arg::I32(a), common::Arg::I32(b)],
+            )
+        })
+        .collect();
+    let memory_matches = common::assert_agrees_at_level_1("level1-struct", &wasm, &calls);
+    assert!(
+        !memory_matches,
+        "the bytes really did stop being written — if they still match, nothing was promoted"
+    );
+}
+
+/// The narrow fields too, which is where a promotion is easiest to get wrong.
+///
+/// A `short` and a `char` in the frame are one and two-byte accesses. The
+/// binding keeps them zero-extended, exactly as `load8_u` would return them, so
+/// a signed read has to sign-extend and a store has to mask. Either one wrong
+/// is a wrong answer, and the engine says which.
+#[test]
+fn level_1_gets_the_narrow_fields_right() {
+    const SOURCE: &str = r#"
+        struct Packed { int x; short y; signed char tag; unsigned char flag; };
+        __attribute__((export_name("through_a_packed_struct")))
+        int through_a_packed_struct(int a, int b) {
+            struct Packed p = { a, (short)b, (signed char)(a ^ b), (unsigned char)b };
+            p.y += (short)p.x;
+            p.tag = (signed char)(p.tag - 1);
+            return p.x + p.y + p.tag + p.flag;
+        }
+    "#;
+    let wasm = common::compile_c("level1-narrow", SOURCE, "-O0");
+    let calls: Vec<_> = [(0, 0), (5, -3), (1, 70000), (-1, 255), (300, -32768)]
+        .into_iter()
+        .map(|(a, b)| {
+            common::call(
+                "through_a_packed_struct",
+                &[common::Arg::I32(a), common::Arg::I32(b)],
+            )
+        })
+        .collect();
+    common::assert_agrees_at_level_1("level1-narrow", &wasm, &calls);
+}
+
+/// A frame level 1 refuses, and says why.
+///
+/// `memcpy` takes the address, so nothing can be claimed about what happens to
+/// the slots afterwards — and a slot promoted out of memory under an escaping
+/// address would be read stale by whatever the callee did.
+#[test]
+fn level_1_refuses_a_frame_it_cannot_see_every_access_to() {
+    const SOURCE: &str = r#"
+        void copy_bytes(void *destination, const void *source, unsigned long count);
+        __attribute__((export_name("leaks_its_frame")))
+        int leaks_its_frame(int n) {
+            char buffer[16];
+            for (int i = 0; i < 16; i++) buffer[i] = (char)(n + i);
+            char other[16];
+            copy_bytes(other, buffer, 16);
+            return other[0] + other[15];
+        }
+    "#;
+    let wasm = common::compile_c("level1-escaping", SOURCE, "-O0");
+    let module = Module::parse(&wasm).expect("valid");
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            promote_frames: true,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+    let code = &files[0].contents;
+    assert!(
+        code.contains("Level 1 promoted nothing here: the address leaves this function"),
+        "the refusal names the reason:\n{code}"
+    );
+    // And the frame is still memory, so the function is still exact.
+    assert!(code.contains("self.memory.store8"), "{code}");
+}
+
+/// Level 0 is unchanged by any of this.
+#[test]
+fn level_0_is_what_it_was() {
+    const SOURCE: &str = r#"
+        struct Point { int x; int y; };
+        __attribute__((export_name("sum")))
+        int sum(int a, int b) {
+            struct Point point = { a, b };
+            return point.x + point.y;
+        }
+    "#;
+    let wasm = common::compile_c("level1-off", SOURCE, "-O0");
+    let module = Module::parse(&wasm).expect("valid");
+    let plain = codegen::generate_files(&module, codegen::Layout::Single).expect("generates");
+    let explicit = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            promote_frames: false,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+    assert_eq!(plain[0].contents, explicit[0].contents);
+    assert!(
+        !plain[0].contents.contains("Level 1"),
+        "and says nothing about a level it did not run"
+    );
+    common::assert_agrees(
+        "level1-off",
+        &wasm,
+        &[common::call(
+            "sum",
+            &[common::Arg::I32(3), common::Arg::I32(4)],
+        )],
+    );
+}
+
 #[test]
 fn a_module_with_no_stack_pointer_has_no_frames_and_still_works() {
     let wasm = common::assemble(

@@ -58,6 +58,34 @@ pub struct Slot {
     pub reads: usize,
     /// How many times it is written.
     pub writes: usize,
+    /// The width and type every access agreed on, if they all did.
+    ///
+    /// `None` once two accesses disagree — a four-byte store and a one-byte
+    /// load at the same offset is a union, a narrowing, or two variables the
+    /// compiler packed together, and none of the three is one variable. This is
+    /// what decides whether the slot can become a single Rust binding.
+    pub uniform: Option<(u32, ValType)>,
+    /// Set once two accesses disagreed, so a third that happens to match the
+    /// first cannot put [`Self::uniform`] back.
+    pub mixed: bool,
+}
+
+impl Slot {
+    /// Records an access, and whether it still looks like one variable.
+    fn observe(&mut self, width: u32, ty: ValType) {
+        self.width = self.width.max(width);
+        if self.mixed {
+            return;
+        }
+        match self.uniform {
+            None => self.uniform = Some((width, ty)),
+            Some(seen) if seen == (width, ty) => {}
+            Some(_) => {
+                self.uniform = None;
+                self.mixed = true;
+            }
+        }
+    }
 }
 
 /// A function's stack frame, as far as its own code reveals it.
@@ -97,6 +125,18 @@ pub struct Frame {
     /// one — a constant store past the end is a bug a compiler would have to
     /// have emitted on purpose.
     pub computed_writes: usize,
+    /// Whether the frame address was ever copied into another local.
+    ///
+    /// A copy is followed rather than given up on, so it is not an escape — but
+    /// it does mean an access can reach a slot through a local other than the
+    /// base. Anything that promotes a slot to a Rust binding has to see *every*
+    /// access to it, so it asks for a frame nobody copied.
+    pub copied: bool,
+    /// How many instructions the prologue occupies.
+    ///
+    /// Where the frame address becomes valid, which is the earliest point
+    /// anything can be initialised from it.
+    pub prologue: usize,
 }
 
 impl Frame {
@@ -577,6 +617,66 @@ pub fn analyse(module: &Module) -> Analysis {
         hot_addresses: find_hot_addresses(module, &placements),
         call_graph: read_call_graph(module),
     }
+}
+
+/// The frame slots that could become Rust bindings instead of memory.
+///
+/// This is the question level 1 asks, and the answer is deliberately hard to
+/// earn. A slot is promotable only when *every* access to the frame is one this
+/// can see and place:
+///
+/// - the address never escapes and was never copied into another local, so
+///   every access goes through the base local and nothing else can reach it;
+/// - no store goes through an address computed from the frame at run time —
+///   an indexed array write could land on any slot;
+/// - the function has no `memory.fill`, `memory.copy` or `memory.init`, whose
+///   destination is a value rather than an offset and could cover the frame;
+/// - the slot's accesses all used one width and one type, so it is one
+///   variable rather than a union or a packed pair;
+/// - and the slot lies inside the frame and overlaps no other.
+///
+/// What it does *not* prove is that no unrelated pointer aliases the region.
+/// Nothing in a wasm module says a store cannot land below the stack pointer,
+/// and no compiler emits one — which is an assumption, and is why this is a
+/// level that says it is guessing rather than the default.
+#[must_use]
+pub fn promotable_slots(
+    frame: &Frame,
+    body: &[Op],
+) -> std::collections::BTreeMap<i32, (u32, ValType)> {
+    let mut promoted = std::collections::BTreeMap::new();
+    if frame.escapes || frame.computed_writes > 0 || frame.copied {
+        return promoted;
+    }
+    if body
+        .iter()
+        .any(|op| matches!(op, Op::MemoryFill | Op::MemoryCopy | Op::MemoryInit(_)))
+    {
+        return promoted;
+    }
+    for (offset, slot) in &frame.slots {
+        let Some((width, ty)) = slot.uniform else {
+            continue;
+        };
+        // Inside the frame it reserved. A slot past the end is a write into the
+        // caller's frame, which `writes_outside` reports and which nothing here
+        // is going to quietly turn into a variable.
+        if *offset < 0 || offset.saturating_add(width as i32) > frame.size {
+            continue;
+        }
+        // And overlapping nothing. Two slots sharing a byte are not two
+        // variables, whatever their widths agreed on separately.
+        let overlaps = frame.slots.iter().any(|(other, candidate)| {
+            other != offset
+                && *other < offset + width as i32
+                && offset < &(other + candidate.width.max(1) as i32)
+        });
+        if overlaps {
+            continue;
+        }
+        promoted.insert(*offset, (width, ty));
+    }
+    promoted
 }
 
 /// The most deeply nested function in the module, and how deep it goes.
@@ -1440,6 +1540,8 @@ fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame>
         escapes: false,
         publishes: prologue.publishes,
         computed_writes: 0,
+        copied: false,
+        prologue: prologue.length,
     };
 
     let mut stack: Vec<Tracked> = Vec::new();
@@ -1512,7 +1614,7 @@ fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame>
                 if let Tracked::Frame(at) = address {
                     let offset = at + mem.offset as i32;
                     let slot = frame.slots.entry(offset).or_default();
-                    slot.width = slot.width.max(width_of_load(*kind));
+                    slot.observe(width_of_load(*kind), kind.result());
                     slot.reads += 1;
                 }
                 stack.push(Tracked::Other);
@@ -1528,7 +1630,7 @@ fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame>
                 if let Tracked::Frame(at) = address {
                     let offset = at + mem.offset as i32;
                     let slot = frame.slots.entry(offset).or_default();
-                    slot.width = slot.width.max(width_of_store(*kind));
+                    slot.observe(width_of_store(*kind), type_of_store(*kind));
                     slot.writes += 1;
                 }
                 if matches!(address, Tracked::Derived) {
@@ -1555,6 +1657,15 @@ fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame>
                     // Anything else is followed rather than given up on. A copy
                     // of the frame address is still the frame address, and the
                     // epilogue of an unoptimised build is exactly that.
+                    // Only a copy that could still reach a slot counts. The
+                    // epilogue copies `frame + size` on its way back to the
+                    // stack pointer, and a memarg offset is never negative, so
+                    // that address cannot name anything inside the frame — and
+                    // treating it as a copy would refuse level 1 on every
+                    // function an unoptimised clang built.
+                    if matches!(value, Tracked::Frame(at) if at < size) {
+                        frame.copied = true;
+                    }
                     locals.insert(*index, value);
                 }
                 if matches!(op, Op::LocalTee(_)) {
@@ -1644,6 +1755,17 @@ fn width_of_load(kind: crate::module::LoadKind) -> u32 {
         L::I32Load16S | L::I32Load16U | L::I64Load16S | L::I64Load16U => 2,
         L::I32 | L::F32 | L::I64Load32S | L::I64Load32U => 4,
         L::I64 | L::F64 => 8,
+    }
+}
+
+/// The value type a store writes, which is the type of what lives there.
+fn type_of_store(kind: crate::module::StoreKind) -> ValType {
+    use crate::module::StoreKind as S;
+    match kind {
+        S::I32 | S::I32Store8 | S::I32Store16 => ValType::I32,
+        S::I64 | S::I64Store8 | S::I64Store16 | S::I64Store32 => ValType::I64,
+        S::F32 => ValType::F32,
+        S::F64 => ValType::F64,
     }
 }
 
@@ -2396,7 +2518,17 @@ mod tests {
         unfolded.extend(unfolded_epilogue(32, 4));
 
         let (folded, unfolded) = (frame_of(folded), frame_of(unfolded));
-        assert_eq!(folded, unfolded);
+        // Everything but the prologue's length, which *is* the spelling: five
+        // instructions against ten, describing the same frame.
+        assert_eq!(folded.prologue, 5);
+        assert_eq!(unfolded.prologue, 10);
+        assert_eq!(
+            Frame {
+                prologue: 5,
+                ..unfolded.clone()
+            },
+            folded
+        );
         assert_eq!(unfolded.size, 32);
         assert_eq!(unfolded.base_local, 4);
         assert!(unfolded.publishes);
@@ -2626,7 +2758,9 @@ mod tests {
             Slot {
                 width: 4,
                 reads: 1,
-                writes: 2
+                writes: 2,
+                uniform: Some((4, ValType::I32)),
+                mixed: false,
             }
         );
         assert_eq!(
@@ -2634,7 +2768,9 @@ mod tests {
             Slot {
                 width: 4,
                 reads: 1,
-                writes: 0
+                writes: 0,
+                uniform: Some((4, ValType::I32)),
+                mixed: false,
             }
         );
         assert_eq!(
@@ -2642,7 +2778,9 @@ mod tests {
             Slot {
                 width: 1,
                 reads: 0,
-                writes: 1
+                writes: 1,
+                uniform: Some((1, ValType::I32)),
+                mixed: false,
             }
         );
     }
@@ -2791,7 +2929,9 @@ mod tests {
             Slot {
                 width: 4,
                 reads: 1,
-                writes: 1
+                writes: 1,
+                uniform: Some((4, ValType::I32)),
+                mixed: false,
             }
         );
     }

@@ -369,11 +369,19 @@ fn write_generated(
     layout: codegen::Layout,
     only: Option<&std::collections::BTreeSet<u32>>,
 ) {
-    let files = match only {
-        Some(only) => codegen::generate_only(module, layout, only),
-        None => codegen::generate_files(module, layout),
-    }
-    .expect("generating Rust");
+    write_generated_options(
+        scratch,
+        module,
+        &codegen::Options {
+            layout,
+            only: only.cloned(),
+            ..codegen::Options::default()
+        },
+    );
+}
+
+fn write_generated_options(scratch: &Path, module: &Module, options: &codegen::Options) {
+    let files = codegen::generate_options(module, options).expect("generating Rust");
     let single = scratch.join("generated.rs");
     let directory = scratch.join("generated");
     // Clear whichever form a previous run left, or `mod generated;` becomes
@@ -413,8 +421,26 @@ fn run_in_rust_with(
     layout: codegen::Layout,
     only: Option<&std::collections::BTreeSet<u32>>,
 ) -> Vec<String> {
+    run_in_rust_options(
+        name,
+        module,
+        calls,
+        &codegen::Options {
+            layout,
+            only: only.cloned(),
+            ..codegen::Options::default()
+        },
+    )
+}
+
+fn run_in_rust_options(
+    name: &str,
+    module: &Module,
+    calls: &[Call],
+    options: &codegen::Options,
+) -> Vec<String> {
     let scratch = workspace_scratch(name);
-    write_generated(&scratch, module, layout, only);
+    write_generated_options(&scratch, module, options);
 
     let mut main = String::from(
         "mod generated;\n\
@@ -618,6 +644,60 @@ pub fn assert_agrees_over_reachable(name: &str, wasm: &[u8], calls: &[Call]) {
             "the decompilation disagrees with the engine on {what}"
         );
     }
+}
+
+/// Runs `calls` on both sides at **level 1**, and asserts the answers agree
+/// while reporting what the memory cost was.
+///
+/// Level 1 promotes frame slots out of linear memory, so the memory comparison
+/// every other test makes is exactly the thing it gives up. What must still
+/// hold is everything the module *returns* — and that is checked against the
+/// engine rather than against another reading of the spec.
+///
+/// The memory is compared too, and reported rather than asserted either way: a
+/// run where it still matches is one where nothing was promoted, or where the
+/// promoted bytes happened to be what was already there, and both are worth
+/// seeing rather than hiding. Returns whether it matched.
+///
+/// # Panics
+///
+/// Panics with the first disagreement, naming the call that produced it.
+pub fn assert_agrees_at_level_1(name: &str, wasm: &[u8], calls: &[Call]) -> bool {
+    let module = Module::parse(wasm).expect("parsing the module under test");
+    let engine = run_in_node(name, wasm, calls, &module);
+    let ours = run_in_rust_options(
+        name,
+        &module,
+        calls,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            promote_frames: true,
+            ..codegen::Options::default()
+        },
+    );
+
+    assert_eq!(
+        engine.len(),
+        ours.len(),
+        "the two sides produced different numbers of lines\nengine: {engine:#?}\nours: {ours:#?}"
+    );
+    for (at, call) in calls.iter().enumerate() {
+        assert_eq!(
+            engine[at], ours[at],
+            "level 1 disagrees with the engine on {call:?}"
+        );
+    }
+    let memory_matches = engine.last() == ours.last();
+    eprintln!(
+        "{name}: level 1 agreed on {} calls; linear memory {}",
+        calls.len(),
+        if memory_matches {
+            "still matches"
+        } else {
+            "differs, which is what level 1 gives up"
+        }
+    );
+    memory_matches
 }
 
 /// Decompiles and compiles, without running. For modules with no callable

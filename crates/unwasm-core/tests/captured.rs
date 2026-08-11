@@ -108,6 +108,51 @@ fn main() {
     assert_eq!(pages % 65536, 0, "memory is a whole number of pages");
 }
 
+/// How much of a real module level 1 can actually place — measured, on the
+/// corpus, rather than estimated.
+///
+/// The number is the argument for the level being opt-in. Promotion needs a
+/// frame nothing else in the function can reach, and compiled C reaches its
+/// frames constantly: it passes `&point` to something, indexes an array in it,
+/// or packs two variables into one word. What survives all of that is a
+/// minority, and the size of the minority is what this prints.
+#[test]
+#[ignore = "reads the capture directory"]
+fn how_much_of_each_capture_level_1_can_place() {
+    let mut missing = Vec::new();
+    for (id, description) in CAPTURES {
+        let Some(bytes) = common::captured(id) else {
+            missing.push(*id);
+            continue;
+        };
+        let module = Module::parse(&bytes).expect("parses");
+        let analysis = unwasm_core::analysis::analyse(&module);
+        let import_count = module.func_imports.len() as u32;
+        let (mut promotable, mut slots, mut promoted) = (0usize, 0usize, 0usize);
+        for (index, frame) in &analysis.frames {
+            slots += frame.slots.len();
+            let body = &module.funcs[(index - import_count) as usize].body;
+            let placed = unwasm_core::analysis::promotable_slots(frame, body);
+            if !placed.is_empty() {
+                promotable += 1;
+            }
+            promoted += placed.len();
+        }
+        let frames = analysis.frames.len();
+        eprintln!(
+            "{id}: {promotable} of {frames} frames have something to promote, \
+             {promoted} of {slots} slots — {description}"
+        );
+        // The claim is only that the analysis answers, not that it answers
+        // generously: a module where nothing can be placed is a real result.
+        assert!(promoted <= slots);
+    }
+    assert!(
+        missing.is_empty(),
+        "these captures were not found: {missing:?}"
+    );
+}
+
 /// The VoIP module's own allocator, run.
 ///
 /// Everything else in this tier reads the big capture or compiles a small one.
