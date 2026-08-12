@@ -292,14 +292,21 @@ fn the_voip_module_leaves_every_import_that_is_not_a_trampoline() {
     let implementation = imports_impl(&skeleton);
     let methods = trait_methods(implementation);
 
-    // Stated as the arithmetic rather than as a number read off a run: 242
-    // imports, 136 of them generated — 134 `invoke_*` plus the two that have to
-    // reach back into the instance — and the host is asked for the other 106. A
-    // capture that rolls changes both sides together, which a bare
-    // `assert_eq!(methods, 106)` would not have said.
+    // Stated as the arithmetic rather than as a number read off a run: every
+    // import is either generated — 134 `invoke_*`, the two pthread ones and the
+    // three `mmap` ones, all of which have to reach back into the instance — or
+    // asked of the host. A capture that rolls changes both sides together,
+    // which a bare `assert_eq!(methods, 103)` would not have said.
+    let mmap = analysis.mmap.map_or(0, |mmap| {
+        [mmap.map, mmap.sync, mmap.unmap]
+            .iter()
+            .filter(|import| import.is_some())
+            .count()
+    });
     let generated = analysis.invokes.len()
         + usize::from(analysis.spawn.is_some())
-        + usize::from(analysis.init_main_thread.is_some());
+        + usize::from(analysis.init_main_thread.is_some())
+        + mmap;
     assert_eq!(
         methods,
         module.func_imports.len() - generated,
@@ -448,7 +455,9 @@ fn the_whole_mechanical_set_is_answered_with_the_real_signatures() {
         r#"(module
             (import "wasi_snapshot_preview1" "fd_read" (func (param i32 i32 i32 i32) (result i32)))
             (import "wasi_snapshot_preview1" "fd_pread" (func (param i32 i32 i32 i64 i32) (result i32)))
+            (import "wasi_snapshot_preview1" "fd_pwrite" (func (param i32 i32 i32 i64 i32) (result i32)))
             (import "wasi_snapshot_preview1" "fd_seek" (func (param i32 i64 i32 i32) (result i32)))
+            (import "wasi_snapshot_preview1" "fd_sync" (func (param i32) (result i32)))
             (import "wasi_snapshot_preview1" "fd_close" (func (param i32) (result i32)))
             (import "wasi_snapshot_preview1" "environ_sizes_get" (func (param i32 i32) (result i32)))
             (import "wasi_snapshot_preview1" "environ_get" (func (param i32 i32) (result i32)))
@@ -489,6 +498,15 @@ fn the_whole_mechanical_set_is_answered_with_the_real_signatures() {
             (import "env" "__syscall_lstat64" (func (param i32 i32) (result i32)))
             (import "env" "__syscall_fstat64" (func (param i32 i32) (result i32)))
             (import "env" "__syscall_newfstatat" (func (param i32 i32 i32 i32) (result i32)))
+            (import "env" "__syscall_chdir" (func (param i32) (result i32)))
+            (import "env" "__syscall_mkdirat" (func (param i32 i32 i32) (result i32)))
+            (import "env" "__syscall_getdents64" (func (param i32 i32 i32) (result i32)))
+            (import "env" "__syscall_ftruncate64" (func (param i32 i64) (result i32)))
+            (import "env" "__syscall_fcntl64" (func (param i32 i32 i32) (result i32)))
+            (import "env" "llvm_eh_typeid_for" (func (param i32) (result i32)))
+            (import "env" "_mktime_js" (func (param i32) (result i64)))
+            (import "env" "strftime_l" (func (param i32 i32 i32 i32 i32) (result i32)))
+            (import "env" "strftime" (func (param i32 i32 i32 i32) (result i32)))
             (import "env" "_localtime_js" (func (param i64 i32)))
             (import "env" "_gmtime_js" (func (param i64 i32) (result i32)))
             (import "env" "_tzset_js" (func (param i32 i32 i32 i32)))
@@ -551,6 +569,15 @@ fn the_whole_mechanical_set_is_answered_with_the_real_signatures() {
         // The older three-argument spelling, which has no second name.
         "runtime::tzset(caller, p0, p1, p2, 0)",
         "self.wasi.unlinkat(caller, p1)",
+        "self.wasi.fd_pwrite(caller, p0, p1, p2, p3, p4)",
+        "self.wasi.fd_sync(p0)",
+        "self.wasi.chdir(caller, p0)",
+        "self.wasi.mkdirat(caller, p1)",
+        "self.wasi.getdents64(caller, p0, p1, p2)",
+        "self.wasi.ftruncate(p0, p1)",
+        "self.wasi.fcntl(caller, p0, p1, p2)",
+        "runtime::mktime(caller, p0)",
+        "runtime::strftime(caller, p0, p1, p2, p3)",
         "-runtime::errno::NOTTY",
         "self.embind.decref(p0)",
         "self.embind.take_value()",

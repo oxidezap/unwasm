@@ -763,6 +763,57 @@ fn the_layout_a_module_gets_by_default_follows_its_size() {
     }
 }
 
+/// Indentation stops growing long before the nesting does.
+///
+/// A `br_table` dispatch in the VoIP module nests 2466 blocks, and indenting
+/// each one put 7964 spaces in front of every line inside it: one part file came
+/// to 650 MB, 644 MB of which was whitespace, and the module to 1.8 GB. Nothing
+/// could read that depth off the leading space anyway — the labels are what say
+/// where a `break` goes — so past a limit the space stops and the labels carry
+/// it.
+#[test]
+fn indentation_stops_growing_and_the_module_still_agrees() {
+    const DEPTH: usize = 200;
+    let mut wat = String::from(
+        "(module (memory (export \"memory\") 1)\n  (func (export \"deep\") (param i32) (result i32)\n",
+    );
+    for at in 0..DEPTH {
+        wat.push_str(&format!(
+            "    block\n    local.get 0\n    i32.const {at}\n    i32.eq\n    br_if 0\n"
+        ));
+    }
+    wat.push_str("    local.get 0\n    i32.const 1000\n    i32.add\n    return\n");
+    for _ in 0..DEPTH {
+        wat.push_str("    end\n");
+    }
+    wat.push_str("    local.get 0\n    i32.const 2\n    i32.mul))\n");
+
+    let wasm = common::assemble("deep-nesting", &wat);
+    let code = common::decompile(&wasm);
+    let widest = code
+        .lines()
+        .map(|line| line.len() - line.trim_start_matches(' ').len())
+        .max()
+        .expect("the module generated something");
+    assert!(
+        widest <= 4 * 32,
+        "a line was indented {widest} spaces, so the cap is not holding"
+    );
+    // The nesting is really there — this is a cap on the whitespace, not on the
+    // blocks — and the labels are what say so.
+    assert!(
+        code.contains(&format!("'b{}", DEPTH - 1)),
+        "the blocks themselves were lost"
+    );
+
+    // And the only thing that changed is whitespace, which the engine settles.
+    let calls: Vec<_> = [0, 7, 199, 500, -1]
+        .into_iter()
+        .map(|n| common::call("deep", &[common::Arg::I32(n)]))
+        .collect();
+    common::assert_agrees("deep-nesting", &wasm, &calls);
+}
+
 #[test]
 fn a_zero_sized_split_still_produces_one_function_per_file() {
     // A guard on the arithmetic rather than on the caller: zero per file would
@@ -1023,6 +1074,275 @@ fn a_leaf_frame_is_marked_as_not_published() {
             common::call("leaf", &[common::Arg::I32(0)]),
             common::call("leaf", &[common::Arg::I32(7)]),
         ],
+    );
+}
+
+/// Level 1: the frame slots that can be placed become Rust bindings.
+///
+/// This is the level that says it is giving something up. The struct in the C
+/// source below lives in the shadow stack at `-O0`, and at level 1 its fields
+/// are `let mut` bindings — so the function computes the same answers and stops
+/// leaving those bytes in linear memory. The differential test is what makes
+/// that sentence checkable: the *answers* are compared against the engine, and
+/// the memory is compared and reported rather than asserted.
+#[test]
+fn level_1_promotes_a_struct_out_of_the_shadow_stack() {
+    const SOURCE: &str = r#"
+        struct Point { int x; int y; int z; };
+        __attribute__((export_name("through_the_stack")))
+        int through_the_stack(int a, int b) {
+            struct Point point = { a, b, a ^ b };
+            point.z += point.x;
+            return point.x + point.y + point.z;
+        }
+    "#;
+    let wasm = common::compile_c("level1-struct", SOURCE, "-O0");
+
+    let plain = common::decompile(&wasm);
+    assert!(
+        plain.contains("self.memory.store32"),
+        "at level 0 the struct is memory:\n{}",
+        &plain[..plain.len().min(400)]
+    );
+
+    let module = Module::parse(&wasm).expect("valid");
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            promote_frames: true,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+    let code = &files[0].contents;
+
+    // The bindings, and the note that says what they cost.
+    assert!(code.contains("let mut s12: i32 = 0;"), "{code}");
+    assert!(code.contains("**Level 1**:"), "{code}");
+    assert!(
+        code.contains("never written back"),
+        "the cost is stated at the function:\n{code}"
+    );
+    // Filled from the frame on entry, so a slot read before it is written sees
+    // what was there.
+    assert!(
+        code.contains("s12 = self.memory.load32(frame, 12);"),
+        "{code}"
+    );
+
+    let calls: Vec<_> = [(0, 0), (1, 2), (-3, 7), (i32::MIN, -1)]
+        .into_iter()
+        .map(|(a, b)| {
+            common::call(
+                "through_the_stack",
+                &[common::Arg::I32(a), common::Arg::I32(b)],
+            )
+        })
+        .collect();
+    let memory_matches = common::assert_agrees_at_level_1("level1-struct", &wasm, &calls);
+    assert!(
+        !memory_matches,
+        "the bytes really did stop being written — if they still match, nothing was promoted"
+    );
+}
+
+/// The narrow fields too, which is where a promotion is easiest to get wrong.
+///
+/// A `short` and a `char` in the frame are one and two-byte accesses. The
+/// binding keeps them zero-extended, exactly as `load8_u` would return them, so
+/// a signed read has to sign-extend and a store has to mask. Either one wrong
+/// is a wrong answer, and the engine says which.
+#[test]
+fn level_1_gets_the_narrow_fields_right() {
+    const SOURCE: &str = r#"
+        struct Packed { int x; short y; signed char tag; unsigned char flag; };
+        __attribute__((export_name("through_a_packed_struct")))
+        int through_a_packed_struct(int a, int b) {
+            struct Packed p = { a, (short)b, (signed char)(a ^ b), (unsigned char)b };
+            p.y += (short)p.x;
+            p.tag = (signed char)(p.tag - 1);
+            return p.x + p.y + p.tag + p.flag;
+        }
+    "#;
+    let wasm = common::compile_c("level1-narrow", SOURCE, "-O0");
+    let calls: Vec<_> = [(0, 0), (5, -3), (1, 70000), (-1, 255), (300, -32768)]
+        .into_iter()
+        .map(|(a, b)| {
+            common::call(
+                "through_a_packed_struct",
+                &[common::Arg::I32(a), common::Arg::I32(b)],
+            )
+        })
+        .collect();
+    common::assert_agrees_at_level_1("level1-narrow", &wasm, &calls);
+}
+
+/// A frame level 1 refuses, and says why.
+///
+/// `memcpy` takes the address, so nothing can be claimed about what happens to
+/// the slots afterwards — and a slot promoted out of memory under an escaping
+/// address would be read stale by whatever the callee did.
+#[test]
+fn level_1_refuses_a_frame_it_cannot_see_every_access_to() {
+    const SOURCE: &str = r#"
+        void copy_bytes(void *destination, const void *source, unsigned long count);
+        __attribute__((export_name("leaks_its_frame")))
+        int leaks_its_frame(int n) {
+            char buffer[16];
+            for (int i = 0; i < 16; i++) buffer[i] = (char)(n + i);
+            char other[16];
+            copy_bytes(other, buffer, 16);
+            return other[0] + other[15];
+        }
+    "#;
+    let wasm = common::compile_c("level1-escaping", SOURCE, "-O0");
+    let module = Module::parse(&wasm).expect("valid");
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            promote_frames: true,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+    let code = &files[0].contents;
+    assert!(
+        code.contains("Level 1 promoted nothing here: the address leaves this function"),
+        "the refusal names the reason:\n{code}"
+    );
+    // And the frame is still memory, so the function is still exact.
+    assert!(code.contains("self.memory.store8"), "{code}");
+}
+
+/// A slot reached both ways is not promoted.
+///
+/// `frame + 8` computed with an `i32.add` and a memarg of 8 name the same byte.
+/// The walk resolves both; the emitter matches only the second. Promoting on
+/// the walk's count alone made the store go to memory and the load read a stale
+/// binding, and the function returned 0 where the engine returned its argument.
+#[test]
+fn level_1_refuses_a_slot_that_arithmetic_also_reaches() {
+    let wasm = common::assemble(
+        "level1-arith",
+        r#"(module
+            (memory (export "memory") 1)
+            (global $sp (export "__stack_pointer") (mut i32) (i32.const 65536))
+            (func (export "both_ways") (param i32) (result i32)
+                (local $frame i32)
+                global.get $sp i32.const 16 i32.sub local.tee $frame global.set $sp
+                ;; written through `frame + 8`, computed
+                local.get $frame i32.const 8 i32.add
+                local.get 0
+                i32.store
+                ;; read through the base and a static offset
+                local.get $frame
+                i32.load offset=8
+                local.get $frame i32.const 16 i32.add global.set $sp))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            promote_frames: true,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+    let code = &files[0].contents;
+    assert!(
+        code.contains("a slot is reached by arithmetic as well as by a static offset"),
+        "the refusal names the reason:\n{code}"
+    );
+    assert!(
+        !code.contains("let mut s8"),
+        "and nothing was promoted:\n{code}"
+    );
+    // Which is the point: it still agrees with the engine.
+    common::assert_agrees_at_level_1(
+        "level1-arith",
+        &wasm,
+        &[
+            common::call("both_ways", &[common::Arg::I32(7)]),
+            common::call("both_ways", &[common::Arg::I32(-1)]),
+        ],
+    );
+}
+
+/// And the refusal names the real blocker rather than the last one in the list.
+#[test]
+fn level_1_names_the_condition_that_actually_stopped_it() {
+    // One uniform slot, reached only by a static offset, inside the frame — and
+    // a `memory.fill` whose destination this cannot place.
+    let wasm = common::assemble(
+        "level1-bulk",
+        r#"(module
+            (memory (export "memory") 1)
+            (global $sp (export "__stack_pointer") (mut i32) (i32.const 65536))
+            (func (export "fills") (param i32) (result i32)
+                (local $frame i32)
+                global.get $sp i32.const 16 i32.sub local.tee $frame global.set $sp
+                local.get $frame local.get 0 i32.store offset=4
+                local.get 0 i32.const 0 i32.const 4 memory.fill
+                local.get $frame i32.load offset=4
+                local.get $frame i32.const 16 i32.add global.set $sp))"#,
+    );
+    let module = Module::parse(&wasm).expect("valid");
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            promote_frames: true,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+    assert!(
+        files[0]
+            .contents
+            .contains("`memory.fill`, `copy` or `init`"),
+        "{}",
+        files[0].contents
+    );
+}
+
+/// Level 0 is unchanged by any of this.
+#[test]
+fn level_0_is_what_it_was() {
+    const SOURCE: &str = r#"
+        struct Point { int x; int y; };
+        __attribute__((export_name("sum")))
+        int sum(int a, int b) {
+            struct Point point = { a, b };
+            return point.x + point.y;
+        }
+    "#;
+    let wasm = common::compile_c("level1-off", SOURCE, "-O0");
+    let module = Module::parse(&wasm).expect("valid");
+    let plain = codegen::generate_files(&module, codegen::Layout::Single).expect("generates");
+    let explicit = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            promote_frames: false,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+    assert_eq!(plain[0].contents, explicit[0].contents);
+    assert!(
+        !plain[0].contents.contains("Level 1"),
+        "and says nothing about a level it did not run"
+    );
+    common::assert_agrees(
+        "level1-off",
+        &wasm,
+        &[common::call(
+            "sum",
+            &[common::Arg::I32(3), common::Arg::I32(4)],
+        )],
     );
 }
 
@@ -1408,4 +1728,169 @@ fn main() {
         expected.push(byte.to_string());
     }
     assert_eq!(output.trim(), expected.join(","));
+}
+
+// ---- level 2 ----
+
+/// The C++ ABI's layout, written out by hand so the test says exactly which
+/// bytes the naming is claimed to rest on.
+///
+/// Four `type_info`s share a vptr, which is what confirms the kind; three of
+/// them point at the fourth as their base, which is what confirms that the third
+/// word is a base pointer. One function sits in all four vtables, which is what
+/// inheritance does and what must therefore stay unnamed.
+fn rtti_module() -> Vec<u8> {
+    const BASE: i32 = 1024;
+    let mut bytes: Vec<u8> = Vec::new();
+    let word = |bytes: &mut Vec<u8>, value: i32| bytes.extend_from_slice(&value.to_le_bytes());
+    let text = |bytes: &mut Vec<u8>, value: &str| {
+        let at = BASE + bytes.len() as i32;
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(0);
+        while !bytes.len().is_multiple_of(4) {
+            bytes.push(0);
+        }
+        at
+    };
+
+    let kind = BASE;
+    word(&mut bytes, 0);
+    word(&mut bytes, 0);
+
+    let base_name = text(&mut bytes, "4Base");
+    let base = BASE + bytes.len() as i32;
+    word(&mut bytes, kind);
+    word(&mut bytes, base_name);
+
+    // Three derived classes, because the base pointer is only read for a kind
+    // where enough members carry one — one derived class is not a group.
+    let mut derived = Vec::new();
+    for name in ["7Derived", "5Other", "5Third"] {
+        let name_at = text(&mut bytes, name);
+        derived.push(BASE + bytes.len() as i32);
+        word(&mut bytes, kind);
+        word(&mut bytes, name_at);
+        word(&mut bytes, base); // Itanium's single-base pointer
+    }
+
+    // A vtable each. Slot 1 is in all four — `Base`'s method, inherited — and
+    // slots 2 to 5 are each in one.
+    for (info, own) in [(base, 2)]
+        .into_iter()
+        .chain(derived.iter().copied().zip(3..))
+    {
+        word(&mut bytes, 0);
+        word(&mut bytes, info);
+        word(&mut bytes, 1);
+        word(&mut bytes, own);
+        word(&mut bytes, 0);
+    }
+
+    let mut data = String::new();
+    for byte in &bytes {
+        data.push_str(&format!("\\{byte:02x}"));
+    }
+    common::assemble(
+        "rtti-classes",
+        &format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (table 6 funcref)
+                (elem (i32.const 1) 0 1 2 3 4)
+                (data (i32.const {BASE}) "{data}")
+                (func (result i32) i32.const 1)
+                (func (result i32) i32.const 2)
+                (func (result i32) i32.const 3)
+                (func (result i32) i32.const 4)
+                (func (result i32) i32.const 5)
+                (func (export "go") (result i32) call 1))"#
+        ),
+    )
+}
+
+#[test]
+fn level_2_names_a_virtual_method_after_the_one_class_that_holds_it() {
+    let wasm = rtti_module();
+    let module = Module::parse(&wasm).expect("parses");
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            name_classes: true,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+    let code = &files[0].contents;
+
+    assert!(
+        code.contains("// Level 2 is on"),
+        "the header says so:\n{code}"
+    );
+    assert!(
+        code.contains("4 classes read out of the C++ RTTI"),
+        "and the summary counts them:\n{code}"
+    );
+    assert!(
+        code.contains("4 of them with a"),
+        "each with a vtable:\n{code}"
+    );
+
+    // A function one vtable holds is named after that class; the one three
+    // vtables hold is named after none of them.
+    for (function, name) in [
+        (1, "_Base_v1"),
+        (2, "_Derived_v1"),
+        (3, "_Other_v1"),
+        (4, "_Third_v1"),
+    ] {
+        assert!(
+            code.contains(&format!("fn f{function}{name}")),
+            "f{function} is {name}:\n{code}"
+        );
+    }
+    assert!(
+        !code.contains("f0_"),
+        "the inherited method is in all four, so it keeps its index:\n{code}"
+    );
+
+    // And the note carries the addresses, the mangled name and the base.
+    assert!(code.contains("**Level 2**: virtual method 1 of `Derived`"));
+    assert!(code.contains("named `7Derived`"));
+    assert!(code.contains("`Derived` derives from `Base`"));
+}
+
+#[test]
+fn level_2_on_a_module_with_no_rtti_says_it_found_none() {
+    let wasm = common::assemble(
+        "rtti-none",
+        r#"(module
+            (memory (export "memory") 1)
+            (data (i32.const 0) "hello, world\00")
+            (func (export "go") (result i32) i32.const 1))"#,
+    );
+    let module = Module::parse(&wasm).expect("parses");
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            name_classes: true,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+    let code = &files[0].contents;
+    assert!(code.contains("// Level 2 is on"), "{code}");
+    assert!(code.contains("found no C++ RTTI"), "{code}");
+    assert!(
+        !code.contains("classes read out of the C++ RTTI"),
+        "a table of zeros reads as a failure to look:\n{code}"
+    );
+}
+
+/// Level 2 is names. The module must do exactly what it did without them.
+#[test]
+fn level_2_changes_nothing_the_module_does() {
+    let wasm = rtti_module();
+    common::assert_agrees_at_level_2("rtti-classes", &wasm, &[common::call("go", &[])]);
 }

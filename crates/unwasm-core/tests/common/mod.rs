@@ -84,6 +84,19 @@ fn workspace_scratch(name: &str) -> PathBuf {
     path
 }
 
+/// rustc, with a stack big enough to parse what this emits.
+///
+/// wasm's nesting becomes Rust's, one labelled block per `block`, `loop` or
+/// `if`, and rustc's parser is recursive. The VoIP module's worst function nests
+/// 2466 blocks; on the default 8 MiB stack rustc overflows and dies with
+/// `SIGSEGV`, which reads as a compiler bug rather than as a file that needs a
+/// bigger stack — and it is what `unwasm decompile` now says before it happens.
+fn rustc() -> Command {
+    let mut command = tool("rustc");
+    command.env("RUST_MIN_STACK", "134217728");
+    command
+}
+
 fn tool(name: &str) -> Command {
     // A missing tool fails the test rather than skipping it: the alternative is
     // a green run that compared nothing.
@@ -160,17 +173,18 @@ pub fn assemble(name: &str, wat: &str) -> Vec<u8> {
     std::fs::read(&binary).expect("reading the assembled module")
 }
 
-/// Locates `emcc`.
+/// Locates one of Emscripten's compiler drivers, `emcc` or `em++`.
 ///
-/// The Arch package puts it in `/usr/lib/emscripten` and adds that to `PATH`
+/// The Arch package puts them in `/usr/lib/emscripten` and adds that to `PATH`
 /// through `/etc/profile.d`, which only applies to shells started afterwards —
-/// so a `cargo test` in an older shell would not find it. Looking in the known
-/// location as well means the tests do not depend on which shell ran them.
-fn emcc() -> Option<PathBuf> {
-    if Command::new("emcc").arg("--version").output().is_ok() {
-        return Some(PathBuf::from("emcc"));
+/// so a `cargo test` in an older shell would not find them. Looking in the
+/// known location as well means the tests do not depend on which shell ran
+/// them.
+fn emscripten_driver(name: &str) -> Option<PathBuf> {
+    if Command::new(name).arg("--version").output().is_ok() {
+        return Some(PathBuf::from(name));
     }
-    let packaged = PathBuf::from("/usr/lib/emscripten/emcc");
+    let packaged = PathBuf::from(format!("/usr/lib/emscripten/{name}"));
     packaged.exists().then_some(packaged)
 }
 
@@ -192,8 +206,15 @@ pub fn compile_emscripten(name: &str, source: &str, extension: &str, flags: &[&s
     let output_js = scratch.join("fixture.js");
     std::fs::write(&file, source).expect("writing the fixture");
 
-    let emcc = emcc().expect("emcc is required by this test; install the `emscripten` package");
-    let output = Command::new(emcc)
+    // `em++` for C++, not `emcc` with a `.cpp` argument. The driver decides
+    // which runtime to link, and emcc links libc only: on Emscripten 6 a C++
+    // fixture fails at the link with `undefined symbol: __cxa_throw` and a
+    // suggestion to use the other driver. It used to be linked anyway, so this
+    // is a toolchain difference rather than a fixture that was ever right.
+    let driver = if extension == "cpp" { "em++" } else { "emcc" };
+    let driver = emscripten_driver(driver)
+        .unwrap_or_else(|| panic!("{driver} is required by this test; install Emscripten"));
+    let output = Command::new(driver)
         .arg(&file)
         .args(["-sSTANDALONE_WASM", "--no-entry"])
         .args(flags)
@@ -286,11 +307,29 @@ fn run_in_node(name: &str, wasm: &[u8], calls: &[Call], module: &Module) -> Vec<
         })
         .unwrap_or_else(|| "null".to_string());
 
+    // Every function import the module declares, so the engine can instantiate
+    // it at all. Each one is a stub that *throws*, which is not a stub that
+    // answers: it is exactly what `NoImports` does on the other side, so a call
+    // that reaches a host is a trap in both runs rather than a zero in one of
+    // them and a trap in the other.
+    let function_imports = module
+        .func_imports
+        .iter()
+        .map(|import| {
+            format!(
+                "{{\"module\":\"{}\",\"field\":\"{}\"}}",
+                import.module, import.field
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
     let output = tool("node")
         .arg(&driver)
         .arg(&binary)
         .arg(format!("[{plan}]"))
         .arg(memory_import)
+        .arg(format!("[{function_imports}]"))
         .output()
         .expect("running node");
     assert!(
@@ -324,8 +363,25 @@ fn result_kind(module: &Module, export: &str) -> String {
 /// Both layouts land at `mod generated;`: Rust resolves that to `generated.rs`
 /// or to `generated/mod.rs`, so the driver is identical either way and the two
 /// layouts are compared by exactly the same tests.
-fn write_generated(scratch: &Path, module: &Module, layout: codegen::Layout) {
-    let files = codegen::generate_files(module, layout).expect("generating Rust");
+fn write_generated(
+    scratch: &Path,
+    module: &Module,
+    layout: codegen::Layout,
+    only: Option<&std::collections::BTreeSet<u32>>,
+) {
+    write_generated_options(
+        scratch,
+        module,
+        &codegen::Options {
+            layout,
+            only: only.cloned(),
+            ..codegen::Options::default()
+        },
+    );
+}
+
+fn write_generated_options(scratch: &Path, module: &Module, options: &codegen::Options) {
+    let files = codegen::generate_options(module, options).expect("generating Rust");
     let single = scratch.join("generated.rs");
     let directory = scratch.join("generated");
     // Clear whichever form a previous run left, or `mod generated;` becomes
@@ -355,8 +411,36 @@ fn run_in_rust_with_layout(
     calls: &[Call],
     layout: codegen::Layout,
 ) -> Vec<String> {
+    run_in_rust_with(name, module, calls, layout, None)
+}
+
+fn run_in_rust_with(
+    name: &str,
+    module: &Module,
+    calls: &[Call],
+    layout: codegen::Layout,
+    only: Option<&std::collections::BTreeSet<u32>>,
+) -> Vec<String> {
+    run_in_rust_options(
+        name,
+        module,
+        calls,
+        &codegen::Options {
+            layout,
+            only: only.cloned(),
+            ..codegen::Options::default()
+        },
+    )
+}
+
+fn run_in_rust_options(
+    name: &str,
+    module: &Module,
+    calls: &[Call],
+    options: &codegen::Options,
+) -> Vec<String> {
     let scratch = workspace_scratch(name);
-    write_generated(&scratch, module, layout);
+    write_generated_options(&scratch, module, options);
 
     let mut main = String::from(
         "mod generated;\n\
@@ -418,7 +502,7 @@ fn run_in_rust_with_layout(
     std::fs::write(scratch.join("main.rs"), &main).expect("writing the driver");
 
     let binary = scratch.join("driver");
-    let output = tool("rustc")
+    let output = rustc()
         .args(["--edition", "2024"])
         .arg("-o")
         .arg(&binary)
@@ -490,6 +574,177 @@ pub fn assert_agrees_with_layout(name: &str, wasm: &[u8], calls: &[Call], layout
     }
 }
 
+/// As [`assert_agrees`], decompiling only what the calls can reach.
+///
+/// For a capture too large to compile whole. The engine still runs the *whole*
+/// module — it is the file, untouched — so this is not a comparison of two
+/// slices: it is the module against a decompilation of the part of it these
+/// calls execute, and every function left out is one nothing on this path ever
+/// enters. A stub that was wrongly left out is not a quiet difference either;
+/// it is an `unimplemented!()`, and the run stops there.
+///
+/// Reachability is over *direct* calls only, which is `unwasm decompile
+/// --direct-only`. Following the table would be the complete answer and is not
+/// a reduction — 98% of the VoIP module is reachable once `call_indirect` is
+/// followed — so it is the direct closure that fits through rustc. That cannot
+/// buy a false pass: the engine still runs everything, and a stub the run
+/// reaches panics, which is compared against whatever the engine returned.
+///
+/// # Panics
+///
+/// Panics with the first disagreement, naming the call that produced it.
+pub fn assert_agrees_over_reachable(name: &str, wasm: &[u8], calls: &[Call]) {
+    let module = Module::parse(wasm).expect("parsing the module under test");
+    let analysis = unwasm_core::analysis::analyse(&module);
+    let mut only = std::collections::BTreeSet::new();
+    // The start function is a root whether or not anything calls it: both sides
+    // run it at instantiation, before the first call, so leaving it out is a
+    // panic before the comparison has begun.
+    if let Some(start) = module.start {
+        only.extend(analysis.directly_reachable_from(&module, start));
+    }
+    for call in calls {
+        let index = module
+            .exports
+            .iter()
+            .find(|export| {
+                export.kind == unwasm_core::module::ExportKind::Func && export.name == call.export
+            })
+            .unwrap_or_else(|| panic!("the module exports no `{}`", call.export))
+            .index;
+        only.extend(analysis.directly_reachable_from(&module, index));
+    }
+    eprintln!(
+        "{name}: {} of {} functions decompiled for {} calls",
+        only.len(),
+        module.funcs.len(),
+        calls.len()
+    );
+
+    let engine = run_in_node(name, wasm, calls, &module);
+    let ours = run_in_rust_with(
+        name,
+        &module,
+        calls,
+        codegen::Layout::for_module(&module),
+        Some(&only),
+    );
+
+    assert_eq!(
+        engine.len(),
+        ours.len(),
+        "the two sides produced different numbers of lines\nengine: {engine:#?}\nours: {ours:#?}"
+    );
+    for (at, (expected, actual)) in engine.iter().zip(ours.iter()).enumerate() {
+        let what = calls
+            .get(at)
+            .map_or_else(|| "linear memory".to_string(), |call| format!("{call:?}"));
+        assert_eq!(
+            expected, actual,
+            "the decompilation disagrees with the engine on {what}"
+        );
+    }
+}
+
+/// Runs `calls` on both sides at **level 1**, and asserts the answers agree
+/// while reporting what the memory cost was.
+///
+/// Level 1 promotes frame slots out of linear memory, so the memory comparison
+/// every other test makes is exactly the thing it gives up. What must still
+/// hold is everything the module *returns* — and that is checked against the
+/// engine rather than against another reading of the spec.
+///
+/// The memory is compared too, and reported rather than asserted either way: a
+/// run where it still matches is one where nothing was promoted, or where the
+/// promoted bytes happened to be what was already there, and both are worth
+/// seeing rather than hiding. Returns whether it matched.
+///
+/// # Panics
+///
+/// Panics with the first disagreement, naming the call that produced it.
+pub fn assert_agrees_at_level_1(name: &str, wasm: &[u8], calls: &[Call]) -> bool {
+    let module = Module::parse(wasm).expect("parsing the module under test");
+    let engine = run_in_node(name, wasm, calls, &module);
+    let ours = run_in_rust_options(
+        name,
+        &module,
+        calls,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            promote_frames: true,
+            ..codegen::Options::default()
+        },
+    );
+
+    assert_eq!(
+        engine.len(),
+        ours.len(),
+        "the two sides produced different numbers of lines\nengine: {engine:#?}\nours: {ours:#?}"
+    );
+    for (at, call) in calls.iter().enumerate() {
+        assert_eq!(
+            engine[at], ours[at],
+            "level 1 disagrees with the engine on {call:?}"
+        );
+    }
+    let memory_matches = engine.last() == ours.last();
+    eprintln!(
+        "{name}: level 1 agreed on {} calls; linear memory {}",
+        calls.len(),
+        if memory_matches {
+            "still matches"
+        } else {
+            "differs, which is what level 1 gives up"
+        }
+    );
+    memory_matches
+}
+
+/// As [`assert_agrees`], with level 2's names on.
+///
+/// Level 2 is names and comments, so this is the test of that claim: the same
+/// calls, the whole of linear memory, and the level-0 assertion unweakened.
+/// Where level 1 gives up byte-exactness and says so, level 2 gives up nothing
+/// — a class name that changed a result would be a bug of the same severity as
+/// wrong arithmetic, and the memory comparison is what would catch it.
+///
+/// It also compiles the renamed output, which is the other thing that can go
+/// wrong: a demangled name reaching an identifier position unsanitised, or two
+/// classes naming one function the same way.
+///
+/// # Panics
+///
+/// Panics with the first disagreement, naming the call that produced it.
+pub fn assert_agrees_at_level_2(name: &str, wasm: &[u8], calls: &[Call]) {
+    let module = Module::parse(wasm).expect("parsing the module under test");
+    let engine = run_in_node(name, wasm, calls, &module);
+    let ours = run_in_rust_options(
+        name,
+        &module,
+        calls,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            name_classes: true,
+            ..codegen::Options::default()
+        },
+    );
+
+    assert_eq!(
+        engine.len(),
+        ours.len(),
+        "the two sides produced different numbers of lines\nengine: {engine:#?}\nours: {ours:#?}"
+    );
+    for (at, (expected, actual)) in engine.iter().zip(ours.iter()).enumerate() {
+        let what = calls
+            .get(at)
+            .map_or_else(|| "linear memory".to_string(), |call| format!("{call:?}"));
+        assert_eq!(
+            expected, actual,
+            "level 2 disagrees with the engine on {what} — a name changed a result"
+        );
+    }
+}
+
 /// Decompiles and compiles, without running. For modules with no callable
 /// entry point worth driving, where the claim under test is only that the
 /// output builds.
@@ -518,11 +773,11 @@ pub fn run_with_driver_in_layout(
 ) -> String {
     let module = Module::parse(wasm).expect("parsing the module under test");
     let scratch = workspace_scratch(name);
-    write_generated(&scratch, &module, layout);
+    write_generated(&scratch, &module, layout, None);
     std::fs::write(scratch.join("main.rs"), driver).expect("writing the driver");
 
     let binary = scratch.join("driver");
-    let output = tool("rustc")
+    let output = rustc()
         .args(["--edition", "2024"])
         .arg("-o")
         .arg(&binary)
@@ -566,7 +821,7 @@ pub fn run_with_generated(name: &str, generated: &str, driver: &str) -> String {
     write_atomically(&scratch.join("main.rs"), driver.as_bytes());
 
     let binary = scratch.join("driver");
-    let output = tool("rustc")
+    let output = rustc()
         .args(["--edition", "2024"])
         .arg("-o")
         .arg(&binary)
@@ -686,6 +941,19 @@ if (memoryImport) {
   if (memoryImport.maximum !== null) descriptor.maximum = memoryImport.maximum;
   if (memoryImport.shared) descriptor.shared = true;
   imports[memoryImport.module] = {[memoryImport.field]: new WebAssembly.Memory(descriptor)};
+}
+
+// The function imports, each one a stub that throws. A module with 242 of them
+// cannot be instantiated without something in every slot, and what goes there
+// has to be what `NoImports` does on the other side: no host was supplied, so
+// reaching one is a trap in both runs. A stub returning 0 would make the two
+// sides disagree about which of them was even asked.
+for (const {module: from, field} of JSON.parse(process.argv[5] || '[]')) {
+  imports[from] = imports[from] || {};
+  if (field in imports[from]) continue;
+  imports[from][field] = () => {
+    throw new WebAssembly.RuntimeError(`no host was supplied for ${from}::${field}`);
+  };
 }
 
 const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), imports);

@@ -488,3 +488,141 @@ fn main() {
          stack of its own, and the join returned"
     );
 }
+
+/// Level 2 reads the C++ ABI's own declarations.
+///
+/// The class here is polymorphic, so Emscripten emits a `type_info` carrying
+/// its mangled name and a vtable holding the table slots its virtual calls
+/// land on. Both are written down; recovering them is reading, not inferring.
+/// What is *not* written down anywhere is the method's own name — only its
+/// position in the vtable — which is why the name it gets carries the index.
+#[test]
+#[ignore = "needs emcc"]
+fn level_2_names_a_class_and_its_virtual_methods() {
+    const SOURCE: &str = r#"
+        struct Shape {
+            virtual ~Shape() {}
+            virtual int area() const { return 0; }
+            virtual int perimeter() const { return 1; }
+        };
+        struct Square : Shape {
+            int side;
+            explicit Square(int s) : side(s) {}
+            int area() const override { return side * side; }
+            int perimeter() const override { return 4 * side; }
+        };
+        extern "C" {
+        __attribute__((export_name("area_of")))
+        int area_of(int side) {
+            Square square(side);
+            Shape *shape = &square;
+            // The `dynamic_cast` is what makes the compiler write the
+            // `type_info` down: a vtable alone does not need one, and clang
+            // emits the name only where something asks for it.
+            Square *back = dynamic_cast<Square *>(shape);
+            return back ? back->area() : -1;
+        }
+        }
+    "#;
+    let wasm = compile_emscripten("em-classes", SOURCE, "cpp", &["-O1", "-frtti"]);
+    let module = Module::parse(&wasm).expect("parses");
+    let analysis = unwasm_core::analysis::analyse(&module);
+    let (classes, evidence) = unwasm_core::analysis::classes(&module, &analysis.placements);
+
+    let square = classes
+        .iter()
+        .find(|class| class.short == "Square")
+        .unwrap_or_else(|| panic!("no Square among {:?}", names(&classes)));
+    assert_eq!(square.mangled, "6Square", "the name the compiler wrote");
+    assert_eq!(square.name, "Square");
+    assert!(square.vtable.is_some(), "a polymorphic class has one");
+    assert!(
+        square.methods.len() >= 4,
+        "two destructors and two overrides: {:?}",
+        square.methods
+    );
+    assert!(
+        classes.iter().any(|class| class.short == "Shape"),
+        "the base is declared too: {:?}",
+        names(&classes)
+    );
+    eprintln!(
+        "em-classes: {} classes, {} with vtables, {} kinds",
+        evidence.classes, evidence.with_vtables, evidence.kinds
+    );
+
+    // And the names reach the output, with what they rest on.
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            name_classes: true,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+    let code = &files[0].contents;
+    assert!(code.contains("_Square_v"), "a method is named after it");
+    assert!(
+        code.contains("**Level 2**: virtual method"),
+        "and says which"
+    );
+    assert!(
+        code.contains("`6Square`"),
+        "with the mangled name as evidence"
+    );
+    assert!(
+        code.contains("classes read out of the C++ RTTI"),
+        "and a summary"
+    );
+
+    // Level 2 is names and comments. It must not change what the module does —
+    // which is asserted with the names on, against the engine, memory included.
+    let calls: Vec<_> = [0, 3, -2, 46341]
+        .into_iter()
+        .map(|side| call("area_of", &[I32(side)]))
+        .collect();
+    assert_agrees("em-classes", &wasm, &calls);
+    common::assert_agrees_at_level_2("em-classes-l2", &wasm, &calls);
+
+    // A vtable says who owns a function. It does not say the body is written
+    // out somewhere else under that name, which is the whole premise of
+    // `--stub-recognised` — so the two together must not drop a method's body.
+    let files = codegen::generate_options(
+        &module,
+        &codegen::Options {
+            layout: codegen::Layout::Single,
+            name_classes: true,
+            stub_recognised: true,
+            ..codegen::Options::default()
+        },
+    )
+    .expect("generates");
+    let stubbed = &files[0].contents;
+    assert!(stubbed.contains("_Square_v"), "still named after its class");
+    assert!(
+        !stubbed.contains("left out by --stub-recognised"),
+        "and no catalogue recognised anything here, so nothing was left out"
+    );
+}
+
+/// A module built from C declares no classes, and says so rather than finding
+/// some.
+#[test]
+#[ignore = "needs emcc"]
+fn a_c_module_declares_no_classes() {
+    const SOURCE: &str = r#"
+        __attribute__((export_name("twice")))
+        int twice(int n) { return n * 2; }
+    "#;
+    let wasm = compile_emscripten("em-no-classes", SOURCE, "c", &["-O1"]);
+    let module = Module::parse(&wasm).expect("parses");
+    let analysis = unwasm_core::analysis::analyse(&module);
+    let (classes, evidence) = unwasm_core::analysis::classes(&module, &analysis.placements);
+    assert!(classes.is_empty(), "{:?}", names(&classes));
+    assert_eq!(evidence.kinds, 0);
+}
+
+fn names(classes: &[unwasm_core::analysis::Class]) -> Vec<&str> {
+    classes.iter().map(|class| class.short.as_str()).collect()
+}

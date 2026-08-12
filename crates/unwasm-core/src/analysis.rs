@@ -19,6 +19,12 @@ pub enum Evidence {
     /// The module exports it under the name the linker gives it. Conclusive,
     /// and present in unstripped builds.
     Exported,
+    /// The name section names it. Just as conclusive as an export and rather
+    /// more common in a debug build: the linker writes `__stack_pointer` into
+    /// the name section whether or not it also exports the global, and a
+    /// module that names it has said which global holds the C stack rather
+    /// than left it to be read off how the code uses it.
+    Named,
     /// Found by its use: the function prologue that reserves a frame.
     ///
     /// ```wat
@@ -52,6 +58,42 @@ pub struct Slot {
     pub reads: usize,
     /// How many times it is written.
     pub writes: usize,
+    /// The width and type every access agreed on, if they all did.
+    ///
+    /// `None` once two accesses disagree — a four-byte store and a one-byte
+    /// load at the same offset is a union, a narrowing, or two variables the
+    /// compiler packed together, and none of the three is one variable. This is
+    /// what decides whether the slot can become a single Rust binding.
+    pub uniform: Option<(u32, ValType)>,
+    /// Set once two accesses disagreed, so a third that happens to match the
+    /// first cannot put [`Self::uniform`] back.
+    pub mixed: bool,
+    /// Whether any access reached this offset by arithmetic rather than by the
+    /// base local and a static offset.
+    ///
+    /// `frame + 8` computed with an `i32.add` names the same byte as a memarg
+    /// of 8, and the walk resolves both — but only the second is a shape the
+    /// emitter recognises. A slot reached both ways would be a binding at one
+    /// access and memory at the other, so level 1 refuses it.
+    pub indirect: bool,
+}
+
+impl Slot {
+    /// Records an access, and whether it still looks like one variable.
+    fn observe(&mut self, width: u32, ty: ValType) {
+        self.width = self.width.max(width);
+        if self.mixed {
+            return;
+        }
+        match self.uniform {
+            None => self.uniform = Some((width, ty)),
+            Some(seen) if seen == (width, ty) => {}
+            Some(_) => {
+                self.uniform = None;
+                self.mixed = true;
+            }
+        }
+    }
 }
 
 /// A function's stack frame, as far as its own code reveals it.
@@ -91,6 +133,18 @@ pub struct Frame {
     /// one — a constant store past the end is a bug a compiler would have to
     /// have emitted on purpose.
     pub computed_writes: usize,
+    /// Whether the frame address was ever copied into another local.
+    ///
+    /// A copy is followed rather than given up on, so it is not an escape — but
+    /// it does mean an access can reach a slot through a local other than the
+    /// base. Anything that promotes a slot to a Rust binding has to see *every*
+    /// access to it, so it asks for a frame nobody copied.
+    pub copied: bool,
+    /// How many instructions the prologue occupies.
+    ///
+    /// Where the frame address becomes valid, which is the earliest point
+    /// anything can be initialised from it.
+    pub prologue: usize,
 }
 
 impl Frame {
@@ -190,6 +244,95 @@ pub struct Spawn {
     pub thread_exit: Option<u32>,
     /// The type of the start routine: `(i32) -> i32`, by index.
     pub entry_type: u32,
+}
+
+/// The `mmap` family, when the module supplies everything they need.
+///
+/// Emscripten's glue answers `__mmap_js` by allocating with the module's *own*
+/// allocator and reading the file into it — so it reaches back into the
+/// instance, which is what makes it something to generate rather than to ask a
+/// host for. Same shape as the pthread glue: the parts are named, checked, and
+/// if any is missing the import stays the host's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mmap {
+    /// `env::_mmap_js`, if the module imports it.
+    pub map: Option<u32>,
+    /// `env::_munmap_js`.
+    pub unmap: Option<u32>,
+    /// `env::_msync_js`.
+    pub sync: Option<u32>,
+    /// The exported `emscripten_builtin_memalign`, which is where the mapping
+    /// comes from. Without it there is nowhere to put a file.
+    pub memalign: u32,
+    /// The exported `free`, which releases the scratch an iovec needs and the
+    /// mapping `munmap` gives back.
+    pub free: u32,
+    /// The imported `fd_pread`, which is how the bytes get in. A mapping
+    /// invented without reading the file is a page of zeros presented as a
+    /// file, which is worse than saying it is not written.
+    pub pread: u32,
+    /// The imported `fd_pwrite`, which is how `msync` gets them out.
+    pub pwrite: Option<u32>,
+}
+
+/// Finds the `mmap` glue, if every part of it is there.
+fn find_mmap(module: &Module) -> Option<Mmap> {
+    let import = |field: &str, params: &[ValType], results: &[ValType]| -> Option<u32> {
+        let at = module
+            .func_imports
+            .iter()
+            .position(|import| import.field == field)? as u32;
+        let ty = module
+            .types
+            .get(module.func_imports[at as usize].type_index as usize)?;
+        (ty.params == params && ty.results == results).then_some(at)
+    };
+    use ValType::{I32, I64};
+
+    // `__mmap_js(len, prot, flags, fd, offset, allocated, addr) -> errno`, and
+    // the two that unwind it. A different shape is a different function, and
+    // reading the wrong argument as a file descriptor is exactly the kind of
+    // mistake a signature check exists to stop.
+    let map = import("_mmap_js", &[I32, I32, I32, I32, I64, I32, I32], &[I32]);
+    let unmap = import("_munmap_js", &[I32, I32, I32, I32, I32, I64], &[I32]);
+    let sync = import("_msync_js", &[I32, I32, I32, I32, I32, I64], &[I32]);
+    if map.is_none() && unmap.is_none() && sync.is_none() {
+        return None;
+    }
+
+    let memalign = find_export(module, &["emscripten_builtin_memalign", "memalign"])?;
+    let free = find_export(module, &["free"])?;
+    if func_type_of(module, memalign)?.params != vec![I32, I32]
+        || func_type_of(module, memalign)?.results != vec![I32]
+        || func_type_of(module, free)?.params != vec![I32]
+        || !func_type_of(module, free)?.results.is_empty()
+    {
+        return None;
+    }
+    let pread = import("fd_pread", &[I32, I32, I32, I64, I32], &[I32])?;
+    let pwrite = import("fd_pwrite", &[I32, I32, I32, I64, I32], &[I32]);
+
+    // Writing a mapping back needs `fd_pwrite`. Without it those two stay the
+    // host's — claiming them and then emitting nothing would leave a call to a
+    // method that does not exist, and the output has to compile.
+    let (sync, unmap) = if pwrite.is_some() {
+        (sync, unmap)
+    } else {
+        (None, None)
+    };
+    if map.is_none() && sync.is_none() && unmap.is_none() {
+        return None;
+    }
+
+    Some(Mmap {
+        map,
+        unmap,
+        sync,
+        memalign,
+        free,
+        pread,
+        pwrite,
+    })
 }
 
 /// `__emscripten_init_main_thread_js`, which is the main thread's version of
@@ -454,6 +597,9 @@ pub struct Analysis {
     pub spawn: Option<Spawn>,
     /// The main thread's own initialisation, when the module asks for it.
     pub init_main_thread: Option<InitMainThread>,
+    /// The `mmap` glue, when the module supplies the allocator and the reads
+    /// it needs.
+    pub mmap: Option<Mmap>,
     /// Where each passive data segment is placed, by segment index, when the
     /// module places it at a constant address.
     pub placements: std::collections::BTreeMap<u32, Placement>,
@@ -567,11 +713,121 @@ pub fn analyse(module: &Module) -> Analysis {
         registrations: find_registrations(module, &placements),
         spawn: find_spawn(module),
         init_main_thread: find_init_main_thread(module),
+        mmap: find_mmap(module),
         table: read_table(module),
         hot_addresses: find_hot_addresses(module, &placements),
         call_graph: read_call_graph(module),
     }
 }
+
+/// The frame slots that could become Rust bindings instead of memory.
+///
+/// This is the question level 1 asks, and the answer is deliberately hard to
+/// earn. A slot is promotable only when *every* access to the frame is one this
+/// can see and place:
+///
+/// - the address never escapes and was never copied into another local, so
+///   every access goes through the base local and nothing else can reach it;
+/// - no store goes through an address computed from the frame at run time —
+///   an indexed array write could land on any slot;
+/// - the function has no `memory.fill`, `memory.copy` or `memory.init`, whose
+///   destination is a value rather than an offset and could cover the frame;
+/// - the slot's accesses all used one width and one type, so it is one
+///   variable rather than a union or a packed pair;
+/// - and the slot lies inside the frame and overlaps no other.
+///
+/// What it does *not* prove is that no unrelated pointer aliases the region.
+/// Nothing in a wasm module says a store cannot land below the stack pointer,
+/// and no compiler emits one — which is an assumption, and is why this is a
+/// level that says it is guessing rather than the default.
+#[must_use]
+pub fn promotable_slots(
+    frame: &Frame,
+    body: &[Op],
+) -> std::collections::BTreeMap<i32, (u32, ValType)> {
+    let mut promoted = std::collections::BTreeMap::new();
+    if frame.escapes || frame.computed_writes > 0 || frame.copied {
+        return promoted;
+    }
+    if body
+        .iter()
+        .any(|op| matches!(op, Op::MemoryFill | Op::MemoryCopy | Op::MemoryInit(_)))
+    {
+        return promoted;
+    }
+    for (offset, slot) in &frame.slots {
+        // Reached by arithmetic somewhere, so the emitter cannot see every
+        // access to it: `frame + 8` computed with an `i32.add` names the same
+        // byte a memarg of 8 does, and only the second is a shape it matches.
+        if slot.indirect {
+            continue;
+        }
+        let Some((width, ty)) = slot.uniform else {
+            continue;
+        };
+        // Inside the frame it reserved. A slot past the end is a write into the
+        // caller's frame, which `writes_outside` reports and which nothing here
+        // is going to quietly turn into a variable.
+        if *offset < 0 || offset.saturating_add(width as i32) > frame.size {
+            continue;
+        }
+        // And overlapping nothing. Two slots sharing a byte are not two
+        // variables, whatever their widths agreed on separately.
+        let overlaps = frame.slots.iter().any(|(other, candidate)| {
+            other != offset
+                && *other < offset + width as i32
+                && offset < &(other + candidate.width.max(1) as i32)
+        });
+        if overlaps {
+            continue;
+        }
+        promoted.insert(*offset, (width, ty));
+    }
+    promoted
+}
+
+/// The most deeply nested function in the module, and how deep it goes.
+///
+/// wasm's nesting becomes Rust's, one labelled block per `block`, `loop` or
+/// `if` — and rustc parses that recursively on an 8 MiB stack. A module whose
+/// `br_table` dispatch nests two thousand blocks makes rustc overflow it and
+/// die with `SIGSEGV`, which reads as a compiler bug rather than as a module
+/// that needs a bigger stack. Knowing the number before compiling is what turns
+/// that into `RUST_MIN_STACK`.
+///
+/// Returns `None` for a module with no functions.
+#[must_use]
+pub fn deepest_nesting(module: &Module) -> Option<(u32, usize)> {
+    let import_count = module.func_imports.len() as u32;
+    let mut deepest: Option<(u32, usize)> = None;
+    for (at, func) in module.funcs.iter().enumerate() {
+        let mut depth = 0usize;
+        let mut most = 0usize;
+        for op in &func.body {
+            match op {
+                Op::Block(_) | Op::Loop(_) | Op::If(_) => {
+                    depth += 1;
+                    most = most.max(depth);
+                }
+                Op::End => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if deepest.is_none_or(|(_, seen)| most > seen) {
+            deepest = Some((import_count + at as u32, most));
+        }
+    }
+    deepest
+}
+
+/// How deep a function can nest before rustc's default stack is not enough.
+///
+/// Not a guess: rustc parses 2466 nested blocks — the VoIP module's worst
+/// function — by overflowing an 8 MiB stack, and compiles the same file with
+/// `RUST_MIN_STACK` raised. The threshold is set well below that, because the
+/// cost of saying so unnecessarily is a line of output and the cost of not
+/// saying so is a segfault nobody can place.
+pub const NESTING_RUSTC_HANDLES: usize = 300;
 
 /// Reads the call graph out of the function bodies.
 fn read_call_graph(module: &Module) -> CallGraph {
@@ -1391,9 +1647,17 @@ fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame>
         escapes: false,
         publishes: prologue.publishes,
         computed_writes: 0,
+        copied: false,
+        prologue: prologue.length,
     };
 
     let mut stack: Vec<Tracked> = Vec::new();
+    // What each local holds, for the locals this walk has watched being
+    // written. At `-O0` an older clang routes every intermediate value through
+    // one of these — the size of the frame, and the frame address itself in the
+    // epilogue — so a walk that only follows the operand stack sees a function
+    // whose frame escapes immediately and can say nothing about it.
+    let mut locals: std::collections::BTreeMap<u32, Tracked> = std::collections::BTreeMap::new();
     for op in &body[prologue.length..] {
         // Control flow ends what this walk can follow. If the frame address is
         // live across it, the analysis gives up rather than losing track of
@@ -1403,13 +1667,28 @@ fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame>
                 frame.escapes = true;
                 return Some(frame);
             }
+            // A local written on one path and read on another holds whatever
+            // the path that ran put there, and this walk follows one path. So
+            // what a local holds is forgotten at the boundary — and a local
+            // holding the frame address when it is forgotten has gone somewhere
+            // this can no longer follow, which is what `escapes` says.
+            if locals
+                .values()
+                .any(|value| matches!(value, Tracked::Frame(_) | Tracked::Derived))
+            {
+                frame.escapes = true;
+            }
+            locals.clear();
             stack.clear();
             continue;
         }
 
         match op {
             Op::LocalGet(index) if *index == base_local => stack.push(Tracked::Frame(0)),
-            Op::LocalGet(_) | Op::GlobalGet(_) => stack.push(Tracked::Other),
+            Op::LocalGet(index) => {
+                stack.push(locals.get(index).copied().unwrap_or(Tracked::Other));
+            }
+            Op::GlobalGet(_) => stack.push(Tracked::Other),
             Op::I32Const(value) => stack.push(Tracked::Const(*value)),
             Op::I64Const(_) | Op::F32Const(_) | Op::F64Const(_) => stack.push(Tracked::Other),
 
@@ -1442,7 +1721,8 @@ fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame>
                 if let Tracked::Frame(at) = address {
                     let offset = at + mem.offset as i32;
                     let slot = frame.slots.entry(offset).or_default();
-                    slot.width = slot.width.max(width_of_load(*kind));
+                    slot.observe(width_of_load(*kind), kind.result());
+                    slot.indirect |= at != 0;
                     slot.reads += 1;
                 }
                 stack.push(Tracked::Other);
@@ -1458,7 +1738,8 @@ fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame>
                 if let Tracked::Frame(at) = address {
                     let offset = at + mem.offset as i32;
                     let slot = frame.slots.entry(offset).or_default();
-                    slot.width = slot.width.max(width_of_store(*kind));
+                    slot.observe(width_of_store(*kind), type_of_store(*kind));
+                    slot.indirect |= at != 0;
                     slot.writes += 1;
                 }
                 if matches!(address, Tracked::Derived) {
@@ -1476,10 +1757,25 @@ fn read_frame(module: &Module, body: &[Op], stack_pointer: u32) -> Option<Frame>
 
             Op::LocalSet(index) | Op::LocalTee(index) => {
                 let value = stack.pop().unwrap_or(Tracked::Other);
-                // The base being reassigned, or copied somewhere this walk no
-                // longer follows.
-                if matches!(value, Tracked::Frame(_)) || *index == base_local {
+                // The base being reassigned: the local this frame is named
+                // after no longer holds it, and every offset read after this
+                // point would be measured from the wrong address.
+                if *index == base_local {
                     frame.escapes = true;
+                } else {
+                    // Anything else is followed rather than given up on. A copy
+                    // of the frame address is still the frame address, and the
+                    // epilogue of an unoptimised build is exactly that.
+                    // Only a copy that could still reach a slot counts. The
+                    // epilogue copies `frame + size` on its way back to the
+                    // stack pointer, and a memarg offset is never negative, so
+                    // that address cannot name anything inside the frame — and
+                    // treating it as a copy would refuse level 1 on every
+                    // function an unoptimised clang built.
+                    if matches!(value, Tracked::Frame(at) if at < size) {
+                        frame.copied = true;
+                    }
+                    locals.insert(*index, value);
                 }
                 if matches!(op, Op::LocalTee(_)) {
                     stack.push(value);
@@ -1571,6 +1867,17 @@ fn width_of_load(kind: crate::module::LoadKind) -> u32 {
     }
 }
 
+/// The value type a store writes, which is the type of what lives there.
+fn type_of_store(kind: crate::module::StoreKind) -> ValType {
+    use crate::module::StoreKind as S;
+    match kind {
+        S::I32 | S::I32Store8 | S::I32Store16 => ValType::I32,
+        S::I64 | S::I64Store8 | S::I64Store16 | S::I64Store32 => ValType::I64,
+        S::F32 => ValType::F32,
+        S::F64 => ValType::F64,
+    }
+}
+
 fn width_of_store(kind: crate::module::StoreKind) -> u32 {
     use crate::module::StoreKind as S;
     match kind {
@@ -1590,95 +1897,175 @@ struct Prologue {
     publishes: bool,
 }
 
-/// Matches the prologue: `global.get $sp; i32.const size; i32.sub`, then some
-/// way of keeping the result.
+/// Matches the prologue against the stack pointer this module was told to use.
+fn read_prologue(body: &[Op], stack_pointer: u32) -> Option<Prologue> {
+    let (global, prologue) = match_prologue(body)?;
+    (global == stack_pointer).then_some(prologue)
+}
+
+/// Matches the prologue: the stack pointer, less a constant, kept in a local.
 ///
-/// Three spellings turn up in practice, and the third was a surprise:
+/// Four spellings turn up in practice, and the last two were surprises:
 ///
 /// ```wat
-/// local.tee $base   global.set $sp     ;; the usual one
-/// local.set $base   local.get $base   global.set $sp
-/// local.set $base                      ;; a leaf function at -O0
+/// global.get $sp  i32.const 32  i32.sub  local.tee $base  global.set $sp
+/// global.get $sp  i32.const 32  i32.sub  local.set $base  local.get $base  global.set $sp
+/// global.get $sp  i32.const 32  i32.sub  local.set $base   ;; a leaf function at -O0
+/// global.get $sp  local.set $a  i32.const 32  local.set $b ;; every value through a local
+/// local.get $a    local.get $b  i32.sub       local.set $base
 /// ```
 ///
-/// The last one never writes the stack pointer back. clang emits it for a
-/// function that calls nothing: the space below the pointer is nobody else's
-/// while it runs, so reserving it formally would be wasted work. Requiring the
+/// The third never writes the stack pointer back. clang emits it for a function
+/// that calls nothing: the space below the pointer is nobody else's while it
+/// runs, so reserving it formally would be wasted work. Requiring the
 /// `global.set` — which this did at first — misses every one of them.
-fn read_prologue(body: &[Op], stack_pointer: u32) -> Option<Prologue> {
-    let Op::GlobalGet(index) = body.first()? else {
+///
+/// The fourth is what clang 18 emits at `-O0`, where every intermediate value
+/// goes through its own local and the subtraction reads two of them rather than
+/// the operand stack. clang 22 folds it; the two compilers describe the same
+/// frame. Missing this spelling is how the analysis reported that a module
+/// built by an older clang had no frames at all — a false statement about the
+/// code, made from the compiler's spelling rather than from the module's.
+fn match_prologue(body: &[Op]) -> Option<(u32, Prologue)> {
+    let Op::GlobalGet(global) = body.first()? else {
         return None;
     };
-    if *index != stack_pointer {
-        return None;
-    }
-    let Op::I32Const(size) = body.get(1)? else {
-        return None;
+    // The folded spellings read the stack pointer and the size straight off the
+    // operand stack; the unfolded one parks both in locals first.
+    let (size, rest) = match (body.get(1)?, body.get(2)?, body.get(3)?) {
+        (Op::I32Const(size), Op::Num(sub), _) if sub.name() == "I32Sub" => (*size, 3),
+        (Op::LocalSet(pointer), Op::I32Const(size), Op::LocalSet(reserved)) => {
+            if !matches!(body.get(4)?, Op::LocalGet(index) if index == pointer) {
+                return None;
+            }
+            if !matches!(body.get(5)?, Op::LocalGet(index) if index == reserved) {
+                return None;
+            }
+            if !matches!(body.get(6)?, Op::Num(sub) if sub.name() == "I32Sub") {
+                return None;
+            }
+            (*size, 7)
+        }
+        _ => return None,
     };
-    if *size <= 0 {
-        return None;
-    }
-    if !matches!(body.get(2)?, Op::Num(num) if num.name() == "I32Sub") {
+    if size <= 0 {
         return None;
     }
 
-    match body.get(3)? {
-        Op::LocalTee(base) => match body.get(4) {
-            Some(Op::GlobalSet(sp)) if *sp == stack_pointer => Some(Prologue {
-                size: *size,
-                base_local: *base,
-                length: 5,
-                publishes: true,
-            }),
-            _ => Some(Prologue {
-                size: *size,
-                base_local: *base,
-                length: 4,
-                publishes: false,
-            }),
-        },
-        Op::LocalSet(base) => {
-            let published = matches!(
-                (body.get(4), body.get(5)),
-                (Some(Op::LocalGet(again)), Some(Op::GlobalSet(sp)))
-                    if again == base && *sp == stack_pointer
-            );
-            Some(Prologue {
-                size: *size,
-                base_local: *base,
-                length: if published { 6 } else { 4 },
-                publishes: published,
-            })
+    // However it got here, the reserved address is now on the stack, and what
+    // keeps it decides both which local names the frame and whether the
+    // reservation is published.
+    let (base_local, kept) = match body.get(rest)? {
+        Op::LocalTee(base) | Op::LocalSet(base) => (*base, matches!(body[rest], Op::LocalTee(_))),
+        _ => return None,
+    };
+    let (length, publishes) = match (kept, body.get(rest + 1), body.get(rest + 2)) {
+        // `local.tee $base; global.set $sp`
+        (true, Some(Op::GlobalSet(sp)), _) if sp == global => (rest + 2, true),
+        // `local.set $base; local.get $base; global.set $sp`
+        (false, Some(Op::LocalGet(again)), Some(Op::GlobalSet(sp)))
+            if again == &base_local && sp == global =>
+        {
+            (rest + 3, true)
         }
-        _ => None,
-    }
+        _ => (rest + 1, false),
+    };
+    Some((
+        *global,
+        Prologue {
+            size,
+            base_local,
+            length,
+            publishes,
+        },
+    ))
 }
 
 /// The names a linker gives the stack pointer when it keeps names at all.
 const STACK_POINTER_NAMES: &[&str] = &["__stack_pointer", "_stack_pointer", "stackPointer"];
 
 fn find_stack_pointer(module: &Module) -> Option<StackPointer> {
-    // An exported name settles it without any guessing.
+    // A name settles it without any guessing — but only for a global that is
+    // there. An index past the end names a field the output does not declare,
+    // and the generated Rust would not compile, which is the one thing it must
+    // always do. An imported global cannot shift the numbering here: this
+    // decompiler refuses those by name rather than modelling them.
+    let declared = |index: u32| module.globals.get(index as usize).map(|_| index);
+
+    // An exported name is the module's own declaration.
     for export in &module.exports {
-        if export.kind == ExportKind::Global && STACK_POINTER_NAMES.contains(&export.name.as_str())
+        if export.kind == ExportKind::Global
+            && STACK_POINTER_NAMES.contains(&export.name.as_str())
+            && let Some(global) = declared(export.index)
         {
             return Some(StackPointer {
-                global: export.index,
+                global,
                 evidence: Evidence::Exported,
+            });
+        }
+    }
+
+    // Failing that, the name section. It survives `--export-all` not reaching
+    // a mutable global, which is how a debug build can name the stack pointer
+    // in every disassembly and still not export it.
+    for (index, name) in &module.global_names {
+        if STACK_POINTER_NAMES.contains(&name.as_str())
+            && let Some(global) = declared(*index)
+        {
+            return Some(StackPointer {
+                global,
+                evidence: Evidence::Named,
             });
         }
     }
 
     // Otherwise, count prologues. A minified module keeps no names, but it
     // still has to reserve stack frames, and only one global is used that way.
-    let mut counts = vec![0usize; module.globals.len()];
+    //
+    // Two counts, because they are not equally good evidence. A prologue that
+    // writes the reservation back says the global is shared with everything the
+    // function calls, which is what a stack pointer is for, and the shape alone
+    // is enough. A leaf's prologue only takes the space, and `global.get;
+    // i32.const; i32.sub; local.set` is also just arithmetic on a global — so
+    // that one is counted only when the function goes on to address memory
+    // through the reserved address, which is what makes it a frame rather than
+    // a number.
+    //
+    // The published ones decide it whenever there are any; the bare
+    // reservations answer only for a build where nothing writes it back at all,
+    // which is what an older clang emits for a module whose functions are all
+    // leaves.
+    let mut published = vec![0usize; module.globals.len()];
+    let mut unpublished: Vec<(u32, &[Op])> = Vec::new();
     for func in &module.funcs {
-        if let Some(global) = prologue_global(&func.body)
-            && let Some(count) = counts.get_mut(global as usize)
-        {
-            *count += 1;
+        let Some((global, prologue)) = match_prologue(&func.body) else {
+            continue;
+        };
+        if prologue.publishes {
+            if let Some(count) = published.get_mut(global as usize) {
+                *count += 1;
+            }
+        } else {
+            unpublished.push((global, &func.body));
         }
     }
+    // The second walk only happens when the first found nothing. Reading every
+    // leaf's frame to fill a tally that is about to be thrown away is a whole
+    // extra pass over 14733 functions on the module where it matters most, and
+    // an Emscripten build always has published prologues.
+    let counts = if published.iter().any(|count| *count > 0) {
+        published
+    } else {
+        let mut addressed = vec![0usize; module.globals.len()];
+        for (global, body) in unpublished {
+            if read_frame(module, body, global).is_some_and(|frame| !frame.slots.is_empty())
+                && let Some(count) = addressed.get_mut(global as usize)
+            {
+                *count += 1;
+            }
+        }
+        addressed
+    };
 
     let (global, functions) = counts
         .iter()
@@ -1703,35 +2090,513 @@ fn find_stack_pointer(module: &Module) -> Option<StackPointer> {
     })
 }
 
-/// Recognises `global.get G; i32.const N; i32.sub; ...; global.set G` at the
-/// start of a function, and returns `G`.
+// ---- what a C++ module declares about its own classes ----
+
+/// A C++ class the module declares, and what it declares about it.
 ///
-/// The instructions between the subtraction and the store vary — clang emits a
-/// `local.tee` to keep the frame address, and at `-O0` there is often nothing
-/// at all — so the shape is matched at its two ends rather than exactly.
-fn prologue_global(body: &[Op]) -> Option<u32> {
-    let mut ops = body.iter();
-    let global = match ops.next()? {
-        Op::GlobalGet(index) => *index,
-        _ => return None,
-    };
-    match ops.next()? {
-        Op::I32Const(size) if *size > 0 => size,
-        _ => return None,
-    };
-    if !matches!(ops.next()?, Op::Num(op) if op.name() == "I32Sub") {
-        return None;
-    }
-    // The store back must be to the same global, and must come before anything
-    // that could be a different function's business.
-    for op in ops.take(3) {
-        match op {
-            Op::GlobalSet(index) if *index == global => return Some(global),
-            Op::LocalTee(_) | Op::LocalSet(_) => {}
-            _ => return None,
+/// This is not inference from how the code behaves. Itanium's ABI puts a
+/// `type_info` object in the data segments for every polymorphic class and a
+/// vtable beside it, and both are *written down*: the class's name is a string
+/// the compiler emitted, and the vtable's entries are the table slots its
+/// virtual calls land on. Recovering them is reading a declaration, not
+/// guessing at one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Class {
+    /// Where the `type_info` object sits.
+    pub type_info: i32,
+    /// The name exactly as the module wrote it, mangled.
+    ///
+    /// Kept beside the readable form because it is the evidence: a demangling
+    /// this could not do in full is still checkable against the bytes.
+    pub mangled: String,
+    /// The readable form, as far as it could be read. The mangled string when
+    /// it could not be read at all.
+    pub name: String,
+    /// The last component of the name, without template arguments — what a
+    /// function derived from this class is named after.
+    pub short: String,
+    /// The `type_info` of the class this one derives from, when the module
+    /// writes one down.
+    ///
+    /// `None` covers both "no base" and "more than one": Itanium spells single
+    /// inheritance as a third word and everything else as a variable-length
+    /// record this does not read, so an absent base is *unstated*, not stated
+    /// to be absent.
+    pub base: Option<i32>,
+    /// Where the vtable sits, when one points at this `type_info`.
+    pub vtable: Option<i32>,
+    /// The functions the vtable holds, in order, by function index.
+    pub methods: Vec<u32>,
+}
+
+/// What the class recovery rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClassEvidence {
+    /// How many distinct `__class_type_info` vtables the classes share.
+    ///
+    /// Itanium gives every `type_info` a vtable pointer, and there are only a
+    /// handful of them in a program — one per *kind* of type_info. So a pointer
+    /// hundreds of `type_info` objects agree on is that; one a single candidate
+    /// has is two words that happened to look like a pair.
+    pub kinds: usize,
+    /// How many classes were confirmed that way.
+    pub classes: usize,
+    /// How many of them a vtable points at.
+    pub with_vtables: usize,
+    /// How many of them the count alone missed, and a confirmed class named as
+    /// its base.
+    pub by_base: usize,
+}
+
+/// How many `type_info` candidates have to share a vtable pointer before it is
+/// one.
+///
+/// Measured rather than picked. The floor was swept over the whole corpus: at 2
+/// two of the three C modules — which declare no classes at all — each report a
+/// kind and two classes, and both are accidents; at 3 all three report none,
+/// while the C++ modules and the tiny emscripten fixture are unchanged. Raising
+/// it further only loses real ones: at 4 `JgwtTQVeWPm` drops three classes and
+/// one of its five kinds. So 3 is the lowest value that admits no accident,
+/// which is the side to err on — a wrong class name is worse than none.
+const TYPE_INFO_KIND_FLOOR: usize = 3;
+
+/// The classes a module declares, and what they rest on.
+///
+/// Not part of [`analyse`]: it reads every four-byte-aligned word of the data
+/// segments, which on a 10 MiB module is worth doing when asked and not on
+/// every run.
+#[must_use]
+pub fn classes(
+    module: &Module,
+    placements: &std::collections::BTreeMap<u32, Placement>,
+) -> (Vec<Class>, ClassEvidence) {
+    let image = DataImage::of(module, placements);
+    let table = read_table(module);
+
+    // Every `{something, name}` pair whose second word points at a mangled
+    // type name. Most are real; the rest are two words that happened to line up.
+    let mut candidates: Vec<(i32, i32, String)> = Vec::new();
+    for (base, bytes) in &image.segments {
+        let mut at = base.next_multiple_of(4);
+        while (at as u64) + 8 <= u64::from(*base) + bytes.len() as u64 {
+            if let (Some(kind), Some(name_at)) =
+                (image.read32(at as i32), image.read32(at as i32 + 4))
+                && kind != 0
+                && let Some(name) = image.cstring(name_at)
+                && is_mangled_type(&name)
+            {
+                candidates.push((at as i32, kind, name));
+            }
+            at += 4;
         }
     }
-    None
+
+    // The counted evidence: a vtable pointer only a few candidates share is not
+    // `__class_type_info`, it is a coincidence.
+    let mut kinds: std::collections::BTreeMap<i32, usize> = Default::default();
+    for (_, kind, _) in &candidates {
+        *kinds.entry(*kind).or_default() += 1;
+    }
+    kinds.retain(|kind, count| {
+        *count >= TYPE_INFO_KIND_FLOOR && image.holds(*kind) && image.holds(*kind + 4)
+    });
+
+    let by_address: std::collections::BTreeMap<i32, (i32, String)> = candidates
+        .iter()
+        .map(|(at, kind, mangled)| (*at, (*kind, mangled.clone())))
+        .collect();
+
+    let mut classes: std::collections::BTreeMap<i32, Class> = Default::default();
+    let mut confirmed_kind: std::collections::BTreeMap<i32, i32> = Default::default();
+    for (at, kind, mangled) in candidates {
+        if !kinds.contains_key(&kind) {
+            continue;
+        }
+        confirmed_kind.insert(at, kind);
+        let (name, short) = demangle_type(&mangled);
+        classes.insert(
+            at,
+            Class {
+                type_info: at,
+                mangled,
+                name,
+                short,
+                base: None,
+                vtable: None,
+                methods: Vec::new(),
+            },
+        );
+    }
+
+    // Itanium gives a singly-inherited class a third word: its base's
+    // `type_info`. Which of the confirmed kinds that is, is counted rather than
+    // assumed — the single-inheritance kind has members whose third word points
+    // at another `type_info`, and a kind of two-word objects does not.
+    //
+    // The one reading that has to be excluded is a pointer into the object
+    // itself: a three-word `type_info` occupies `[at, at + 12)`, so a "base"
+    // at one of those addresses would be the object overlapping itself. That
+    // is a coincidence rather than a base, and what says so is the object's
+    // own bounds rather than a guess about how the segments are laid out.
+    let base_of = |at: i32| -> Option<i32> {
+        let base = image.read32(at + 8)?;
+        (by_address.contains_key(&base) && !(at..at + 12).contains(&base)).then_some(base)
+    };
+    let single_inheritance: std::collections::BTreeSet<i32> = kinds
+        .keys()
+        .copied()
+        .filter(|kind| {
+            confirmed_kind
+                .iter()
+                .filter(|(at, member)| *member == kind && base_of(**at).is_some())
+                .count()
+                >= TYPE_INFO_KIND_FLOOR
+        })
+        .collect();
+
+    // Which is also the one way a class the count missed still gets named: a
+    // base named by a confirmed derived class is written down by the module, not
+    // inferred from it. One hop only — the admitted class's own kind was never
+    // confirmed, so its third word is not read as a base.
+    let mut adopt: Vec<(i32, i32)> = Vec::new();
+    for (at, kind) in &confirmed_kind {
+        if !single_inheritance.contains(kind) {
+            continue;
+        }
+        if let Some(base) = base_of(*at) {
+            adopt.push((*at, base));
+        }
+    }
+    let mut by_base = 0usize;
+    for (at, base) in adopt {
+        if let Some(class) = classes.get_mut(&at) {
+            class.base = Some(base);
+        }
+        if classes.contains_key(&base) {
+            continue;
+        }
+        let (_, mangled) = &by_address[&base];
+        let (name, short) = demangle_type(mangled);
+        classes.insert(
+            base,
+            Class {
+                type_info: base,
+                mangled: mangled.clone(),
+                name,
+                short,
+                base: None,
+                vtable: None,
+                methods: Vec::new(),
+            },
+        );
+        by_base += 1;
+    }
+
+    // And the vtables: `{offset-to-top, type_info*, slot, slot, …}`, which is
+    // Itanium's layout. Three independent things have to agree — a zero, a
+    // `type_info` already confirmed, and a run of live table slots — which is
+    // what makes a vtable recognisable at all.
+    let highest = table.keys().max().copied().unwrap_or(0);
+    for (base, bytes) in &image.segments {
+        let mut at = base.next_multiple_of(4);
+        while (at as u64) + 8 <= u64::from(*base) + bytes.len() as u64 {
+            let here = at as i32;
+            at += 4;
+            if image.read32(here) != Some(0) {
+                continue;
+            }
+            let Some(info) = image.read32(here + 4) else {
+                continue;
+            };
+            if !classes.contains_key(&info) {
+                continue;
+            }
+            let mut methods = Vec::new();
+            let mut cursor = here + 8;
+            while let Some(slot) = image.read32(cursor) {
+                if slot <= 0 || slot as u32 > highest {
+                    break;
+                }
+                let Some(func) = table.get(&(slot as u32)) else {
+                    break;
+                };
+                methods.push(*func);
+                cursor += 4;
+            }
+            if methods.is_empty() {
+                continue;
+            }
+            // The first vtable wins. A class has one; a second match at another
+            // address is a construction-vtable or an accident, and picking
+            // between them is not something the bytes decide.
+            let class = classes.get_mut(&info).expect("just checked");
+            if class.vtable.is_none() {
+                class.vtable = Some(here);
+                class.methods = methods;
+            }
+        }
+    }
+
+    let classes: Vec<Class> = classes.into_values().collect();
+    let evidence = ClassEvidence {
+        kinds: kinds.len(),
+        classes: classes.len(),
+        with_vtables: classes
+            .iter()
+            .filter(|class| class.vtable.is_some())
+            .count(),
+        by_base,
+    };
+    (classes, evidence)
+}
+
+/// Whether a string is the shape `_ZTS` holds for a class type.
+///
+/// A leading digit is a source name and a leading `N` a nested one; those two
+/// are the class types, which are the ones a vtable belongs to. Anything else —
+/// a builtin, a pointer, a function type — is not something to name a class
+/// after.
+fn is_mangled_type(name: &str) -> bool {
+    name.len() >= 3
+        && name
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'N')
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' || ch == '.')
+}
+
+/// Reads an Itanium type name into something a person can read, and says so
+/// only as far as it got.
+///
+/// Returns `(readable, short)` — the whole path, and its last component without
+/// template arguments, which is what a function derived from the class is
+/// named after. When the name cannot be read at all, both are the mangled
+/// string: **a wrong name is worse than a mangled one**, and this is the same
+/// rule the fingerprint catalogue follows.
+///
+/// What it reads is the part that carries the meaning: nested names, source
+/// names, and `St` for `std`. What it deliberately does *not* read is the
+/// inside of a template argument list, because that needs Itanium's
+/// substitution table — `NS_9allocatorIS1_EE` refers back to components by
+/// number — and a substitution resolved wrongly is a name that says something
+/// the module did not. So `I…E` comes out as `<…>`: the class is named, and the
+/// instantiation is visibly elided rather than invented.
+fn demangle_type(mangled: &str) -> (String, String) {
+    let unreadable = || (mangled.to_string(), mangled.to_string());
+    let bytes = mangled.as_bytes();
+    let mut at = 0usize;
+
+    // A bare source name: `20WasmShimErrorHandler`.
+    let source_name = |at: &mut usize| -> Option<String> {
+        let start = *at;
+        while bytes.get(*at).is_some_and(u8::is_ascii_digit) {
+            *at += 1;
+        }
+        if *at == start {
+            return None;
+        }
+        let length: usize = mangled[start..*at].parse().ok()?;
+        let end = at.checked_add(length)?;
+        let name = mangled.get(*at..end)?;
+        *at = end;
+        Some(name.to_string())
+    };
+
+    // `I … E`, skipped as a whole: what is inside needs the substitution table,
+    // and finding the end is counting rather than parsing.
+    //
+    // Counting bytes is not enough, though. A source name's *text* can hold any
+    // letter — `12_GLOBAL__N_1` is the anonymous namespace, and it carries an
+    // `N` — so a scan that counts letters wherever it finds them goes out of
+    // step and swallows the `E` that closes the name around the list. Ten names
+    // in the VoIP module read as demangled that way, correctly by luck. So a
+    // source name is skipped by its length, and only the five characters that
+    // really open a scope are counted.
+    let skip_template = |at: &mut usize| -> Option<()> {
+        let mut depth = 0usize;
+        loop {
+            let byte = *bytes.get(*at)?;
+            if byte.is_ascii_digit() {
+                let start = *at;
+                while bytes.get(*at).is_some_and(u8::is_ascii_digit) {
+                    *at += 1;
+                }
+                let length: usize = mangled[start..*at].parse().ok()?;
+                *at = at.checked_add(length)?;
+                if *at > bytes.len() {
+                    return None;
+                }
+                continue;
+            }
+            // A substitution is `S <seq-id> _`, and its sequence id is base 36 —
+            // so it holds letters that would otherwise read as openers, and
+            // digits that would otherwise read as a source name's length.
+            if byte == b'S' {
+                *at += 1;
+                let id = *at;
+                while bytes
+                    .get(*at)
+                    .is_some_and(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+                {
+                    *at += 1;
+                }
+                if bytes.get(*at) == Some(&b'_') {
+                    *at += 1;
+                } else if *at == id {
+                    // `St`, `Sa`, `Ss` — the fixed abbreviations, two characters
+                    // and no underscore. `St3__2` is one of them followed by a
+                    // source name, and reading the `3` as an id loses both.
+                    *at += 1;
+                }
+                continue;
+            }
+            match byte {
+                // `I` a template list, `N` a nested name, `J` an argument pack,
+                // `Z` a local name, `L` a literal, `F` a function type — each
+                // closed by `E`.
+                b'I' | b'N' | b'J' | b'Z' | b'L' | b'F' => depth += 1,
+                b'E' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        *at += 1;
+                        return Some(());
+                    }
+                }
+                _ => {}
+            }
+            *at += 1;
+        }
+    };
+
+    let mut components: Vec<String> = Vec::new();
+    let nested = bytes.first() == Some(&b'N');
+    if nested {
+        at += 1;
+    }
+    // `N` opens a scope `E` closes. A scope that never closes is a name that
+    // ran out, not a name that ended, and the two must not read the same.
+    let mut closed = !nested;
+    loop {
+        match bytes.get(at) {
+            None => break,
+            Some(b'E') if nested => {
+                at += 1;
+                closed = true;
+                break;
+            }
+            // `St` is `std`, and the only substitution with a fixed meaning.
+            Some(b'S') if bytes.get(at + 1) == Some(&b't') => {
+                at += 2;
+                components.push("std".to_string());
+            }
+            Some(b'I') => {
+                // A template argument list belongs to the component before it.
+                if skip_template(&mut at).is_none() {
+                    return unreadable();
+                }
+                match components.last_mut() {
+                    Some(last) => last.push_str("<…>"),
+                    None => return unreadable(),
+                }
+            }
+            Some(byte) if byte.is_ascii_digit() => match source_name(&mut at) {
+                Some(name) => components.push(name),
+                None => return unreadable(),
+            },
+            // Anything else — a substitution, a qualifier, a builtin — is a
+            // construct this does not read, and guessing at it is the one thing
+            // it must not do.
+            Some(_) => return unreadable(),
+        }
+    }
+    if components.is_empty() || at != bytes.len() || !closed {
+        return unreadable();
+    }
+    let short = components
+        .last()
+        .expect("just checked")
+        .split('<')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    (components.join("::"), short)
+}
+
+/// The data segments as one addressable image.
+struct DataImage<'a> {
+    /// Each placed segment: where it starts, and its bytes.
+    segments: Vec<(u32, &'a [u8])>,
+}
+
+impl<'a> DataImage<'a> {
+    fn of(module: &'a Module, placements: &std::collections::BTreeMap<u32, Placement>) -> Self {
+        let mut segments = Vec::new();
+        for (index, segment) in module.datas.iter().enumerate() {
+            let base = match segment.offset {
+                Some(ConstExpr::I32(base)) => base as u32,
+                Some(_) => continue,
+                None => match placements.get(&(index as u32)) {
+                    // The placement records where a *part* of the segment went;
+                    // the segment's own start is that much earlier.
+                    Some(placement) => {
+                        match (placement.address as u32).checked_sub(placement.offset) {
+                            Some(base) => base,
+                            None => continue,
+                        }
+                    }
+                    None => continue,
+                },
+            };
+            if !segment.bytes.is_empty() {
+                segments.push((base, segment.bytes.as_slice()));
+            }
+        }
+        segments.sort_by_key(|(base, _)| *base);
+        Self { segments }
+    }
+
+    /// The bytes at an address, if a segment covers them.
+    fn bytes(&self, address: i32, length: usize) -> Option<&'a [u8]> {
+        let address = address as u32;
+        let at = self
+            .segments
+            .partition_point(|(base, _)| *base <= address)
+            .checked_sub(1)?;
+        let (base, bytes) = self.segments[at];
+        let within = (address - base) as usize;
+        bytes.get(within..within + length)
+    }
+
+    fn read32(&self, address: i32) -> Option<i32> {
+        let bytes = self.bytes(address, 4)?;
+        Some(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn holds(&self, address: i32) -> bool {
+        self.bytes(address, 1).is_some()
+    }
+
+    /// The NUL-terminated printable text at an address.
+    fn cstring(&self, address: i32) -> Option<String> {
+        let bytes = self.bytes(address, 1)?;
+        let _ = bytes;
+        let mut out = Vec::new();
+        let mut cursor = address;
+        loop {
+            let byte = *self.bytes(cursor, 1)?.first()?;
+            if byte == 0 {
+                break;
+            }
+            if !byte.is_ascii_graphic() || out.len() >= 512 {
+                return None;
+            }
+            out.push(byte);
+            cursor += 1;
+        }
+        (!out.is_empty()).then(|| String::from_utf8_lossy(&out).into_owned())
+    }
 }
 
 /// The NUL-terminated text at an address, if a data segment puts text there.
@@ -1975,6 +2840,87 @@ mod tests {
     }
 
     #[test]
+    fn the_deepest_nesting_is_the_deepest_one_function_reaches() {
+        // Two functions, and the answer is the deeper one — not the sum, and
+        // not the last. Nesting that closes and reopens is not deeper.
+        let shallow = vec![
+            Op::Block(crate::module::BlockType::Empty),
+            Op::End,
+            Op::Block(crate::module::BlockType::Empty),
+            Op::Block(crate::module::BlockType::Empty),
+            Op::End,
+            Op::End,
+        ];
+        let deep = vec![
+            Op::Block(crate::module::BlockType::Empty),
+            Op::Loop(crate::module::BlockType::Empty),
+            Op::If(crate::module::BlockType::Empty),
+            Op::End,
+            Op::End,
+            Op::End,
+        ];
+        let module = with_bodies(module_with_globals(1, true), vec![shallow, deep]);
+        assert_eq!(deepest_nesting(&module), Some((1, 3)));
+        assert_eq!(deepest_nesting(&Module::default()), None);
+    }
+
+    #[test]
+    fn the_name_section_settles_it_when_nothing_exports_it() {
+        // A debug build names the stack pointer and does not necessarily export
+        // it: `--export-all` under some linkers leaves the mutable global out.
+        // The name is still the module saying which global it is.
+        let mut module = module_with_globals(3, true);
+        module.global_names.push((1, "__stack_pointer".into()));
+        let found = analyse(&module).stack_pointer.expect("named");
+        assert_eq!(found.global, 1);
+        assert_eq!(found.evidence, Evidence::Named);
+    }
+
+    #[test]
+    fn an_export_outranks_a_name() {
+        // Both are conclusive, so this is only about which one is quoted back;
+        // the export is the module's interface and cannot be stripped without
+        // changing it.
+        let mut module = module_with_globals(3, true);
+        module.global_names.push((1, "__stack_pointer".into()));
+        module.exports.push(crate::module::Export {
+            name: "__stack_pointer".into(),
+            kind: ExportKind::Global,
+            index: 2,
+        });
+        let found = analyse(&module).stack_pointer.expect("named");
+        assert_eq!(found.global, 2);
+        assert_eq!(found.evidence, Evidence::Exported);
+    }
+
+    #[test]
+    fn a_global_named_something_else_is_not_taken_for_it() {
+        let mut module = module_with_globals(1, true);
+        module.global_names.push((0, "__heap_base".into()));
+        assert!(analyse(&module).stack_pointer.is_none());
+    }
+
+    #[test]
+    fn a_name_for_a_global_that_is_not_there_names_nothing() {
+        // The index reaches the output as a field name. One past the end would
+        // be `self.g9_stack_pointer` on a struct that declares one global, and
+        // the generated Rust would not compile — which is the one thing it must
+        // always do. Both naming routes are checked, since a malformed module
+        // can carry either.
+        let mut module = module_with_globals(1, true);
+        module.global_names.push((9, "__stack_pointer".into()));
+        assert!(analyse(&module).stack_pointer.is_none());
+
+        let mut module = module_with_globals(1, true);
+        module.exports.push(crate::module::Export {
+            name: "__stack_pointer".into(),
+            kind: ExportKind::Global,
+            index: 9,
+        });
+        assert!(analyse(&module).stack_pointer.is_none());
+    }
+
+    #[test]
     fn the_prologue_identifies_it_in_a_stripped_module() {
         let module = with_bodies(
             module_with_globals(2, true),
@@ -2141,6 +3087,178 @@ mod tests {
         }
     }
 
+    /// The same frame, spelled the way clang 18 spells it at `-O0`: every
+    /// intermediate value parked in its own local, including the stack pointer
+    /// and the size, so the subtraction reads two locals rather than the
+    /// operand stack.
+    fn unfolded_prologue(size: i32, base: u32) -> Vec<Op> {
+        vec![
+            Op::GlobalGet(0),
+            Op::LocalSet(8),
+            Op::I32Const(size),
+            Op::LocalSet(9),
+            Op::LocalGet(8),
+            Op::LocalGet(9),
+            Op::Num(NumOp::I32Sub),
+            Op::LocalSet(base),
+            Op::LocalGet(base),
+            Op::GlobalSet(0),
+        ]
+    }
+
+    /// The epilogue that goes with it: the size through a local again, and the
+    /// restored pointer through one more before it reaches the global.
+    fn unfolded_epilogue(size: i32, base: u32) -> Vec<Op> {
+        vec![
+            Op::I32Const(size),
+            Op::LocalSet(9),
+            Op::LocalGet(base),
+            Op::LocalGet(9),
+            Op::Num(NumOp::I32Add),
+            Op::LocalSet(10),
+            Op::LocalGet(10),
+            Op::GlobalSet(0),
+        ]
+    }
+
+    #[test]
+    fn a_frame_reads_the_same_whether_the_prologue_is_folded_or_not() {
+        // The two compilers describe the same frame. An analysis that only
+        // knows the folded spelling reports that a module built by the other
+        // one has no frames at all, which is a statement about the compiler
+        // dressed up as one about the code.
+        let mut folded = frame_prologue(32, 4);
+        folded.extend([Op::LocalGet(4), Op::I32Const(7), store(12)]);
+        folded.extend(frame_epilogue(32, 4));
+
+        let mut unfolded = unfolded_prologue(32, 4);
+        unfolded.extend([Op::LocalGet(4), Op::I32Const(7), store(12)]);
+        unfolded.extend(unfolded_epilogue(32, 4));
+
+        let (folded, unfolded) = (frame_of(folded), frame_of(unfolded));
+        // Everything but the prologue's length, which *is* the spelling: five
+        // instructions against ten, describing the same frame.
+        assert_eq!(folded.prologue, 5);
+        assert_eq!(unfolded.prologue, 10);
+        assert_eq!(
+            Frame {
+                prologue: 5,
+                ..unfolded.clone()
+            },
+            folded
+        );
+        assert_eq!(unfolded.size, 32);
+        assert_eq!(unfolded.base_local, 4);
+        assert!(unfolded.publishes);
+        assert!(
+            !unfolded.escapes,
+            "the address only ever went into locals this walk follows"
+        );
+        assert_eq!(unfolded.slots[&12].writes, 1);
+    }
+
+    #[test]
+    fn an_unfolded_leaf_prologue_is_read_and_marked_unpublished() {
+        // clang drops the write-back for a function that calls nothing, in this
+        // spelling as in the folded one.
+        let mut body = unfolded_prologue(16, 3);
+        body.truncate(8);
+        body.extend([Op::LocalGet(3), Op::I32Const(1), store(4)]);
+        let frame = frame_of(body);
+        assert_eq!(frame.size, 16);
+        assert_eq!(frame.base_local, 3);
+        assert!(!frame.publishes);
+        assert_eq!(frame.slots[&4].writes, 1);
+    }
+
+    #[test]
+    fn an_unfolded_prologue_identifies_the_stack_pointer_too() {
+        // No export, no name section: the shape is the only evidence, and it
+        // has to be countable in this spelling as well.
+        let module = with_bodies(
+            module_with_globals(2, true),
+            vec![
+                {
+                    let mut body = unfolded_prologue(32, 4);
+                    body.extend(unfolded_epilogue(32, 4));
+                    body
+                },
+                {
+                    let mut body = unfolded_prologue(16, 4);
+                    body.extend(unfolded_epilogue(16, 4));
+                    body
+                },
+            ],
+        );
+        let found = analyse(&module).stack_pointer.expect("found by its use");
+        assert_eq!(found.global, 0);
+        assert_eq!(found.evidence, Evidence::Prologue { functions: 2 });
+    }
+
+    #[test]
+    fn the_unfolded_prologue_is_matched_exactly_and_not_by_its_shape() {
+        // The four instructions between the two `local.set`s say *which* locals
+        // are subtracted. Reading a different pair is arithmetic on a global
+        // that happens to start the same way, and a frame claimed for it would
+        // have the wrong base and the wrong size.
+        let module = |body: Vec<Op>| {
+            let mut module = module_with_globals(1, true);
+            module.exports.push(crate::module::Export {
+                name: "__stack_pointer".into(),
+                kind: ExportKind::Global,
+                index: 0,
+            });
+            with_bodies(module, vec![body])
+        };
+        let good = unfolded_prologue(16, 3);
+        for spoiled in [
+            // Not the local the stack pointer went into.
+            (4, Op::LocalGet(7)),
+            // Not the local the size went into.
+            (5, Op::LocalGet(7)),
+            // Not a subtraction.
+            (6, Op::Num(NumOp::I32Add)),
+        ] {
+            let (at, op) = spoiled;
+            let mut body = good.clone();
+            body[at] = op;
+            assert!(
+                analyse(&module(body)).frames.is_empty(),
+                "the prologue was matched with instruction {at} replaced"
+            );
+        }
+        assert!(!analyse(&module(good)).frames.is_empty(), "and unspoiled");
+    }
+
+    #[test]
+    fn leaf_prologues_are_evidence_only_when_they_address_memory() {
+        // Nothing writes the stack pointer back in a module of leaves, so the
+        // reservations are all there is — and a reservation that never becomes
+        // an address is indistinguishable from arithmetic on a global.
+        let bare = || {
+            let mut body = unfolded_prologue(16, 3);
+            body.truncate(8);
+            body
+        };
+        let module = with_bodies(module_with_globals(1, true), vec![bare(), bare()]);
+        assert!(
+            analyse(&module).stack_pointer.is_none(),
+            "a number, not a frame"
+        );
+
+        let addressing = || {
+            let mut body = bare();
+            body.extend([Op::LocalGet(3), Op::I32Const(1), store(4)]);
+            body
+        };
+        let module = with_bodies(
+            module_with_globals(1, true),
+            vec![addressing(), addressing()],
+        );
+        let found = analyse(&module).stack_pointer.expect("found by its use");
+        assert_eq!(found.evidence, Evidence::Prologue { functions: 2 });
+    }
+
     #[test]
     fn a_frame_records_its_size_and_the_local_that_holds_it() {
         let mut body = frame_prologue(32, 1);
@@ -2258,7 +3376,10 @@ mod tests {
             Slot {
                 width: 4,
                 reads: 1,
-                writes: 2
+                writes: 2,
+                uniform: Some((4, ValType::I32)),
+                mixed: false,
+                indirect: false,
             }
         );
         assert_eq!(
@@ -2266,7 +3387,10 @@ mod tests {
             Slot {
                 width: 4,
                 reads: 1,
-                writes: 0
+                writes: 0,
+                uniform: Some((4, ValType::I32)),
+                mixed: false,
+                indirect: false,
             }
         );
         assert_eq!(
@@ -2274,7 +3398,10 @@ mod tests {
             Slot {
                 width: 1,
                 reads: 0,
-                writes: 1
+                writes: 1,
+                uniform: Some((1, ValType::I32)),
+                mixed: false,
+                indirect: false,
             }
         );
     }
@@ -2338,9 +3465,38 @@ mod tests {
     }
 
     #[test]
-    fn copying_the_frame_address_to_another_local_is_an_escape() {
+    fn a_copy_of_the_frame_address_is_followed_through_the_local() {
+        // A copy is not an escape by itself: the walk knows which local it went
+        // into, so an access through the copy is an access to the frame and
+        // lands in the table like any other. Giving up here is what made an
+        // unoptimised build — where every value goes through a local — report a
+        // frame it could say nothing about.
         let mut body = frame_prologue(16, 0);
-        body.extend([Op::LocalGet(0), Op::LocalSet(3)]);
+        body.extend([
+            Op::LocalGet(0),
+            Op::LocalSet(3),
+            Op::LocalGet(3),
+            Op::I32Const(7),
+            store(4),
+        ]);
+        body.extend(frame_epilogue(16, 0));
+        let frame = frame_of(body);
+        assert!(!frame.escapes, "the copy never left the function");
+        assert_eq!(frame.slots[&4].writes, 1, "the write went to `frame + 4`");
+    }
+
+    #[test]
+    fn a_copy_of_the_frame_address_live_across_control_flow_is_an_escape() {
+        // The other side of following a copy: the walk follows one path, so at
+        // a branch it forgets what a local holds — and a local holding the
+        // frame address when that happens has gone where it cannot be followed.
+        let mut body = frame_prologue(16, 0);
+        body.extend([
+            Op::LocalGet(0),
+            Op::LocalSet(3),
+            Op::Block(crate::module::BlockType::Empty),
+            Op::End,
+        ]);
         body.extend(frame_epilogue(16, 0));
         assert!(frame_of(body).escapes);
     }
@@ -2394,7 +3550,10 @@ mod tests {
             Slot {
                 width: 4,
                 reads: 1,
-                writes: 1
+                writes: 1,
+                uniform: Some((4, ValType::I32)),
+                mixed: false,
+                indirect: false,
             }
         );
     }
@@ -2911,7 +4070,10 @@ mod tests {
     #[test]
     fn a_prologue_that_never_stores_back_is_not_one() {
         // `global.get; i32.const; i32.sub` and then something else entirely:
-        // arithmetic on a global, not a frame being reserved.
+        // arithmetic on a global, not a frame being reserved. It is the same
+        // shape a leaf function's prologue has, which is why the leaf spelling
+        // counts as evidence only when the address is then used to reach
+        // memory — and nothing here ever is.
         let body = vec![
             Op::GlobalGet(0),
             Op::I32Const(32),
@@ -2984,5 +4146,255 @@ mod tests {
             ..Module::default()
         };
         assert_eq!(static_text(&module, 0), None);
+    }
+
+    // ---- the C++ RTTI, laid out by hand ----
+
+    /// Lays out an image the way the Itanium ABI does, so the rules below are
+    /// tested against a layout rather than against a module nobody can edit.
+    ///
+    /// The base is 1024 because address 0 is not a `type_info` anywhere — a null
+    /// vptr is how "no kind" is spelled, and starting at 0 would make the first
+    /// object indistinguishable from it.
+    struct Image {
+        bytes: Vec<u8>,
+    }
+
+    impl Image {
+        const BASE: i32 = 1024;
+
+        fn new() -> Self {
+            Self { bytes: Vec::new() }
+        }
+
+        fn here(&self) -> i32 {
+            Self::BASE + self.bytes.len() as i32
+        }
+
+        fn word(&mut self, value: i32) -> i32 {
+            let at = self.here();
+            self.bytes.extend_from_slice(&value.to_le_bytes());
+            at
+        }
+
+        fn text(&mut self, value: &str) -> i32 {
+            let at = self.here();
+            self.bytes.extend_from_slice(value.as_bytes());
+            self.bytes.push(0);
+            while !self.bytes.len().is_multiple_of(4) {
+                self.bytes.push(0);
+            }
+            at
+        }
+
+        /// Somewhere for a `type_info`'s vptr to point at. It has to be inside
+        /// the image — a vptr that addresses nothing is not one — and two zero
+        /// words are not a `type_info` themselves.
+        fn vtable(&mut self) -> i32 {
+            let at = self.word(0);
+            self.word(0);
+            at
+        }
+
+        /// `{vptr, name}` — a class with no base, which is what Itanium's
+        /// `__class_type_info` is.
+        fn plain(&mut self, kind: i32, name: &str) -> i32 {
+            let name_at = self.text(name);
+            let at = self.word(kind);
+            self.word(name_at);
+            at
+        }
+
+        /// `{vptr, name, base}` — `__si_class_type_info`.
+        fn derived(&mut self, kind: i32, name: &str, base: i32) -> i32 {
+            let at = self.plain(kind, name);
+            self.word(base);
+            at
+        }
+
+        fn module(self) -> Module {
+            module_with_data(Self::BASE, &self.bytes)
+        }
+    }
+
+    fn class_names(module: &Module) -> Vec<String> {
+        let (classes, _) = classes(module, &Default::default());
+        classes.into_iter().map(|class| class.name).collect()
+    }
+
+    #[test]
+    fn a_vtable_pointer_too_few_type_infos_share_is_not_one() {
+        // Two candidates agreeing on a word is two words that lined up. The
+        // floor is what separates that from a `__class_type_info` vtable, and
+        // it is the whole defence against naming a class that is not there.
+        let mut image = Image::new();
+        let kind = image.vtable();
+        image.plain(kind, "5Alpha");
+        image.plain(kind, "4Beta");
+        assert_eq!(class_names(&image.module()), Vec::<String>::new());
+
+        let mut image = Image::new();
+        let kind = image.vtable();
+        image.plain(kind, "5Alpha");
+        image.plain(kind, "4Beta");
+        image.plain(kind, "5Gamma");
+        assert_eq!(class_names(&image.module()), ["Alpha", "Beta", "Gamma"]);
+    }
+
+    #[test]
+    fn a_base_a_confirmed_class_names_is_a_class_the_count_missed() {
+        // Three derived classes confirm their kind; the base each of them points
+        // at has a kind of its own that nothing else shares, so only the base
+        // pointers can name it. That is a statement the module makes, not one
+        // this inferred.
+        let mut image = Image::new();
+        let (si, alone) = (image.vtable(), image.vtable());
+        let base = image.plain(alone, "5Shape");
+        for name in ["6Square", "6Circle", "9Rectangle"] {
+            image.derived(si, name, base);
+        }
+        let module = image.module();
+        let (classes, evidence) = classes(&module, &Default::default());
+
+        let names: Vec<&str> = classes.iter().map(|class| class.name.as_str()).collect();
+        assert_eq!(names, ["Shape", "Square", "Circle", "Rectangle"]);
+        assert_eq!(evidence.by_base, 1, "one of them the count did not reach");
+        assert_eq!(evidence.kinds, 1, "and only one kind was ever confirmed");
+        let square = classes
+            .iter()
+            .find(|class| class.name == "Square")
+            .expect("declared");
+        assert_eq!(square.base, Some(base));
+        let shape = classes
+            .iter()
+            .find(|class| class.name == "Shape")
+            .expect("named by its derived classes");
+        assert_eq!(
+            shape.base, None,
+            "one hop: an admitted class's own third word is not read as a base"
+        );
+    }
+
+    #[test]
+    fn a_kind_whose_members_carry_no_base_pointer_reads_none() {
+        // Three two-word objects are packed, so each one's third word is the
+        // next one's first. Reading that as a base would give every class in the
+        // module a bogus parent, and the last one a parent past the segment.
+        let mut image = Image::new();
+        let kind = image.vtable();
+        for name in ["5Alpha", "4Beta", "5Gamma"] {
+            image.plain(kind, name);
+        }
+        let module = image.module();
+        let (classes, evidence) = classes(&module, &Default::default());
+        assert_eq!(classes.len(), 3);
+        assert!(
+            classes.iter().all(|class| class.base.is_none()),
+            "{classes:?}"
+        );
+        assert_eq!(evidence.by_base, 0);
+    }
+
+    #[test]
+    fn a_base_pointing_inside_its_own_object_is_not_a_base() {
+        // A three-word `type_info` occupies twelve bytes, so a base pointer into
+        // those twelve is the object overlapping itself. The three that do point
+        // outside are enough to confirm the kind, which is what makes the fourth
+        // a rejection rather than a group that never formed.
+        let mut image = Image::new();
+        let (si, alone) = (image.vtable(), image.vtable());
+        let base = image.plain(alone, "5Shape");
+        for name in ["6Square", "6Circle", "9Rectangle"] {
+            image.derived(si, name, base);
+        }
+        let liar = image.here() + 8; // the object itself, past its own name
+        image.derived(si, "5Wrong", liar);
+
+        let module = image.module();
+        let (classes, _) = classes(&module, &Default::default());
+        let wrong = classes
+            .iter()
+            .find(|class| class.name == "Wrong")
+            .expect("still a class: its kind was confirmed");
+        assert_eq!(wrong.base, None, "but the word inside it is not a base");
+    }
+
+    #[test]
+    fn a_mangled_type_reads_as_far_as_it_can_and_no_further() {
+        // What it reads: source names, nesting, `St`, and a template argument
+        // list elided as a whole.
+        assert_eq!(
+            demangle_type("20WasmShimErrorHandler"),
+            (
+                "WasmShimErrorHandler".to_string(),
+                "WasmShimErrorHandler".to_string()
+            )
+        );
+        assert_eq!(
+            demangle_type("N10__cxxabiv120__si_class_type_infoE"),
+            (
+                "__cxxabiv1::__si_class_type_info".to_string(),
+                "__si_class_type_info".to_string()
+            )
+        );
+        let (name, short) =
+            demangle_type("NSt3__212basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEE");
+        assert_eq!(name, "std::__2::basic_string<…>");
+        assert_eq!(short, "basic_string", "the short name drops the arguments");
+
+        // Skipping the argument list is where this can go wrong quietly. The
+        // anonymous namespace is a *source name* holding an `N`, a substitution
+        // holds base-36 digits, and `St` is two characters with no `_` — count
+        // any of those as structure and the skip runs past the `E` that closes
+        // the name, which reads as a demangling that worked.
+        assert_eq!(
+            demangle_type(
+                "N5folly6detail30StaticSingletonManagerWithRtti3SrcINS_11ThreadLocalINS_20Single\
+                 tonThreadLocalINS_12_GLOBAL__N_120BufferedRandomDeviceENS5_9RandomTagEvS7_E7Wr\
+                 apperES7_vEES7_EE"
+            )
+            .0,
+            "folly::detail::StaticSingletonManagerWithRtti::Src<…>"
+        );
+        assert_eq!(
+            demangle_type("N5folly5tag_tIJvEEE").0,
+            "folly::tag_t<…>",
+            "`J` opens an argument pack"
+        );
+        assert_eq!(
+            demangle_type("NSt3__210__function6__baseIFvmEEE").0,
+            "std::__2::__function::__base<…>",
+            "`F` opens a function type"
+        );
+
+        // And what it refuses. A substitution refers back to a component by
+        // number; resolving one wrongly is a name that says something the
+        // module did not, so the mangled string comes back untouched.
+        for mangled in [
+            "NS_9allocatorIS1_EE", // a substitution
+            "PKc",                 // a pointer, not a class
+            "N10__cxxabiv1",       // nesting that never closes
+            "12Truncated",         // a length past the end of the string
+            "IcE",                 // arguments with nothing to attach them to
+            "3AbcE",               // an `E` with nothing open
+        ] {
+            assert_eq!(
+                demangle_type(mangled),
+                (mangled.to_string(), mangled.to_string()),
+                "{mangled} is not something this can read"
+            );
+        }
+    }
+
+    #[test]
+    fn a_type_info_whose_name_is_not_a_type_is_not_a_candidate() {
+        // `_ZTS` holds a mangled type; a word pointing at ordinary text is a
+        // word pointing at ordinary text.
+        let mut image = Image::new();
+        let kind = image.vtable();
+        for name in ["hello, world", "GET /index.html", "%s: %d\n"] {
+            image.plain(kind, name);
+        }
+        assert_eq!(class_names(&image.module()), Vec::<String>::new());
     }
 }

@@ -14,6 +14,10 @@ env:
   # See the install step: which frames the analysis can see is a property of
   # the compiler that built the fixture.
   CLANG_VERSION: '22'
+  # The Emscripten the `captures` tier builds its signature reference with. A
+  # fingerprint matches ~91% across builds of one toolchain and a handful across
+  # versions, so which version produced the reference is part of the result.
+  EMSCRIPTEN_VERSION: '6.0.6'
   # The harness compiles generated Rust on every run, so a slow debug build is
   # felt on every test, not only in release.
   CARGO_INCREMENTAL: 0
@@ -38,13 +42,14 @@ jobs:
       # clang builds the wasm32 C fixtures; wasm-ld comes from lld and clang
       # will not link `--target=wasm32` without it.
       #
-      # The version is pinned, and that is not tidiness. `read_prologue` knows
-      # three spellings of the shadow-stack prologue, all three found by reading
-      # what clang actually emits at -O0 — so which frames the analysis can see
-      # is a property of the compiler that built the fixture. Ubuntu's clang 18
-      # emits a fourth shape and the frame tests find nothing at all. Until
-      # `read_prologue` learns it, the fixtures are built with a compiler the
-      # analysis is known to read.
+      # The version is pinned, and that is not tidiness. `match_prologue` knows
+      # four spellings of the shadow-stack prologue, each found by reading what
+      # clang actually emits at -O0 — so which frames the analysis can see is a
+      # property of the compiler that built the fixture. The frame tests pass
+      # under clang 18 and 22 now that the fourth spelling is known, and pinning
+      # says which of those two a green run measured. A fifth compiler may well
+      # have a fifth spelling, and a pin is what turns that into a deliberate
+      # change rather than a runner image moving underneath the tests.
       - name: Install clang ${{ env.CLANG_VERSION }} and lld
         run: |
           sudo apt-get update
@@ -89,11 +94,10 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
-  # The tier that needs the real modules: ~19 MB of captures to download and
-  # about forty minutes of decompiling 10 MiB modules, so it does not run on
-  # every push. Start it by hand from the Actions tab, or let the weekly run
-  # take it — which also catches WhatsApp rolling a capture out of the
-  # published archive, since that is what the fetch script fails on.
+  # The tier that needs the real modules: ~19 MB of captures to download, so it
+  # does not run on every push. Start it by hand from the Actions tab, or let
+  # the weekly run take it — which also catches WhatsApp rolling a capture out
+  # of the published archive, since that is what the fetch script fails on.
   captures:
     if: github.event_name != 'push' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -103,18 +107,41 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # The reference engine, for the one test in this tier that runs a capture
+      # rather than reading it.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # The catalogue test builds its reference module with Emscripten, so this
+      # tier needs the toolchain the captures were built with. Installed from
+      # the SDK rather than from an action, and pinned, for the same reason
+      # clang is: which functions a fingerprint recognises is a property of the
+      # compiler that produced the reference.
+      - name: Install Emscripten ${{ env.EMSCRIPTEN_VERSION }}
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git ~/emsdk
+          ~/emsdk/emsdk install "$EMSCRIPTEN_VERSION"
+          ~/emsdk/emsdk activate "$EMSCRIPTEN_VERSION"
+          echo "$HOME/emsdk/upstream/emscripten" >> "$GITHUB_PATH"
+
       - name: Fetch the captures
         run: ./scripts/fetch-captures.sh
 
-      # Decompiling every capture, and what the analysis says about the VoIP
-      # one. The tests that hand generated Rust back to rustc are left out:
-      # they are minutes each, and `check` already proves the emitted code
-      # compiles on the fixtures.
-      - name: Decompile every capture
+      # The whole tier, including the tests that hand generated Rust back to
+      # rustc. It used to be thirty-one minutes and only the decompilation was
+      # worth running here; counting the index's line numbers forward instead of
+      # recounting the whole output made it under a minute, and what had been
+      # left out is the part that actually runs a capture.
+      - name: Every capture, decompiled — and one of them run
         run: cargo test --test captured -- --ignored --nocapture
-             every_capture_either_decompiles_or_says_why_not
 
       - name: The VoIP module's host, names, registrations and trampolines
         run: |
           cargo test --test host --test names --test embind --test trampolines \
             -- --ignored --nocapture
+
+      # The toolchain tier. It needs no captures, only `emcc` — which is why it
+      # runs here rather than in `check`, and why it ran nowhere before.
+      - name: What the real toolchain emits
+        run: cargo test --test emscripten -- --ignored --nocapture

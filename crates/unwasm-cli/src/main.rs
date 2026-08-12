@@ -14,13 +14,15 @@ const USAGE: &str = "\
 unwasm — a WebAssembly decompiler whose output compiles
 
 usage:
-  unwasm decompile <module.wasm> [-o <out>] [--split <n>] [--only <indices>]
-                   [--reachable-from <indices>] [--signatures <file>]
+  unwasm decompile <module.wasm> [-o <out>] [--level <n>] [--split <n>]
+                   [--only <indices>] [--reachable-from <indices>]
+                   [--signatures <file>] [--stub-recognised]
                    [--instrument-stores] [--offsets]
   unwasm host      <module.wasm> [-o <host.rs>] [--defaults]
   unwasm table     <module.wasm> [--type <signature>]
   unwasm calls     <module.wasm> <index>
   unwasm signatures <module.wasm> [-o <sigs.txt>]
+  unwasm classes   <module.wasm> [--methods]
   unwasm frames    <module.wasm> [--outside]
   unwasm bytes     <module.wasm> <offset> <length>
   unwasm constants <module.wasm> <value>
@@ -43,7 +45,15 @@ usage:
                  entry an indirect call could land on
   --direct-only  with --reachable-from: follow direct calls only. Smaller and
                  incomplete; a stub it reaches says which function to add
+  --level <n>    0 (default) is a faithful translation; 1 also turns the frame
+                 slots it can place into Rust bindings, which stops the output
+                 being byte-exact and says so at every function it did it to;
+                 2 also names functions from the C++ RTTI the module carries,
+                 which changes nothing it does
   --signatures <file>  name library code using a catalogue from `signatures`
+  --stub-recognised  with --signatures: leave the bodies of the functions the
+                 catalogue named out, keeping their names and signatures. For
+                 reading, not running — anything that calls one stops there
   --instrument-stores  route every memory write through the watchpoint runtime,
                  so `instance.memory.watch(addr, len)` reports who wrote it
   --offsets      also write offsets.json: which wasm bytes made each line,
@@ -65,6 +75,12 @@ things that move between builds left out. It matches ~91% across builds of the
 same toolchain and only a handful across different emscripten versions, so it
 is worth generating from a build of your own rather than expecting it to
 recognise someone else's.
+
+`classes` reads the C++ RTTI: every class the module declares a `type_info`
+for, its name as the compiler mangled it, and the functions its vtable holds.
+That is a declaration rather than an inference — the ABI writes both down — and
+it is what `decompile --level 2` names functions after. `--methods` lists the
+vtable slot by slot.
 
 `constants` finds every site that pushes a value, with the file offset and the
 encoded length of each — all of them, which a hand-counted subset is not. An
@@ -99,6 +115,12 @@ boundaries, so half a million lines in one file becomes one enormous unit.
 Decompilation is faithful, not idiomatic: linear memory stays a byte vector and
 every trap stays a trap, so the result can be run against the module it came
 from. Anything unsupported is an error, never a silent omission.
+
+`--level 1` is the one exception, and it is opt-in for that reason. A frame slot
+it promotes is a Rust binding rather than bytes in linear memory, so a run no
+longer leaves those bytes behind — the answers still match the engine, the
+memory no longer does. Every function it changed says so in its doc comment,
+and every function it refused says why it refused.
 ";
 
 fn main() -> ExitCode {
@@ -126,6 +148,7 @@ fn run(arguments: &[String]) -> Result<String, String> {
         Some("table") => table(&arguments[1..]),
         Some("calls") => calls(&arguments[1..]),
         Some("signatures") => signatures(&arguments[1..]),
+        Some("classes") => classes(&arguments[1..]),
         Some("frames") => frames(&arguments[1..]),
         Some("bytes") => bytes(&arguments[1..]),
         Some("patch") => patch(&arguments[1..]),
@@ -146,6 +169,8 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
     let mut reachable_from: Vec<u32> = Vec::new();
     let mut direct_only = false;
     let mut instrument = false;
+    let mut stub_recognised = false;
+    let mut level = 0u8;
     let mut map_offsets = false;
     let mut rest = arguments[1..].iter();
     while let Some(argument) = rest.next() {
@@ -183,6 +208,21 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
                 }
             }
             "--instrument-stores" => instrument = true,
+            "--stub-recognised" => stub_recognised = true,
+            "--level" => {
+                let value = rest.next().ok_or("--level needs a number")?;
+                level = match value.as_str() {
+                    "0" => 0,
+                    "1" => 1,
+                    "2" => 2,
+                    other => {
+                        return Err(format!(
+                            "--level is 0 (faithful), 1 (frame slots as bindings) or 2 (and \
+                             names from the C++ RTTI), not `{other}`"
+                        ));
+                    }
+                };
+            }
             "--offsets" => map_offsets = true,
             "--only" => {
                 let value = rest.next().ok_or("--only needs a list of indices")?;
@@ -248,6 +288,21 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
         only.extend(callees);
     }
 
+    // A catalogue is the only thing that recognises anything, so asking to
+    // leave the recognised out without one leaves nothing out — and would
+    // report success having done nothing.
+    if stub_recognised && catalogue.is_none() {
+        return Err(
+            "--stub-recognised needs --signatures: without a catalogue nothing is recognised"
+                .to_string(),
+        );
+    }
+    let stubbed = if stub_recognised {
+        codegen::recognised_functions(&module, catalogue.as_ref().expect("just checked")).len()
+    } else {
+        0
+    };
+
     let Some(destination) = destination else {
         if split.is_some() {
             return Err("--split writes several files, so it needs -o <directory>".to_string());
@@ -258,7 +313,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
                     .to_string(),
             );
         }
-        if only.is_empty() && catalogue.is_none() && !instrument {
+        if only.is_empty() && catalogue.is_none() && !instrument && level == 0 {
             return codegen::generate(&module).map_err(|error| error.to_string());
         }
         let files = codegen::generate_options(
@@ -269,6 +324,9 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
                 signatures: catalogue.clone().unwrap_or_default(),
                 instrument_stores: instrument,
                 map_offsets,
+                stub_recognised,
+                promote_frames: level >= 1,
+                name_classes: level >= 2,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -296,10 +354,34 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
             signatures: catalogue.unwrap_or_default(),
             instrument_stores: instrument,
             map_offsets,
+            stub_recognised,
+            promote_frames: level >= 1,
+            name_classes: level >= 2,
         },
     )
     .map_err(|error| error.to_string())?;
     let lines: usize = files.iter().map(|file| file.contents.lines().count()).sum();
+
+    // Said before rustc says it its own way. wasm's nesting becomes Rust's, and
+    // rustc parses that recursively: past a couple of thousand blocks it
+    // overflows its stack and dies with SIGSEGV, which reads as a compiler bug
+    // rather than as a file that needs a bigger stack to parse.
+    let stubbed = if stubbed > 0 {
+        format!(
+            "left {stubbed} of {} functions out as recognised library code\n",
+            module.funcs.len()
+        )
+    } else {
+        String::new()
+    };
+    let note = match unwasm_core::analysis::deepest_nesting(&module) {
+        Some((func, depth)) if depth > unwasm_core::analysis::NESTING_RUSTC_HANDLES => format!(
+            "note: function #{func} nests {depth} blocks, and rustc parses nesting \
+             recursively.\n      Compile this with RUST_MIN_STACK=134217728 set, or \
+             rustc overflows its\n      stack and dies with SIGSEGV.\n"
+        ),
+        _ => String::new(),
+    };
 
     // A single-file destination gets the Rust; the index needs a directory to
     // live beside it.
@@ -307,7 +389,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
         std::fs::write(&destination, &files[0].contents)
             .map_err(|error| format!("writing {destination}: {error}"))?;
         return Ok(format!(
-            "wrote {destination} ({} lines, {} functions)\n",
+            "wrote {destination} ({} lines, {} functions)\n{stubbed}{note}",
             files[0].contents.lines().count(),
             module.funcs.len()
         ));
@@ -322,7 +404,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
             .map_err(|error| format!("writing {}: {error}", at.display()))?;
     }
     Ok(format!(
-        "wrote {destination}/ ({} Rust files plus names.json, {lines} lines, {} functions)\n",
+        "wrote {destination}/ ({} Rust files plus names.json, {lines} lines, {} functions)\n{stubbed}{note}",
         files.len() - 1,
         module.funcs.len()
     ))
@@ -601,6 +683,72 @@ fn bytes(arguments: &[String]) -> Result<String, String> {
             " — a pattern patch would hit all of them"
         }
     ))
+}
+
+/// `classes`: what the C++ ABI wrote down about the module's own types.
+fn classes(arguments: &[String]) -> Result<String, String> {
+    let path = arguments.first().ok_or("classes needs a module path")?;
+    let mut methods = false;
+    for argument in &arguments[1..] {
+        match argument.as_str() {
+            "--methods" => methods = true,
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+    }
+    let module = read(path)?;
+    let analysis = unwasm_core::analysis::analyse(&module);
+    let (classes, evidence) = unwasm_core::analysis::classes(&module, &analysis.placements);
+    if classes.is_empty() {
+        return Ok(format!(
+            "{path} declares no C++ classes: no `type_info` object here is pointed at\nby enough others to be one. A module built from C has none.\n"
+        ));
+    }
+
+    let mut out = format!(
+        "{} classes, {} with vtables, across {} `type_info` {}\n",
+        evidence.classes,
+        evidence.with_vtables,
+        evidence.kinds,
+        if evidence.kinds == 1 { "kind" } else { "kinds" }
+    );
+    if evidence.by_base > 0 {
+        let _ = writeln!(
+            out,
+            "  {} of them named by a derived class rather than by the count",
+            evidence.by_base
+        );
+    }
+    let named: std::collections::BTreeMap<i32, &str> = classes
+        .iter()
+        .map(|class| (class.type_info, class.name.as_str()))
+        .collect();
+    for class in &classes {
+        let _ = writeln!(
+            out,
+            "  {:<60} {}",
+            class.name,
+            match class.vtable {
+                Some(at) => format!("vtable {at:#x}, {} methods", class.methods.len()),
+                None => "no vtable".to_string(),
+            }
+        );
+        // The mangled form when the readable one is not the whole story, so a
+        // reader can check the name against the bytes.
+        if class.name != class.mangled {
+            let _ = writeln!(out, "      mangled {}", class.mangled);
+        }
+        // Only single inheritance is written down as a pointer, so a class with
+        // no line here may still have bases — see `analysis::Class::base`.
+        if let Some(base) = class.base.and_then(|at| named.get(&at)) {
+            let _ = writeln!(out, "      derives from {base}");
+        }
+        if methods {
+            for (slot, func) in class.methods.iter().enumerate() {
+                let _ = writeln!(out, "      slot {slot:<3} f{func}");
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn frames(arguments: &[String]) -> Result<String, String> {
@@ -908,6 +1056,8 @@ fn inspect(arguments: &[String]) -> Result<String, String> {
             found.global,
             match found.evidence {
                 unwasm_core::analysis::Evidence::Exported => "by its exported name".to_string(),
+                unwasm_core::analysis::Evidence::Named =>
+                    "by its name in the name section".to_string(),
                 unwasm_core::analysis::Evidence::Prologue { functions } =>
                     format!("by {functions} prologues"),
             }

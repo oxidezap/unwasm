@@ -110,6 +110,65 @@ fn the_index_says_where_every_function_ended_up() {
     assert!(json.contains(r#""table_slots": [2]"#), "{json}");
 }
 
+/// The line in the index is a line number in the file it names, and the only
+/// way to check that is to go and look.
+///
+/// Worth its own test because the number is *counted forward* rather than
+/// measured: recounting the whole output for each function was quadratic — 152
+/// of the 154 seconds a 3.3 MiB capture took — and the arithmetic that replaced
+/// it is exactly the kind that is off by one without anything noticing.
+#[test]
+fn the_line_the_index_gives_is_where_the_function_actually_starts() {
+    let wasm = common::assemble("index-lines", SAMPLE);
+    let module = Module::parse(&wasm).expect("valid");
+    for layout in [
+        codegen::Layout::Single,
+        codegen::Layout::Split { lines_per_file: 1 },
+    ] {
+        let files = codegen::generate_files(&module, layout).expect("generates");
+        let json = &files
+            .iter()
+            .find(|file| file.name == "names.json")
+            .expect("present")
+            .contents;
+
+        let mut checked = 0;
+        for entry in json.split("{\"index\":").skip(1) {
+            let field = |name: &str| {
+                entry
+                    .split_once(&format!("\"{name}\": "))
+                    .map(|(_, rest)| rest.split([',', '}']).next().unwrap_or_default().trim())
+                    .expect("the field is in the entry")
+                    .trim_matches('"')
+                    .to_string()
+            };
+            let (name, file, line) = (field("name"), field("file"), field("line"));
+            let line: usize = line.parse().expect("a number");
+            let contents = &files
+                .iter()
+                .find(|candidate| candidate.name == file)
+                .unwrap_or_else(|| panic!("{file} is named by the index but was not written"))
+                .contents;
+            // From the line it gives, the function's own declaration is the
+            // next one — everything before it is that function's doc comment.
+            let rest: Vec<&str> = contents.lines().skip(line - 1).collect();
+            let declaration = rest
+                .iter()
+                .position(|text| text.contains(&format!("fn {name}(")))
+                .unwrap_or_else(|| panic!("{name} is not at {file}:{line}:\n{}", rest.join("\n")));
+            assert!(
+                rest[..declaration]
+                    .iter()
+                    .all(|text| text.trim_start().starts_with("///")),
+                "{file}:{line} starts inside {name} rather than at it:\n{}",
+                rest[..=declaration].join("\n")
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, module.funcs.len());
+    }
+}
+
 #[test]
 fn the_index_is_json_a_parser_will_accept() {
     let wasm = common::assemble("index-json", SAMPLE);

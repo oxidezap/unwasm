@@ -61,6 +61,18 @@ const PART_HEADER: &str = concat!(
     ")]\n\n",
 );
 
+/// What follows [`PART_HEADER`] in a part file, before its first function.
+const PART_OPENING: &str = "use super::*;\n\nimpl<H: Imports> Instance<H> {\n";
+
+/// How many lines of a part file come before its first function.
+///
+/// Derived from the two strings rather than written down: the index says which
+/// line a function is on, and a header that grew by a line would silently move
+/// every one of those answers.
+fn part_prelude_lines() -> usize {
+    PART_HEADER.lines().count() + PART_OPENING.lines().count()
+}
+
 /// The runtime, as text, for embedding in the output.
 ///
 /// The tests are cut off: they belong to this crate, and carrying four hundred
@@ -307,7 +319,9 @@ fn known_import(field: &str, ty: &crate::module::FuncType) -> Option<&'static st
         ("fd_write", "iiii->i") => "self.wasi.fd_write(caller, p0, p1, p2, p3)",
         ("fd_read", "iiii->i") => "self.wasi.fd_read(caller, p0, p1, p2, p3)",
         ("fd_pread", "iiiji->i") => "self.wasi.fd_pread(caller, p0, p1, p2, p3, p4)",
+        ("fd_pwrite", "iiiji->i") => "self.wasi.fd_pwrite(caller, p0, p1, p2, p3, p4)",
         ("fd_seek", "ijii->i") => "self.wasi.fd_seek(caller, p0, p1, p2, p3)",
+        ("fd_sync", "i->i") => "self.wasi.fd_sync(p0)",
         ("fd_close", "i->i") => "self.wasi.fd_close(p0)",
         ("environ_sizes_get", "ii->i") => "self.wasi.environ_sizes_get(caller, p0, p1)",
         ("environ_get", "ii->i") => "self.wasi.environ_get(caller, p0, p1)",
@@ -331,6 +345,10 @@ fn known_import(field: &str, ty: &crate::module::FuncType) -> Option<&'static st
         // class. Answering with the exception unconditionally selects the
         // wrong handler for `throw Derived; catch (Base&)` and hands the guest
         // the wrong address, which is worse than saying it is not written.
+        // The type id *is* the answer: Emscripten's glue is `(type) => type`,
+        // because the personality routine compares the value it gets back
+        // against the same pointers the module's own tables hold.
+        ("llvm_eh_typeid_for", "i->i") => "p0",
         ("__assert_fail", "iiii->") => "runtime::assert_fail(caller, p0, p1, p2, p3)",
 
         // ---- Emscripten's runtime
@@ -348,6 +366,12 @@ fn known_import(field: &str, ty: &crate::module::FuncType) -> Option<&'static st
         ("_localtime_js", "ji->") | ("_gmtime_js", "ji->") => {
             "let _ = runtime::write_tm(caller, p1, p0);"
         }
+        ("_mktime_js", "i->j") => "runtime::mktime(caller, p0)",
+        // `strftime` is specified by the standard rather than by the
+        // application, so it is the same for every module — and the locale
+        // argument of `strftime_l` selects nothing this answers differently.
+        ("strftime", "iiii->i") => "runtime::strftime(caller, p0, p1, p2, p3)",
+        ("strftime_l", "iiiii->i") => "runtime::strftime(caller, p0, p1, p2, p3)",
         ("_tzset_js", "iiii->") => "runtime::tzset(caller, p0, p1, p2, p3)",
         ("_tzset_js", "iii->") => "runtime::tzset(caller, p0, p1, p2, 0)",
         ("emscripten_num_logical_cores", "->i") => "self.emscripten.cores",
@@ -374,6 +398,7 @@ fn known_import(field: &str, ty: &crate::module::FuncType) -> Option<&'static st
         // when `Atomics.waitAsync` is unavailable — the comment there says so
         // — and that is the branch this is.
         ("_emscripten_thread_cleanup", "i->")
+        | ("__emscripten_thread_cleanup", "i->")
         | ("_emscripten_thread_set_strongref", "i->")
         | ("_emscripten_thread_mailbox_await", "i->") => "()",
         ("abort", "->") => "rt::trap(\"the module called abort\")",
@@ -390,9 +415,14 @@ fn known_import(field: &str, ty: &crate::module::FuncType) -> Option<&'static st
             "self.wasi.stat_path(caller, p0, p1)"
         }
         ("__syscall_fstat64", "ii->i") => "self.wasi.stat_fd(caller, p0, p1)",
-        // `newfstatat(dirfd, path, buf, flags)`: every path here is absolute,
-        // so the directory descriptor decides nothing.
+        // `newfstatat(dirfd, path, buf, flags)`: a relative path is resolved
+        // against the working directory, so the descriptor decides nothing.
         ("__syscall_newfstatat", "iiii->i") => "self.wasi.stat_path(caller, p1, p2)",
+        ("__syscall_chdir", "i->i") => "self.wasi.chdir(caller, p0)",
+        ("__syscall_mkdirat", "iii->i") => "self.wasi.mkdirat(caller, p1)",
+        ("__syscall_getdents64", "iii->i") => "self.wasi.getdents64(caller, p0, p1, p2)",
+        ("__syscall_ftruncate64", "ij->i") => "self.wasi.ftruncate(p0, p1)",
+        ("__syscall_fcntl64", "iii->i") => "self.wasi.fcntl(caller, p0, p1, p2)",
 
         // ---- embind and emval
         ("_emval_incref", "i->") => "self.embind.incref(p0)",
@@ -589,6 +619,9 @@ pub fn generate_host_with(module: &Module, defaults: bool) -> Result<String> {
             || analysis
                 .init_main_thread
                 .is_some_and(|init| init.import == index as u32)
+            || analysis
+                .mmap
+                .is_some_and(|mmap| [mmap.map, mmap.sync, mmap.unmap].contains(&Some(index as u32)))
         {
             continue;
         }
@@ -751,6 +784,77 @@ pub struct Options {
     /// Write `offsets.json` beside the output: which bytes of the wasm file
     /// produced each generated line.
     pub map_offsets: bool,
+    /// Leave out the bodies of functions the signature catalogue recognised.
+    ///
+    /// A library function that has been named is one whose source is already
+    /// readable somewhere else, and on a 9 MiB module it is most of the output.
+    /// The name, the signature and the cross-references stay, so the result
+    /// still compiles and the index still finds it — what goes is the body.
+    ///
+    /// For a run being *read*. Anything that calls a stub stops there, which is
+    /// why this is not the default and never applies without `signatures`.
+    pub stub_recognised: bool,
+    /// **Level 1**: keep the frame slots that can be placed in Rust bindings
+    /// rather than in linear memory.
+    ///
+    /// This gives up byte-exactness, deliberately and only when asked. See
+    /// [`analysis::promotable_slots`] for what a slot has to prove first, and
+    /// the doc comment each promoted function carries for what a run of it no
+    /// longer matches.
+    pub promote_frames: bool,
+    /// **Level 2**: name functions from the C++ RTTI the module carries.
+    ///
+    /// A class's `type_info` and its vtable are written down by the ABI, so a
+    /// function in exactly one vtable belongs to exactly one class. Changes no
+    /// behaviour — it is a name and a doc comment — but it is a level 2 name:
+    /// the *method* has no name in the module, only a position.
+    pub name_classes: bool,
+}
+
+/// Which functions a catalogue names, by index.
+///
+/// Public because the answer is worth having on its own: `--stub-recognised`
+/// reports how much of a module it left out, and a caller deciding whether a
+/// catalogue is worth applying wants the count before the output.
+///
+/// A fingerprint that occurs twice *in this module* names nothing, for the same
+/// reason one that occurs twice in the catalogue does: the fingerprint is a
+/// deliberately coarse equivalence class, and two functions in it are two
+/// functions. And what the module says about itself always wins — a name
+/// section entry is a declaration, a fingerprint match is a guess.
+#[must_use]
+pub fn recognised_functions(
+    module: &Module,
+    signatures: &Signatures,
+) -> std::collections::BTreeMap<u32, String> {
+    let mut recognised = std::collections::BTreeMap::new();
+    if signatures.is_empty() {
+        return recognised;
+    }
+    let import_count = module.func_imports.len() as u32;
+    let mut seen: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for func in &module.funcs {
+        if func.body.len() >= analysis::FINGERPRINT_FLOOR {
+            *seen.entry(analysis::fingerprint(module, func)).or_default() += 1;
+        }
+    }
+    for (at, func) in module.funcs.iter().enumerate() {
+        if func.body.len() < analysis::FINGERPRINT_FLOOR {
+            continue;
+        }
+        let index = import_count + at as u32;
+        if module.func_name(index).is_some() {
+            continue;
+        }
+        let fingerprint = analysis::fingerprint(module, func);
+        if seen.get(&fingerprint).copied().unwrap_or_default() > 1 {
+            continue;
+        }
+        if let Some(name) = signatures.get(&fingerprint) {
+            recognised.insert(index, name.clone());
+        }
+    }
+    recognised
 }
 
 /// Generates with [`Options`].
@@ -764,6 +868,9 @@ pub fn generate_options(module: &Module, options: &Options) -> Result<Vec<Genera
     generator.signatures = options.signatures.clone();
     generator.instrument = options.instrument_stores;
     generator.map_offsets = options.map_offsets;
+    generator.stub_recognised = options.stub_recognised;
+    generator.promote_frames = options.promote_frames;
+    generator.name_classes = options.name_classes;
     generator.run()
 }
 
@@ -872,6 +979,26 @@ struct Generator<'a> {
     instrument: bool,
     /// Whether to build the line-to-bytes map.
     map_offsets: bool,
+    /// Whether a recognised function keeps its body.
+    stub_recognised: bool,
+    /// Whether frame slots become Rust bindings — level 1.
+    promote_frames: bool,
+    /// Whether the C++ RTTI names the functions it declares — level 2.
+    name_classes: bool,
+    /// The classes recovered, when it did.
+    classes: Vec<crate::analysis::Class>,
+    /// What that recovery rested on.
+    class_evidence: Option<crate::analysis::ClassEvidence>,
+    /// Each virtual method: which class, and which slot of its vtable.
+    class_methods: std::collections::BTreeMap<u32, (usize, usize)>,
+    /// The functions whose *name* a vtable supplied.
+    ///
+    /// Not the same set as `class_methods`: a function a catalogue already named
+    /// keeps that name and is still a virtual method. Which of the two named it
+    /// decides what the doc comment credits — and, more than cosmetically,
+    /// whether `--stub-recognised` may leave its body out. A vtable says who
+    /// owns a function, never that its body is readable somewhere else.
+    class_named: BTreeSet<u32>,
     /// Per function: its index, how many lines of its chunk come before its
     /// body, and the body's own line-to-bytes spans.
     spans: Vec<FunctionSpans>,
@@ -892,6 +1019,13 @@ impl<'a> Generator<'a> {
             recognised: Default::default(),
             instrument: false,
             map_offsets: false,
+            stub_recognised: false,
+            promote_frames: false,
+            name_classes: false,
+            classes: Vec::new(),
+            class_evidence: None,
+            class_methods: Default::default(),
+            class_named: BTreeSet::new(),
             spans: Vec::new(),
             located: Vec::new(),
         }
@@ -932,40 +1066,166 @@ impl<'a> Generator<'a> {
     /// two functions. Deduplicating only the catalogue would put one library
     /// name on every member of the class.
     fn recognise(&mut self) {
-        if self.signatures.is_empty() {
+        self.recognised = recognised_functions(self.module, &self.signatures);
+    }
+
+    /// Level 2: names taken from what the C++ ABI writes down.
+    ///
+    /// A class's `type_info` carries its name and its vtable carries the table
+    /// slots its virtual calls land on, so a function in exactly one vtable
+    /// belongs to exactly one class and can say so. That is reading a
+    /// declaration, not inferring one — but it is still a level 2 name, because
+    /// which *method* it is has no name anywhere and the index is all there is.
+    ///
+    /// A function in several vtables is named after none of them. Inheritance
+    /// puts a base's method in every derived vtable — one of them is in 333, of
+    /// 239 different classes — and picking one would be a claim the bytes do not
+    /// make. Same rule as the fingerprint catalogue, for the same reason.
+    fn name_from_classes(&mut self) {
+        if !self.name_classes {
             return;
         }
-        let import_count = self.module.func_imports.len() as u32;
-        let mut seen: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
-        for func in &self.module.funcs {
-            if func.body.len() >= analysis::FINGERPRINT_FLOOR {
-                *seen
-                    .entry(analysis::fingerprint(self.module, func))
-                    .or_default() += 1;
+        let (classes, evidence) = analysis::classes(self.module, &self.analysis.placements);
+        let mut owners: std::collections::BTreeMap<u32, Vec<usize>> = Default::default();
+        for (at, class) in classes.iter().enumerate() {
+            for func in &class.methods {
+                owners.entry(*func).or_default().push(at);
             }
         }
-        for (at, func) in self.module.funcs.iter().enumerate() {
-            if func.body.len() < analysis::FINGERPRINT_FLOOR {
+        for (func, owning) in owners {
+            let [only] = owning[..] else { continue };
+            let class = &classes[only];
+            let Some(slot) = class.methods.iter().position(|method| *method == func) else {
                 continue;
-            }
-            let index = import_count + at as u32;
-            // What the module says about itself wins; this fills gaps.
-            if self.module.func_name(index).is_some() {
-                continue;
-            }
-            let fingerprint = analysis::fingerprint(self.module, func);
-            if seen.get(&fingerprint).copied().unwrap_or_default() > 1 {
-                continue;
-            }
-            if let Some(name) = self.signatures.get(&fingerprint) {
-                self.recognised.insert(index, name.clone());
+            };
+            self.class_methods.insert(func, (only, slot));
+            // What the module says about itself still wins, and so does a
+            // catalogue that named the function rather than its owner. Only a
+            // name this actually supplied is recorded as one.
+            if self.module.func_name(func).is_none()
+                && let std::collections::btree_map::Entry::Vacant(slot_for_name) =
+                    self.recognised.entry(func)
+            {
+                slot_for_name.insert(format!("{}_v{slot}", class.short));
+                self.class_named.insert(func);
             }
         }
+        self.classes = classes;
+        self.class_evidence = Some(evidence);
+    }
+
+    /// What the class recovery found, said once at the top.
+    ///
+    /// The counts *are* the evidence. Itanium gives every `type_info` a vtable
+    /// pointer and there are only a handful of them in a program — one per kind
+    /// of `type_info` — so a pointer hundreds of candidates agree on is one, and
+    /// a pointer one candidate has is two words that happened to line up. The
+    /// summary says how many kinds and how many classes, because a run that
+    /// found four classes across four kinds found nothing.
+    fn class_summary(&mut self) {
+        let Some(evidence) = self.class_evidence else {
+            return;
+        };
+        // Nothing found is a result, and it is not the same sentence: a table of
+        // zeros reads as a failure to look.
+        if evidence.classes == 0 {
+            self.out.push_str(concat!(
+                "// Level 2 read the data segments and found no C++ RTTI: no `type_info`\n",
+                "// object here is pointed at by enough others to be one. A module built\n",
+                "// from C has none, and nothing below is named from a class.\n",
+                "//\n\n",
+            ));
+            return;
+        }
+        let named = self.class_methods.len();
+        let _ = writeln!(
+            self.out,
+            "// Level 2: {} classes read out of the C++ RTTI — {} of them with a\n\
+             // vtable, across {} `type_info` {} — and {named} functions named after\n\
+             // the class whose vtable holds them. A function in more than one vtable is\n\
+             // named after none of them: inheritance puts a base's method in every\n\
+             // derived vtable, and picking one would be a claim these bytes do not make.",
+            evidence.classes,
+            evidence.with_vtables,
+            evidence.kinds,
+            if evidence.kinds == 1 { "kind" } else { "kinds" }
+        );
+        if evidence.by_base > 0 {
+            let _ = writeln!(
+                self.out,
+                "// {} of them {} named by a derived class that points at {} as its base,\n\
+                 // rather than by the count of what shares their kind.",
+                evidence.by_base,
+                if evidence.by_base == 1 { "was" } else { "were" },
+                if evidence.by_base == 1 { "it" } else { "them" }
+            );
+        }
+        let _ = writeln!(self.out, "//");
+        self.out.push('\n');
+    }
+
+    /// The doc comment a virtual method carries: which class, and what says so.
+    fn class_note(&self, index: u32) -> String {
+        let Some((class, slot)) = self.class_methods.get(&index) else {
+            return String::new();
+        };
+        let class = &self.classes[*class];
+        let mut out = String::new();
+        let _ = writeln!(out, "    ///");
+        let _ = writeln!(
+            out,
+            "    /// **Level 2**: virtual method {slot} of `{}`.",
+            class.name
+        );
+        let vtable = match class.vtable {
+            Some(at) => format!("{at:#x}"),
+            None => "no address".to_string(),
+        };
+        let _ = writeln!(out, "    ///");
+        let _ = writeln!(
+            out,
+            "    /// The evidence is the C++ ABI's own: a `type_info` at {:#x}",
+            class.type_info
+        );
+        let _ = writeln!(
+            out,
+            "    /// named `{}`, and a vtable at {vtable} that holds this function",
+            escape_doc(&class.mangled)
+        );
+        let _ = writeln!(
+            out,
+            "    /// at slot {slot}. The method's own name is nowhere in the module —"
+        );
+        let _ = writeln!(
+            out,
+            "    /// only its position is — so that is what the name carries."
+        );
+        // A base is worth saying because it says where the slot came from: a
+        // method at a slot the base also has is an override of it.
+        if let Some(base) = class
+            .base
+            .and_then(|at| self.classes.iter().find(|other| other.type_info == at))
+        {
+            let _ = writeln!(out, "    ///");
+            let _ = writeln!(
+                out,
+                "    /// `{}` derives from `{}`, which the same object says at",
+                class.name, base.name
+            );
+            let _ = writeln!(
+                out,
+                "    /// {:#x}: Itanium writes a single base into the `type_info` itself.",
+                class.type_info + 8
+            );
+        }
+        out
     }
 
     fn run(mut self) -> Result<Vec<GeneratedFile>> {
         self.recognise();
+        self.name_from_classes();
         self.header();
+        self.class_summary();
         self.registered_api();
         self.shared_state();
         self.embed_runtime();
@@ -1063,6 +1323,8 @@ impl<'a> Generator<'a> {
                 .collect();
             let source = if self.module.func_name(*index).is_some() {
                 "name section"
+            } else if self.class_named.contains(index) {
+                "vtable"
             } else if self.recognised.contains_key(index) {
                 "signature"
             } else {
@@ -1100,11 +1362,31 @@ impl<'a> Generator<'a> {
         self.out.push_str(concat!(
             "// Generated by unwasm. Do not edit: regenerate from the module.\n",
             "//\n",
-            "// This is level 0 — a faithful translation. Linear memory is a byte\n",
+            "// The base is level 0 — a faithful translation. Linear memory is a byte\n",
             "// vector and every wasm value type is its Rust counterpart, so the\n",
             "// arithmetic, the traps and the memory layout are the module's own.\n",
             "// Names come from the module where it kept them and from indices\n",
             "// where it did not.\n",
+        ));
+        // What was asked for on top of it, named where it applies rather than
+        // claimed here: a level is only in the output if a function shows it.
+        if self.promote_frames {
+            self.out.push_str(concat!(
+                "//\n",
+                "// Level 1 is on: a frame slot this could place is a Rust binding rather\n",
+                "// than a shadow-stack write, so the stack bytes are no longer the\n",
+                "// module's. Every function it did that to says so, and says which slots.\n",
+            ));
+        }
+        if self.name_classes {
+            self.out.push_str(concat!(
+                "//\n",
+                "// Level 2 is on: names read out of the C++ RTTI the module carries.\n",
+                "// Those are identifiers and comments — a level 2 run and a level 0 run\n",
+                "// compute the same thing.\n",
+            ));
+        }
+        self.out.push_str(concat!(
             "\n",
             "#![allow(\n",
             "    dead_code,\n",
@@ -1247,6 +1529,10 @@ impl<'a> Generator<'a> {
                 .analysis
                 .init_main_thread
                 .is_some_and(|init| init.import == index as u32)
+            || self
+                .analysis
+                .mmap
+                .is_some_and(|mmap| [mmap.map, mmap.sync, mmap.unmap].contains(&Some(index as u32)))
     }
 
     fn imports_trait(&mut self) {
@@ -1502,6 +1788,9 @@ impl<'a> Generator<'a> {
 
         self.export_wrappers();
         self.import_thunks();
+        if let Some(mmap) = self.analysis.mmap {
+            self.mmap_trampolines(mmap);
+        }
         self.indirect_dispatchers()?;
         // Closes the `impl` block, and emits the functions either inside it or
         // into part files beside it.
@@ -1529,6 +1818,14 @@ impl<'a> Generator<'a> {
         let import_count = self.module.func_imports.len() as u32;
         let budget = match self.layout {
             Layout::Single => {
+                // Counted forward rather than recounted. `self.out.lines()`
+                // walks everything written so far, and doing that once per
+                // function is quadratic in the size of the output: on a 3.3 MiB
+                // capture it was 152 of the 154 seconds a decompilation took,
+                // and on the 10.2 MiB one it was twenty-five minutes. Each body
+                // ends in a newline, so the count of what is already there plus
+                // the count of what is being added is the count of the whole.
+                let mut lines = self.out.lines().count();
                 for (at, func) in self.module.funcs.iter().enumerate() {
                     let index = import_count + at as u32;
                     let body = self.function(index, func)?;
@@ -1536,8 +1833,9 @@ impl<'a> Generator<'a> {
                         index,
                         function_ident_with(index, &self.analysis, &self.recognised),
                         "mod.rs".to_string(),
-                        self.out.lines().count() + 1,
+                        lines + 1,
                     ));
+                    lines += body.lines().count();
                     self.out.push_str(&body);
                 }
                 self.out.push_str("}\n\n");
@@ -1564,14 +1862,12 @@ impl<'a> Generator<'a> {
                 self.push_part(std::mem::take(&mut current));
                 lines = 0;
             }
-            // Four lines of part header and `impl` opening come before the
-            // first function in a part.
             let file = format!("part{}.rs", self.parts.len());
             self.located.push((
                 index,
                 function_ident_with(index, &self.analysis, &self.recognised),
                 file,
-                lines + 5,
+                part_prelude_lines() + lines + 1,
             ));
             current.push_str(&body);
             lines += body_lines;
@@ -1590,7 +1886,7 @@ impl<'a> Generator<'a> {
     fn push_part(&mut self, functions: String) {
         let mut contents = String::new();
         contents.push_str(PART_HEADER);
-        contents.push_str("use super::*;\n\nimpl<H: Imports> Instance<H> {\n");
+        contents.push_str(PART_OPENING);
         contents.push_str(&functions);
         contents.push_str("}\n");
         let name = format!("part{}.rs", self.parts.len());
@@ -1607,6 +1903,10 @@ impl<'a> Generator<'a> {
             Some(found) if found.global == index => match found.evidence {
                 Evidence::Exported => {
                     "\n    ///\n    /// The C stack pointer: the module exports it under that name."
+                        .to_string()
+                }
+                Evidence::Named => {
+                    "\n    ///\n    /// The C stack pointer: the module's name section calls it that."
                         .to_string()
                 }
                 Evidence::Prologue { functions } => format!(
@@ -1707,6 +2007,11 @@ impl<'a> Generator<'a> {
                 self.init_main_thread_trampoline(init);
                 continue;
             }
+            // The `mmap` family is emitted as a group, since the three share
+            // the allocator and the scratch they read an iovec out of.
+            if self.is_generated(index) {
+                continue;
+            }
             let args: Vec<String> = (0..ty.params.len()).map(|at| format!("p{at}")).collect();
             // The caller is the first argument, so the rest need the comma the
             // trait signature already carries.
@@ -1724,6 +2029,161 @@ impl<'a> Generator<'a> {
                 return_type(ty),
                 import_ident(import.module.as_str(), import.field.as_str()),
                 rest
+            );
+        }
+    }
+
+    /// A memory write from a trampoline, instrumented like every other one.
+    ///
+    /// The site is the import's own index, so `memory.watch` names the
+    /// trampoline rather than reporting a write nothing accounts for.
+    fn trampoline_store(&self, index: u32) -> String {
+        if self.instrument {
+            format!("store32_at({index}, 0, ")
+        } else {
+            "store32(".to_string()
+        }
+    }
+
+    /// The `mmap` family, generated rather than asked of the host.
+    ///
+    /// Emscripten's glue answers `__mmap_js` out of the module's *own*
+    /// allocator and then reads the file into what it got back. A host cannot
+    /// do either: it has no way to ask the guest for memory, and no way to call
+    /// back into it. So this is generated, like the pthread glue and for the
+    /// same reason — every part of it is already here.
+    ///
+    /// The order is the glue's: allocate a page-aligned mapping, zero it, read
+    /// the file into it through the host's own `fd_pread`, and report the
+    /// address and that it was allocated. `msync` writes the range back through
+    /// `fd_pwrite`, and `munmap` is `msync` when the mapping was writable and
+    /// nothing otherwise — the *freeing* is musl's, not the glue's, so this
+    /// does not free the mapping.
+    ///
+    /// The read goes through the host rather than around it. Inventing the
+    /// contents would put a page of zeros where a file was and call it a
+    /// mapping, and nothing downstream could tell.
+    fn mmap_trampolines(&mut self, mmap: crate::analysis::Mmap) {
+        let memalign = function_ident_with(mmap.memalign, &self.analysis, &self.recognised);
+        let free = function_ident_with(mmap.free, &self.analysis, &self.recognised);
+        let import_method = |index: u32| {
+            let import = &self.module.func_imports[index as usize];
+            import_ident(&import.module, &import.field)
+        };
+        let pread = import_method(mmap.pread);
+
+        if let Some(index) = mmap.map {
+            let store = self.trampoline_store(index);
+            let _ = writeln!(
+                self.out,
+                "    /// `env::_mmap_js`, generated: the mapping comes out of the module's\n\
+                 \x20   /// own allocator and the file comes through the host's own `fd_pread`.\n\
+                 \x20   ///\n\
+                 \x20   /// `(len, prot, flags, fd, offset, allocated_out, addr_out) -> errno`.\n\
+                 \x20   /// The protection and the flags decide nothing here: this filesystem\n\
+                 \x20   /// has no shared mappings, so every mapping is a private copy.\n\
+                 \x20   pub(crate) fn f{index}(&mut self, p0: i32, p1: i32, p2: i32, p3: i32, p4: i64, p5: i32, p6: i32) -> i32 {{\n\
+                 \x20       let _ = (p1, p2);\n\
+                 \x20       let mapped = self.{memalign}(65536, p0);\n\
+                 \x20       if mapped == 0 {{\n\
+                 \x20           return -48;\n\
+                 \x20       }}\n\
+                 \x20       self.memory.fill(mapped, 0, p0);\n\
+                 \x20       // An iovec and a place for the count, because `fd_pread` reads\n\
+                 \x20       // both out of guest memory — the same way the guest would have\n\
+                 \x20       // had to hand them over.\n\
+                 \x20       let scratch = self.{memalign}(4, 12);\n\
+                 \x20       if scratch == 0 {{\n\
+                 \x20           self.{free}(mapped);\n\
+                 \x20           return -48;\n\
+                 \x20       }}\n\
+                 \x20       self.memory.{store}scratch, 0, i64::from(mapped));\n\
+                 \x20       self.memory.{store}scratch, 4, i64::from(p0));\n\
+                 \x20       let errno = {{\n\
+                 \x20           let mut caller = rt::Caller {{\n\
+                 \x20               memory: &mut self.memory,\n\
+                 \x20           }};\n\
+                 \x20           self.host.{pread}(&mut caller, p3, scratch, 1, p4, scratch + 8)\n\
+                 \x20       }};\n\
+                 \x20       self.{free}(scratch);\n\
+                 \x20       // A read that failed is not a mapping. Reporting success here\n\
+                 \x20       // would hand back a page of zeros as the file's contents.\n\
+                 \x20       if errno != 0 {{\n\
+                 \x20           self.{free}(mapped);\n\
+                 \x20           return -errno;\n\
+                 \x20       }}\n\
+                 \x20       self.memory.{store}p5, 0, 1i64);\n\
+                 \x20       self.memory.{store}p6, 0, i64::from(mapped));\n\
+                 \x20       0\n\
+                 \x20   }}\n"
+            );
+        }
+
+        let Some(pwrite) = mmap.pwrite.map(import_method) else {
+            return;
+        };
+        // `MAP_PRIVATE` is 2, and a private mapping is a copy: Emscripten's
+        // `doMsync` returns before writing anything back, and so does this.
+        // Writing it back would push a process's own scratch into the file.
+        let write_back = |store: &str, guard: &str| {
+            format!(
+                "{guard}\
+                 \x20       if p3 & 2 != 0 {{\n\
+                 \x20           return 0;\n\
+                 \x20       }}\n\
+                 \x20       let scratch = self.{memalign}(4, 12);\n\
+                 \x20       if scratch == 0 {{\n\
+                 \x20           return -48;\n\
+                 \x20       }}\n\
+                 \x20       self.memory.{store}scratch, 0, i64::from(p0));\n\
+                 \x20       self.memory.{store}scratch, 4, i64::from(p1));\n\
+                 \x20       let errno = {{\n\
+                 \x20           let mut caller = rt::Caller {{\n\
+                 \x20               memory: &mut self.memory,\n\
+                 \x20           }};\n\
+                 \x20           self.host.{pwrite}(&mut caller, p4, scratch, 1, p5, scratch + 8)\n\
+                 \x20       }};\n\
+                 \x20       self.{free}(scratch);\n\
+                 \x20       if errno != 0 {{\n\
+                 \x20           return -errno;\n\
+                 \x20       }}\n"
+            )
+        };
+
+        if let Some(index) = mmap.sync {
+            let store = self.trampoline_store(index);
+            let body = write_back(&store, "        let _ = p2;\n");
+            let _ = writeln!(
+                self.out,
+                "    /// `env::_msync_js`, generated: the mapped range goes back to the file\n\
+                 \x20   /// through the host's own `fd_pwrite`.\n\
+                 \x20   ///\n\
+                 \x20   /// `(addr, len, prot, flags, fd, offset) -> errno`.\n\
+                 \x20   pub(crate) fn f{index}(&mut self, p0: i32, p1: i32, p2: i32, p3: i32, p4: i32, p5: i64) -> i32 {{\n{body}\
+                 \x20       0\n\
+                 \x20   }}\n"
+            );
+        }
+
+        if let Some(index) = mmap.unmap {
+            let store = self.trampoline_store(index);
+            // `PROT_WRITE` is 2. A read-only mapping has nothing to write back,
+            // and the mapping itself is freed by musl rather than here.
+            let body = write_back(
+                &store,
+                "        if p2 & 2 == 0 {\n            return 0;\n        }\n",
+            );
+            let _ = writeln!(
+                self.out,
+                "    /// `env::_munmap_js`, generated: a writable mapping is written back,\n\
+                 \x20   /// and a read-only one has nothing to do. The mapping is freed by\n\
+                 \x20   /// the module's own `munmap`, not here — which is where the glue\n\
+                 \x20   /// frees it too.\n\
+                 \x20   ///\n\
+                 \x20   /// `(addr, len, prot, flags, fd, offset) -> errno`.\n\
+                 \x20   pub(crate) fn f{index}(&mut self, p0: i32, p1: i32, p2: i32, p3: i32, p4: i32, p5: i64) -> i32 {{\n{body}\
+                 \x20       0\n\
+                 \x20   }}\n"
             );
         }
     }
@@ -2229,14 +2689,23 @@ impl<'a> Generator<'a> {
         if let Some(name) = self.module.func_name(index) {
             let _ = writeln!(out, "    /// `{}`", escape_doc(name));
         } else if let Some(name) = self.recognised.get(&index) {
-            // Recognised by its shape, not by anything the module said. The
-            // catalogue is only as good as the toolchain it came from, so the
-            // comment says where the name is from.
-            let _ = writeln!(
-                out,
-                "    /// Function #{index}, recognised as `{}`: its body fingerprints\n    /// identically to that function in the signature catalogue.",
-                escape_doc(name)
-            );
+            // Two things fill this map, and they are not the same claim. The
+            // catalogue recognised the *function*; a vtable named its *owner*.
+            // Saying "fingerprints identically" about the second would credit
+            // the wrong evidence.
+            if self.class_named.contains(&index) {
+                let _ = writeln!(
+                    out,
+                    "    /// Function #{index}, named `{}` after the class whose vtable holds it.",
+                    escape_doc(name)
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "    /// Function #{index}, recognised as `{}`: its body fingerprints\n    /// identically to that function in the signature catalogue.",
+                    escape_doc(name)
+                );
+            }
         } else if let Some(derived) = self.analysis.derived_names.get(&index) {
             // The name is a guess, so the reason travels with it. Without the
             // evidence a reader has to take `parse_xmpp_offer` on trust, and
@@ -2306,10 +2775,23 @@ impl<'a> Generator<'a> {
         }
 
         out.push_str(&self.cross_reference(index, &slots));
+        out.push_str(&self.class_note(index));
 
         let frame = self.analysis.frames.get(&index);
         if let Some(frame) = frame {
             out.push_str(&frame_summary(frame));
+            if self.promote_frames {
+                let promoted = analysis::promotable_slots(frame, &func.body);
+                let bulk = func.body.iter().any(|op| {
+                    matches!(
+                        op,
+                        crate::module::Op::MemoryFill
+                            | crate::module::Op::MemoryCopy
+                            | crate::module::Op::MemoryInit(_)
+                    )
+                });
+                out.push_str(&promotion_note(frame, &promoted, bulk));
+            }
         }
         // `pub(crate)` rather than private: under a split layout the callers
         // live in sibling modules, and a private method would be visible only
@@ -2322,7 +2804,20 @@ impl<'a> Generator<'a> {
             return_type(ty)
         );
 
-        let asked_for = self.only.as_ref().is_none_or(|only| only.contains(&index));
+        // A recognised function is left out first: `--stub-recognised` says the
+        // body is already readable under its own name somewhere else, and that
+        // is a different reason from `--only`, so the stub says which.
+        // A vtable-supplied name is not a catalogue hit: nothing says this
+        // function's body is written out under that name anywhere else, so
+        // stubbing it would drop a body no reader can recover.
+        let library = self
+            .stub_recognised
+            .then(|| self.recognised.get(&index))
+            .flatten()
+            .filter(|_| !self.class_named.contains(&index))
+            .cloned();
+        let asked_for =
+            library.is_none() && self.only.as_ref().is_none_or(|only| only.contains(&index));
         if asked_for {
             // The body's lines start after everything written above.
             let before_body = out.matches('\n').count();
@@ -2332,6 +2827,7 @@ impl<'a> Generator<'a> {
                 recognised: &self.recognised,
                 instrument: self.instrument,
                 map_offsets: self.map_offsets,
+                promote: self.promote_frames,
             };
             let (body, spans) = Body::new(context, func, ty, index).emit()?;
             out.push_str(&body);
@@ -2342,10 +2838,16 @@ impl<'a> Generator<'a> {
             // Not decompiled, and saying so rather than looking decompiled. The
             // signature and the name stay, so callers still compile and the
             // index still finds it.
-            let _ = writeln!(
-                out,
-                "        unimplemented!(\"function #{index} was not decompiled: --only\")"
-            );
+            let _ = match &library {
+                Some(name) => writeln!(
+                    out,
+                    "        unimplemented!(\"function #{index} is `{name}`, left out by --stub-recognised\")"
+                ),
+                None => writeln!(
+                    out,
+                    "        unimplemented!(\"function #{index} was not decompiled: --only\")"
+                ),
+            };
         }
         out.push_str("    }\n\n");
         Ok(out)
@@ -2374,6 +2876,8 @@ struct Context<'a> {
     recognised: &'a std::collections::BTreeMap<u32, String>,
     instrument: bool,
     map_offsets: bool,
+    /// Level 1: promote what can be promoted out of the shadow stack.
+    promote: bool,
 }
 
 /// A value sitting on the operand stack, and how it may be used.
@@ -2390,6 +2894,13 @@ struct Value {
     folded: bool,
     /// What a folded expression reads, and therefore what can invalidate it.
     reads: Reads,
+    /// Whether this value *is* the frame base address, unmodified.
+    ///
+    /// Only `local.get $base` sets it, and only a spill carries it — `let t5 =
+    /// frame;` is still the frame. Arithmetic on it does not, which is the
+    /// point: level 1 promotes a slot only when it can see every access to it,
+    /// and an address it cannot place is an access it cannot see.
+    frame_base: bool,
 }
 
 /// What an expression on the stack depends on.
@@ -2554,6 +3065,9 @@ struct Body<'a> {
     here: u32,
     /// This function's C stack frame, when it has one.
     frame: Option<&'a StackFrame>,
+    /// The frame slots this function keeps in Rust bindings rather than in
+    /// linear memory. Empty at level 0, which is every slot in memory.
+    promoted: std::collections::BTreeMap<i32, Promoted>,
     func: &'a Func,
     ty: &'a crate::module::FuncType,
     index: u32,
@@ -2584,6 +3098,7 @@ impl<'a> Body<'a> {
             recognised,
             instrument,
             map_offsets,
+            promote,
         } = context;
         Self {
             module,
@@ -2596,6 +3111,23 @@ impl<'a> Body<'a> {
             lines: 0,
             here: 0,
             frame: analysis.frames.get(&index),
+            promoted: promote
+                .then(|| analysis.frames.get(&index))
+                .flatten()
+                .map(|frame| {
+                    analysis::promotable_slots(frame, &func.body)
+                        .into_iter()
+                        .map(|(offset, (width, ty))| {
+                            let name = if offset < 0 {
+                                format!("s_{}", -offset)
+                            } else {
+                                format!("s{offset}")
+                            };
+                            (offset, Promoted { name, width, ty })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             func,
             ty,
             index,
@@ -2613,6 +3145,53 @@ impl<'a> Body<'a> {
 
     fn location(&self) -> String {
         format!("function #{}", self.index)
+    }
+
+    /// The promoted slot an access reaches, if this access is one of them.
+    ///
+    /// Two conditions, and both are exact rather than heuristic: the address is
+    /// the frame base itself, and the static offset names a slot that was
+    /// promoted. `promotable_slots` only promotes when nothing else in the
+    /// function can reach the frame, so an access this does not recognise is an
+    /// access to a slot that was not promoted.
+    fn promoted_at(&self, address: &Value, offset: u64) -> Option<Promoted> {
+        if !address.frame_base {
+            return None;
+        }
+        let at = i32::try_from(offset).ok()?;
+        self.promoted.get(&at).cloned()
+    }
+
+    /// The bindings a promoted frame declares, and the doc comment saying what
+    /// they cost.
+    ///
+    /// Declared zeroed at the top and filled from memory once the prologue has
+    /// computed the frame address — because the bytes at those offsets belong
+    /// to whatever ran before, and a slot read before it is written has to see
+    /// them.
+    fn declare_promoted(&mut self) {
+        if self.promoted.is_empty() {
+            return;
+        }
+        for slot in self.promoted.values().cloned().collect::<Vec<_>>() {
+            self.line(&format!(
+                "let mut {}: {} = {};",
+                slot.name,
+                slot.ty.rust_name(),
+                slot.ty.zero()
+            ));
+        }
+    }
+
+    /// Fills them, at the first point the frame address exists.
+    fn fill_promoted(&mut self) {
+        for (offset, slot) in self.promoted.clone() {
+            self.line(&format!(
+                "{} = self.memory.{}(frame, {offset});",
+                slot.name,
+                slot.initialiser()
+            ));
+        }
     }
 
     /// The opening of a call to a memory write: `store32(` normally, and
@@ -2656,7 +3235,11 @@ impl<'a> Body<'a> {
                 local.zero()
             ));
         }
+        self.declare_promoted();
 
+        // Where the frame address becomes valid, and so the earliest point the
+        // bindings can be filled from what is already at those offsets.
+        let prologue = self.frame.map_or(0, |frame| frame.prologue);
         let body = self.func.body.clone();
         for (at, op) in body.iter().enumerate() {
             // The next instruction is worth having for one reason: a Rust
@@ -2670,6 +3253,9 @@ impl<'a> Body<'a> {
                 self.pending = span.map(|(offset, _)| offset);
             }
             self.op(op)?;
+            if at + 1 == prologue {
+                self.fill_promoted();
+            }
             if self.map_offsets && self.emitted_lines() > before {
                 if let (Some(start), Some((offset, length))) = (self.pending, span) {
                     self.spans.push((before, start, offset + length - start));
@@ -2703,9 +3289,20 @@ impl<'a> Body<'a> {
         self.lines
     }
 
+    /// How deep the indentation is allowed to get.
+    ///
+    /// Past this the leading whitespace stops growing, and the nesting is read
+    /// from the labels instead — which is where it is legible at that depth
+    /// anyway. This is not tidiness: a `br_table` dispatch in the VoIP module
+    /// nests **2466** blocks, so a line inside it carried 7964 spaces, and one
+    /// part file came to 650 MB of which **644 MB was indentation**. The whole
+    /// module was 1.8 GB. Capped, that is a 20th of the bytes, for output that
+    /// differs only in the whitespace nobody could have used.
+    const MAX_INDENT: usize = 32;
+
     fn line(&mut self, text: &str) {
         self.lines += 1;
-        for _ in 0..self.depth {
+        for _ in 0..self.depth.min(Self::MAX_INDENT) {
             self.out.push_str("    ");
         }
         self.out.push_str(text);
@@ -2718,6 +3315,7 @@ impl<'a> Body<'a> {
             ty,
             folded,
             reads,
+            frame_base: false,
         });
     }
 
@@ -2834,6 +3432,11 @@ impl<'a> Body<'a> {
                 ty: value.ty,
                 folded: false,
                 reads: Reads::default(),
+                // A name for the frame address is still the frame address.
+                // Losing that here would let a slot be promoted at one access
+                // and left in memory at another, which is worse than not
+                // promoting it at all.
+                frame_base: value.frame_base,
             };
         }
     }
@@ -3077,6 +3680,11 @@ impl<'a> Body<'a> {
             Op::LocalGet(index) => {
                 let ty = self.local_type(*index)?;
                 self.push(self.local_ident(*index), ty, true, Reads::local(*index));
+                if self.frame.is_some_and(|frame| frame.base_local == *index)
+                    && let Some(value) = self.stack.last_mut()
+                {
+                    value.frame_base = true;
+                }
             }
             Op::LocalSet(index) => {
                 let value = self.pop()?;
@@ -3155,6 +3763,15 @@ impl<'a> Body<'a> {
             }
             Op::Load { kind, mem } => {
                 let address = self.pop()?;
+                // Level 1: a promoted slot is a binding, and reading it is
+                // reading the binding. `push_temp` rather than folding, for the
+                // same reason a load is named — a store to the slot between
+                // here and the consumer would otherwise be read back.
+                if let Some(slot) = self.promoted_at(&address, mem.offset) {
+                    let code = read_promoted(&slot, *kind);
+                    self.push_temp(&code, kind.result());
+                    return Ok(());
+                }
                 let method = load_method(*kind);
                 self.push_temp(
                     &format!("self.memory.{method}({}, {})", address.code, mem.offset),
@@ -3163,6 +3780,14 @@ impl<'a> Body<'a> {
             }
             Op::Store { kind, mem } => {
                 let mut values = self.pop_n(2)?;
+                if let Some(slot) = self.promoted_at(&values[0], mem.offset) {
+                    // Nothing folded can read a promoted slot: every read of one
+                    // is given a name as it happens. So there is nothing to
+                    // spill before writing it.
+                    let code = write_promoted(&slot, *kind, &values[1].code);
+                    self.line(&code);
+                    return Ok(());
+                }
                 self.spill_operands(&mut values);
                 // Nothing folded reads memory, so a memory write invalidates nothing.
                 let (method, cast) = store_method(*kind);
@@ -3525,6 +4150,78 @@ impl<'a> Body<'a> {
     }
 }
 
+/// A frame slot that became a Rust binding: its name, and the width and type
+/// every access to it agreed on.
+#[derive(Debug, Clone)]
+struct Promoted {
+    name: String,
+    width: u32,
+    ty: ValType,
+}
+
+impl Promoted {
+    /// Whether the binding holds fewer bytes than its Rust type.
+    ///
+    /// A narrow slot is kept zero-extended — exactly what a `load8_u` would
+    /// return — so a store masks and a signed load sign-extends. Keeping it any
+    /// other way would make one of the two wrong.
+    fn narrow(&self) -> bool {
+        self.width < if self.ty == ValType::I64 { 8 } else { 4 }
+    }
+
+    /// The runtime load that fills it from memory, zero-extended.
+    fn initialiser(&self) -> &'static str {
+        match (self.width, self.ty) {
+            (1, ValType::I32) => "load8_u",
+            (2, ValType::I32) => "load16_u",
+            (1, ValType::I64) => "load8_u_i64",
+            (2, ValType::I64) => "load16_u_i64",
+            (4, ValType::I64) => "load32_u_i64",
+            (_, ValType::I64) => "load64",
+            (_, ValType::F32) => "load_f32",
+            (_, ValType::F64) => "load_f64",
+            (_, ValType::I32) => "load32",
+        }
+    }
+}
+
+/// Reading a promoted slot: the binding, widened the way the load asks for.
+fn read_promoted(slot: &Promoted, kind: LoadKind) -> String {
+    let name = &slot.name;
+    if !slot.narrow() {
+        return name.clone();
+    }
+    // The binding holds the bytes zero-extended, so an unsigned load is the
+    // binding and a signed one has to sign-extend from the stored width.
+    match kind {
+        LoadKind::I32Load8S => format!("(({name} as u8) as i8) as i32"),
+        LoadKind::I32Load16S => format!("(({name} as u16) as i16) as i32"),
+        LoadKind::I64Load8S => format!("(({name} as u8) as i8) as i64"),
+        LoadKind::I64Load16S => format!("(({name} as u16) as i16) as i64"),
+        LoadKind::I64Load32S => format!("(({name} as u32) as i32) as i64"),
+        _ => name.clone(),
+    }
+}
+
+/// Writing a promoted slot, keeping it zero-extended from the stored width.
+fn write_promoted(slot: &Promoted, kind: StoreKind, value: &str) -> String {
+    let name = &slot.name;
+    if !slot.narrow() {
+        return format!("{name} = {value};");
+    }
+    let mask = match kind {
+        StoreKind::I32Store8 | StoreKind::I64Store8 => "0xff",
+        StoreKind::I32Store16 | StoreKind::I64Store16 => "0xffff",
+        _ => "0xffff_ffff",
+    };
+    let suffix = if slot.ty == ValType::I64 {
+        "i64"
+    } else {
+        "i32"
+    };
+    format!("{name} = ({value}) & {mask}{suffix};")
+}
+
 fn load_method(kind: LoadKind) -> &'static str {
     match kind {
         LoadKind::I32 => "load32",
@@ -3613,6 +4310,71 @@ pub fn exported_functions(module: &Module) -> Vec<(&crate::module::Export, Strin
         }
         out.push((export, name));
     }
+    out
+}
+
+/// The doc comment a promoted frame carries, and what it costs.
+///
+/// Said at the function rather than once in the header, because it is a
+/// property of *this* function: which offsets left memory, and therefore which
+/// bytes a run of it no longer leaves behind.
+fn promotion_note(
+    frame: &StackFrame,
+    promoted: &std::collections::BTreeMap<i32, (u32, ValType)>,
+    bulk: bool,
+) -> String {
+    let mut out = String::new();
+    if promoted.is_empty() {
+        // Worth saying which of the conditions it failed: "level 1 did nothing
+        // here" is a result, and the reason is the interesting part. So the
+        // reason is read off the frame rather than assumed to be the last one
+        // in the list — a note that names the wrong blocker sends a reader
+        // looking at the wrong thing.
+        let slot_reason = || {
+            if frame.slots.iter().any(|(_, slot)| slot.indirect) {
+                "a slot is reached by arithmetic as well as by a static offset"
+            } else if frame.slots.iter().any(|(_, slot)| slot.mixed) {
+                "a slot's accesses disagree about its width or its type"
+            } else if frame
+                .slots
+                .keys()
+                .any(|offset| *offset < 0 || *offset >= frame.size)
+            {
+                "a slot lies outside the frame it reserved"
+            } else if frame.slots.is_empty() {
+                "the frame is never read or written"
+            } else {
+                "the slots overlap each other"
+            }
+        };
+        let why = if frame.escapes {
+            "the address leaves this function"
+        } else if frame.computed_writes > 0 {
+            "a write goes through an address computed at run time"
+        } else if frame.copied {
+            "the address is copied into another local"
+        } else if bulk {
+            "the function has a `memory.fill`, `copy` or `init`, whose destination \n    /// this cannot place"
+        } else {
+            slot_reason()
+        };
+        let _ = writeln!(
+            out,
+            "    ///\n    /// Level 1 promoted nothing here: {why}."
+        );
+        return out;
+    }
+    let _ = writeln!(
+        out,
+        "    ///\n    /// **Level 1**: {} of {} slots are Rust bindings rather than memory —\n    /// {}. They are filled from the frame on entry, so a slot read before\n    /// it is written still sees what was there; they are never written back,\n    /// so this function no longer leaves those bytes in linear memory. That is\n    /// the exactness level 1 gives up, and it is given up here.",
+        promoted.len(),
+        frame.slots.len(),
+        promoted
+            .keys()
+            .map(|offset| format!("`s{offset}` at +{offset}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     out
 }
 
@@ -3958,6 +4720,7 @@ mod tests {
     #[test]
     fn an_operand_brackets_itself_when_it_has_to() {
         let name = Value {
+            frame_base: false,
             code: "l3".to_string(),
             ty: ValType::I32,
             folded: true,
@@ -3965,6 +4728,7 @@ mod tests {
         };
         assert_eq!(name.as_operand(), "l3");
         let compound = Value {
+            frame_base: false,
             code: "l3 as u32".to_string(),
             ty: ValType::I32,
             folded: true,
@@ -3979,6 +4743,8 @@ mod tests {
         // else could be worked out. Printing an empty table would read as "no
         // slots", which is a different claim.
         let summary = frame_summary(&StackFrame {
+            copied: false,
+            prologue: 5,
             size: 16,
             base_local: 0,
             slots: std::collections::BTreeMap::new(),
