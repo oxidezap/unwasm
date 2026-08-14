@@ -14,6 +14,45 @@ rather than asserted.** Every test below runs the same calls twice — once on t
 wasm module in V8, once on the generated Rust — and compares the returned value,
 the trap, and the final contents of linear memory.
 
+## Two halves, and why they do not share a host
+
+This repository holds two ways of running the same captured module:
+
+| | what it does | crates |
+| --- | --- | --- |
+| **unwasm** | decompiles wasm to Rust and runs *that* | `unwasm-core`, `unwasm-cli` |
+| **oracle** | runs the original `.wasm` under wasmtime | `oracle-core`, `oracle-cli` |
+
+Both implement WASI, the C++ runtime, emscripten's runtime and threads, and
+**neither shares a line of that with the other**. Merging them would remove
+about 4,700 lines and destroy the property they exist for: two implementations
+that share lineage agree on their shared defects, so a third opinion only helps
+when it shares no ancestry. The argument is RFC-0005 of the sibling
+`wa-codegen-research`; the `Cargo.toml` here carries it in full.
+
+What they *do* share is one capture set, one lock, and one small piece of code —
+`oracle carry`, which finds a function again after WhatsApp renumbers
+everything. That one is the reason co-location pays:
+
+```console
+$ oracle carry D5pLH9sfOOl JgwtTQVeWPm 13445 11198
+D5pLH9sfOOl (13347 functions) -> JgwtTQVeWPm (14733): 6561 carry one-to-one
+  13445 -> 14839
+  11198 -> changed; no mechanical route, re-derive it
+```
+
+Everything else that looks like duplication was measured before being left
+alone. `oracle inspect` streams a module without building its bodies and answers
+in **under 10 ms**; `unwasm`'s `Module::parse` builds the whole instruction
+model and costs **~300 ms**. Sharing the decoder is the obvious de-duplication
+and the one to refuse — which is why the inspection, call-graph and xref paths
+stay separate. `carry` is the exception because it is asked once per capture
+bump rather than once per question.
+
+`cargo build -p unwasm-cli` still resolves **4 packages**. The decompiler's
+single dependency survived the merge, and must: a decompiler whose output needs
+a runtime to link against is not self-contained.
+
 ## Why another one
 
 The field, as of July 2026:

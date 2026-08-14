@@ -1,2 +1,6 @@
 /target
 /fixtures/wasm
+# The captured modules. WhatsApp's build output, fetched by
+# scripts/fetch-wasm.py and verified against wasm.lock.json; a copy committed
+# here would drift from the capture every recorded offset was read out of.
+/wasm
