@@ -38,3 +38,4 @@ base64 = "0.23.0"
 wacore-binary = { version = "0.7", default-features = false }
 wasmtime.workspace = true
 wasm-encoder = { workspace = true }
+wacore = { version = "0.7", default-features = false }
