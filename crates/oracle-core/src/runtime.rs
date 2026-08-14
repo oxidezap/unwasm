@@ -785,6 +785,16 @@ impl Runtime {
             .collect()
     }
 
+    /// Every stanza the guest asked the host to put on the wire.
+    ///
+    /// Unlike [`Self::all_calls_to`] this is complete and its bytes are real:
+    /// the host function copies them while the guest's buffer is still alive,
+    /// which is the only moment it is. See [`SignalingCall`].
+    #[must_use]
+    pub fn signaling(&self) -> Vec<crate::shared::SignalingCall> {
+        self.store.data().shared.signaling()
+    }
+
     /// Every name this module exports.
     ///
     /// Exposed so a test can assert against the real export list rather than

@@ -27,10 +27,27 @@
 > Also corrected here: the sender's trampoline is function **#855** at table
 > slot **464** (`examples/table_slot_of.rs`), not slot 436 as noted elsewhere.
 >
-> What remains genuinely unmeasured is the stanza's **content**: #855 frees its
-> three pointers as soon as the import returns, so the 179 bytes have to be read
-> inside the host call. See `examples/outbound_setup_matrix.rs` and
-> `examples/call_the_sender.rs`.
+> And the stanza is a stanza. `sendSignalingXMPP_js_sync` is implemented rather
+> than stubbed so the bytes are copied while they exist — #855 frees them on
+> return — and decoding them with **whatsapp-rust's** parser, which shares no
+> lineage with the engine, yields:
+>
+> ```xml
+> <offer call-id="0011223344556677" call-creator="99887766554433@lid">
+>   <privacy>a5 a5 … 32 bytes</privacy>   <!-- the tcToken passed to startVoipCall -->
+>   <audio enc="opus" rate="8000"/>
+>   <audio enc="opus" rate="16000"/>
+>   <net medium="3"/>
+>   <capability ver="1">01 05 f7 09 e0 bb 5b</capability>
+>   <enc count="0">32 bytes</enc>
+>   <encopt keygen="2"/>
+> </offer>
+> ```
+>
+> The leading byte is the stream flag, so the node starts at +1. The `<privacy>`
+> content is the tcToken handed in at the embind surface, which makes the path
+> end to end. `Runtime::signaling()` returns these. See
+> `examples/outbound_setup_matrix.rs` and `examples/call_the_sender.rs`.
 >
 > Everything below predates that correction. The ruled-out list, the
 > instrumentation notes and the architectural reading of the P2P path are still

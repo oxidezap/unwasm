@@ -100,6 +100,50 @@ pub fn define(store: &mut Store<HostState>, linker: &mut Linker<HostState>) -> R
         },
     )?;
 
+    // The engine handing the host a stanza to put on the wire.
+    //
+    // Implemented rather than stubbed for one reason: **the bytes only exist
+    // during this call.** The trampoline that reaches this import — function
+    // #855, at table slot 464 — frees all three pointers the moment it returns,
+    // and the allocator hands the memory straight back out, so a caller reading
+    // the recorded arguments afterwards gets whatever landed there next. This
+    // is the only place the stanza can be copied.
+    //
+    // `record` is called by hand because defining the import removes the
+    // automatic stub that would otherwise have done it, and the counters are
+    // what `hot_calls` reports.
+    linker.func_wrap(
+        "env",
+        "sendSignalingXMPP_js_sync",
+        |mut caller: Caller<'_, HostState>, peer: i32, call_id: i32, stanza: i32, len: i32| {
+            crate::state::sync_memory(&mut caller);
+            let state = caller.data();
+            state.shared.record(
+                "env",
+                "sendSignalingXMPP_js_sync",
+                vec![
+                    i64::from(peer),
+                    i64::from(call_id),
+                    i64::from(stanza),
+                    i64::from(len),
+                ],
+            );
+            // A length the guest gives is not to be trusted onto a read: a
+            // negative or absurd one would be a panic here rather than a
+            // diagnosis. Out-of-range reads come back empty, and an empty
+            // stanza in the record is itself the finding.
+            let bytes = u32::try_from(len)
+                .ok()
+                .and_then(|len| state.read(stanza as u32, len).ok())
+                .unwrap_or_default();
+            state.shared.record_signaling(crate::shared::SignalingCall {
+                peer_jid: state.read_cstr(peer as u32).unwrap_or_default(),
+                call_id: state.read_cstr(call_id as u32).unwrap_or_default(),
+                stanza: bytes,
+            });
+        },
+    )?;
+
     // --- threading
     //
     // The core count steers how many workers the module's pools want. It is

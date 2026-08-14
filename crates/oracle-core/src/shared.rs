@@ -82,6 +82,24 @@ struct Trace {
     dropped_logs: u64,
 }
 
+/// One `sendSignalingXMPP_js_sync` call, with the stanza copied out of guest
+/// memory while it was still there.
+///
+/// The argument order is the engine's: peer JID, call id, stanza, length. Both
+/// JIDs are NUL-terminated C strings; the stanza is *not* text — it is
+/// WhatsApp's binary XMPP encoding, which is why it is kept as bytes and left
+/// for a caller to decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalingCall {
+    /// Who the stanza is addressed to, as the engine spelled it.
+    pub peer_jid: String,
+    /// The call this belongs to.
+    pub call_id: String,
+    /// The stanza itself, copied before the guest freed it. Empty if the
+    /// length the guest passed did not name a readable range.
+    pub stanza: Vec<u8>,
+}
+
 /// The cross-thread half of the host state.
 #[derive(Debug)]
 pub struct SharedHost {
@@ -98,6 +116,15 @@ pub struct SharedHost {
     /// before failing, so a front-truncating buffer records the startup and
     /// drops the answer.
     markers: Mutex<std::collections::VecDeque<(i32, i64)>>,
+    /// Signaling the guest handed the host, with the bytes copied out.
+    ///
+    /// Its own store rather than part of `trace` for one reason: the trampoline
+    /// that calls `sendSignalingXMPP_js_sync` **frees all three pointers as soon
+    /// as the import returns**, and the allocator hands the memory straight back
+    /// out. A caller that reads the arguments afterwards gets whatever landed
+    /// there next. The bytes have to be copied inside the host call, so the
+    /// host call is where this is filled.
+    signaling: Mutex<Vec<SignalingCall>>,
     /// Virtual monotonic clock, in milliseconds, advanced under a lock so no
     /// thread ever observes it going backwards.
     clock_ms: Mutex<f64>,
@@ -217,6 +244,7 @@ impl Default for SharedHost {
             trace: Mutex::new(Trace::default()),
             marker_sink: Mutex::new(None),
             markers: Mutex::new(std::collections::VecDeque::new()),
+            signaling: Mutex::new(Vec::new()),
             clock_ms: Mutex::new(0.0),
             wall_ms: Mutex::new(0.0),
             next_seq: AtomicU64::new(0),
@@ -485,6 +513,27 @@ impl SharedHost {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .calls
+            .clone()
+    }
+
+    /// Records one outbound signaling call, bytes and all.
+    ///
+    /// Called from the `sendSignalingXMPP_js_sync` host function, which is the
+    /// only moment the stanza exists: its trampoline frees the buffer as soon
+    /// as this returns.
+    pub fn record_signaling(&self, call: SignalingCall) {
+        self.signaling
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(call);
+    }
+
+    /// Every stanza the guest asked the host to send, oldest first.
+    #[must_use]
+    pub fn signaling(&self) -> Vec<SignalingCall> {
+        self.signaling
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 

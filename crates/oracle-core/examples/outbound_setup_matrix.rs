@@ -1,21 +1,15 @@
 //! Which setup step, if any, makes the engine's offer reach the host?
 //!
-//! `outbound_after_settings` establishes that the engine builds an outgoing
-//! offer — `send_offer_msg`, `EVENT: Call offer sent` — and that no host call
-//! carries it, with five explanations tested and eliminated: the settings blob,
-//! all 28 A/B properties, the proxy queue not being drained, a worker that had
-//! not finished, and the sender being uninstrumented.
-//!
-//! What remains are setup steps WhatsApp Web performs and no harness here does.
-//! `StackInterfaceWeb.js` builds an SCTP ring buffer and starts a JS worker
-//! thread — `JsWorkerThread.js` is `startJsWorkerThread()` →
-//! `getJsWorkerPThreadId()` → a message port, and `SctpDataChannelThread.js` is
-//! built on the same thing. This runs the same origination under each
-//! combination and reports where the offer ends up.
+//! The question this was opened to answer: `outbound_after_settings` reported
+//! the engine building an outgoing offer that no host call carried, and
+//! `StackInterfaceWeb.js` performs two setup steps no harness here did — an
+//! SCTP ring buffer and a JS worker thread (`JsWorkerThread.js` is
+//! `startJsWorkerThread()` → `getJsWorkerPThreadId()` → a message port, and
+//! `SctpDataChannelThread.js` is built on the same thing). So: run the same
+//! origination under each combination and see which one makes the offer leave.
 //!
 //! The arms are cumulative on purpose. If none of them changes the outcome, the
-//! missing piece is not a setup call at all, and that is worth establishing as
-//! firmly as the positive result would be.
+//! missing piece is not a setup call at all.
 //!
 //! **The answer turned out to be that nothing was missing.** All five arms are
 //! identical and all five *send*: `startVoipCall` returns 0, the engine builds
@@ -57,12 +51,34 @@
 //! exactly as its body reads; this example shows the engine reaching it on its
 //! own during an ordinary origination.
 //!
-//! ## Reading the stanza
+//! ## The stanza
 //!
 //! `arg2` cannot be read after the fact: #855 frees the three pointers as soon
 //! as the import returns and the allocator hands the memory straight back out,
-//! so a later read shows whatever landed there. Capturing the bytes means
-//! reading them inside the host call.
+//! so a later read shows whatever landed there. `sendSignalingXMPP_js_sync` is
+//! therefore implemented rather than stubbed, and copies the bytes while they
+//! exist — `Runtime::signaling()` returns them.
+//!
+//! Decoding those 179 bytes with **whatsapp-rust's** parser, which shares no
+//! lineage with the engine that produced them, gives a stanza:
+//!
+//! ```xml
+//! <offer call-id="0011223344556677" call-creator="99887766554433@lid">
+//!   <privacy>a5 a5 … 32 bytes</privacy>   <!-- the tcToken passed in -->
+//!   <audio enc="opus" rate="8000"/>
+//!   <audio enc="opus" rate="16000"/>
+//!   <net medium="3"/>
+//!   <capability ver="1">01 05 f7 09 e0 bb 5b</capability>
+//!   <enc count="0">32 bytes</enc>
+//!   <encopt keygen="2"/>
+//! </offer>
+//! ```
+//!
+//! The first byte is the stream flag the transport puts in front of a node, so
+//! the node starts at +1. The `<privacy>` content is the 32-byte tcToken this
+//! example passes to `startVoipCall`, which is what makes the path end-to-end
+//! rather than merely plausible: an argument handed in at the embind surface
+//! comes back out as a field of a stanza a second implementation can parse.
 //!
 //! ```sh
 //! cargo run --release --example outbound_setup_matrix
@@ -169,37 +185,6 @@ const ARMS: &[Arm] = &[
         worker: true,
     },
 ];
-
-/// Bytes as text, with anything unprintable shown as a dot. Stops at the first
-/// NUL so a C string reads as itself.
-fn printable(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .take_while(|b| **b != 0)
-        .map(|b| {
-            if b.is_ascii_graphic() || *b == b' ' {
-                *b as char
-            } else {
-                '.'
-            }
-        })
-        .collect()
-}
-
-/// The same, without stopping at a NUL — for a block that interleaves pointers
-/// and text rather than being one C string.
-fn loose(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|b| {
-            if b.is_ascii_graphic() || *b == b' ' {
-                *b as char
-            } else {
-                '.'
-            }
-        })
-        .collect()
-}
 
 fn offer_stanza(caller: &Jid, now: u64) -> Node {
     NodeBuilder::new("call")
@@ -417,44 +402,53 @@ fn main() -> anyhow::Result<()> {
             println!("  markers      {markers:?}");
         }
 
-        // What the engine actually handed the host. The four words are the
-        // block #855 unpacks: three heap pointers and a value. Reading them
-        // back is the difference between "a call happened" and "here is the
-        // stanza".
-        for call in r.all_calls_to("env::sendSignalingXMPP_js_sync") {
-            println!("  sendSignalingXMPP_js_sync{:?}", call.args);
-            for (i, word) in call.args.iter().enumerate() {
-                let addr = *word as u32;
-                if addr == 0 || addr as usize >= r.memory_size() {
-                    continue;
-                }
-                // Read it as bytes, and — when that looks like nothing — follow
-                // it one level. libc++'s `std::string` is `{ptr, size, cap}`
-                // when long, so a pointer to one dereferences to the text.
-                let Ok(bytes) = r.read(addr, 256) else {
-                    continue;
-                };
-                let direct = printable(&bytes);
-                if direct.chars().filter(|c| *c != '.').count() > 4 {
-                    println!("    arg{i} @{addr:#x}: {direct}");
-                    continue;
-                }
-                let inner = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                let len = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-                if inner == 0 || inner as usize >= r.memory_size() || len > 1 << 20 {
-                    // Not a `{ptr, size}` header. Both of these carry text at
-                    // +8, so show the block as text and let the shape speak.
-                    println!("    arg{i} @{addr:#x}: {}", loose(&bytes[..160]));
-                    continue;
-                }
-                if let Ok(target) = r.read(inner, len.clamp(1, 400)) {
-                    println!(
-                        "    arg{i} @{addr:#x} -> {inner:#x} len={len}: {}",
-                        printable(&target)
-                    );
+        // What the engine handed the host, captured inside the host call —
+        // the only moment the stanza exists, since #855 frees the buffer on
+        // return. Reading the recorded arguments afterwards shows whatever the
+        // allocator handed out next, which is what an earlier version of this
+        // example printed.
+        for call in r.signaling() {
+            println!(
+                "  -> {} / {} : {} bytes",
+                call.peer_jid,
+                call.call_id,
+                call.stanza.len()
+            );
+            let head: Vec<String> = call
+                .stanza
+                .iter()
+                .take(32)
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            println!("     {}", head.join(" "));
+
+            // Decode it with **whatsapp-rust's** parser — an implementation
+            // that shares no lineage with the engine that produced these bytes.
+            // If it parses, the engine's output is a stanza in the sense the
+            // rest of the ecosystem means, and this is RFC-0005's cross-check
+            // for free: two independent implementations agreeing on one wire
+            // format.
+            //
+            // The leading byte is the stream flag WhatsApp's transport puts in
+            // front of a node, so the node itself starts at +1; both forms are
+            // tried rather than assuming which one the engine hands out.
+            for (label, slice) in [
+                ("as given", call.stanza.as_slice()),
+                (
+                    "skipping the flag byte",
+                    &call.stanza[1.min(call.stanza.len())..],
+                ),
+            ] {
+                match marshal::unmarshal_ref(slice) {
+                    Ok(node) => {
+                        println!("     wacore parses it ({label}): {node:?}");
+                        break;
+                    }
+                    Err(e) => println!("     wacore ({label}): {e}"),
                 }
             }
         }
+
         let lines = r.engine_log_from(mark);
         println!(
             "  startVoipCall -> {}   sent={sent} sendto={sendto} events={events} lines={}",

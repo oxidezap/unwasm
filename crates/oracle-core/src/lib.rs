@@ -28,6 +28,7 @@ pub mod wasi;
 pub use call::{Handle, Value};
 pub use embind::{EmbindClass, EmbindFunction, EmbindRegistry};
 pub use runtime::Runtime;
+pub use shared::SignalingCall;
 pub use state::{HostCall, HostState, ThreadPolicy};
 
 pub use catalog::{CapturedModule, Catalog};

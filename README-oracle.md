@@ -522,6 +522,36 @@ engine reaches it with or without main-thread registration: outbound signaling
 is delivered on a bare engine, measured through the call *counters*. See
 "Counting host calls" below.
 
+### Reading the outbound signaling
+
+`sendSignalingXMPP_js_sync` is implemented rather than stubbed, because its
+bytes only exist during the call: the trampoline that reaches it — function
+#855 at table slot 464 — frees all three pointers on return, so a caller
+reading the recorded arguments afterwards gets whatever the allocator handed
+out next. `Runtime::signaling()` returns what the host copied:
+
+```rust
+for call in runtime.signaling() {
+    // peer_jid, call_id, and the stanza as bytes
+    let node = wacore_binary::marshal::unmarshal_ref(&call.stanza[1..])?;  // +1: stream flag
+}
+```
+
+An origination on a bare engine produces one, and whatsapp-rust's parser —
+sharing no lineage with the engine — decodes it:
+
+```xml
+<offer call-id="0011223344556677" call-creator="99887766554433@lid">
+  <privacy>a5 … 32 bytes</privacy>   <!-- the tcToken passed to startVoipCall -->
+  <audio enc="opus" rate="8000"/>
+  <audio enc="opus" rate="16000"/>
+  <net medium="3"/>
+  <capability ver="1">01 05 f7 09 e0 bb 5b</capability>
+  <enc count="0">32 bytes</enc>
+  <encopt keygen="2"/>
+</offer>
+```
+
 ### Counting host calls
 
 Three accessors answer "did the guest call this", and **two of them return zero
