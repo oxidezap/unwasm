@@ -47,8 +47,16 @@ fn near_misses(available: &BTreeSet<String>, wanted: &[&str]) -> Vec<String> {
 
 /// Builds the message for an export that is not there.
 fn missing(caller: &Caller<'_, HostState>, kind: &str, wanted: &[&str]) -> anyhow::Error {
-    let available = caller.data().shared.exports.get();
+    missing_from(caller.data().shared.exports.get(), kind, wanted)
+}
 
+/// The same message, for a caller that holds the export set rather than a
+/// `Caller` — `Runtime` looks up its function table outside any host call.
+pub(crate) fn missing_from(
+    available: Option<&BTreeSet<String>>,
+    kind: &str,
+    wanted: &[&str],
+) -> anyhow::Error {
     let suggestion = match available {
         Some(available) => {
             let close = near_misses(available, wanted);

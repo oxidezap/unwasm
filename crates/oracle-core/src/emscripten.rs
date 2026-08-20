@@ -446,7 +446,16 @@ pub fn define(store: &mut Store<HostState>, linker: &mut Linker<HostState>) -> R
                 });
             }
 
-            let mut out = vec![Val::I32(0); results.len()];
+            // One slot per result, each of the callee's own type. `Val::I32`
+            // throughout was wrong for any callee returning `i64`, `f32` or
+            // `f64`: wasmtime validates the result buffer against the signature
+            // and refuses the call, so the conversion below never got the
+            // chance to do what it says it does.
+            let mut out: Vec<Val> = results
+                .iter()
+                .cloned()
+                .map(crate::host::zero_value_of)
+                .collect();
             callee.call(&mut caller, &call_args, &mut out)?;
 
             // The result comes back as a double whatever the callee returned,

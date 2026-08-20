@@ -4,13 +4,45 @@
 //! Anything that must be coherent across threads lives in `shared.rs` instead;
 //! that split is a correctness question, documented there.
 
+use std::cell::UnsafeCell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use anyhow::{Result, anyhow};
-use wasmtime::{Caller, Extern, SharedMemory};
+use wasmtime::{Caller, Extern, Memory, SharedMemory};
 
 use crate::embind::EmbindRegistry;
 use crate::shared::SharedHost;
+
+/// Reads one byte of shared memory as an atomic.
+///
+/// Not `*cell.get()`, and the difference is not stylistic. A guest thread may
+/// be writing this byte while the host reads it, and a plain load racing a
+/// write is undefined behaviour in Rust however small the object is — the
+/// compiler is entitled to assume it cannot happen and to fold or duplicate the
+/// read accordingly. A relaxed atomic load says the race is expected: the value
+/// may be either the old or the new byte, which is exactly the "can tear"
+/// caveat the callers already document, but it is a *defined* answer rather
+/// than licence to miscompile the surrounding code.
+///
+/// Relaxed because there is nothing to order against. The host is sampling
+/// bytes the guest owns; no other host state is published through them.
+#[allow(unsafe_code)]
+fn load_shared(cell: &UnsafeCell<u8>) -> u8 {
+    // SAFETY: the pointer comes from a live `UnsafeCell<u8>` inside wasmtime's
+    // shared-memory mapping, so it is non-null, aligned (`u8` always is) and
+    // valid for the lifetime of the borrow. Every host access to that mapping
+    // goes through `load_shared`/`store_shared`, so nothing in this process
+    // touches it non-atomically.
+    unsafe { AtomicU8::from_ptr(cell.get()).load(Ordering::Relaxed) }
+}
+
+/// Writes one byte of shared memory as an atomic. See [`load_shared`].
+#[allow(unsafe_code)]
+fn store_shared(cell: &UnsafeCell<u8>, byte: u8) {
+    // SAFETY: as in `load_shared`.
+    unsafe { AtomicU8::from_ptr(cell.get()).store(byte, Ordering::Relaxed) }
+}
 
 /// One call into a stubbed host function, with the raw arguments the module
 /// passed. The arguments are the interesting part: pointers into linear memory
@@ -55,6 +87,14 @@ pub struct HostState {
     /// on entry to every host call — see `sync_memory`. It is never used across
     /// a call boundary, so `memory.grow` cannot leave it dangling.
     pub linear: Option<(usize, usize)>,
+    /// An ordinary memory this host created to satisfy a module's *import*.
+    ///
+    /// Held because it cannot be found again: a module that imports its memory
+    /// without re-exporting it has no name for `sync_memory` to look up, so
+    /// without the handle the window would never be filled in and every host
+    /// callback reading a guest pointer would fail on a module that otherwise
+    /// ran. Shared memory takes the `memory` field above instead.
+    pub imported_memory: Option<Memory>,
     /// Registered API. Only the instantiating thread runs the constructors, so
     /// this is not shared.
     pub embind: EmbindRegistry,
@@ -150,6 +190,7 @@ impl HostState {
             spawner: None,
             memory: None,
             linear: None,
+            imported_memory: None,
             embind: EmbindRegistry::default(),
             in_flight: crate::cxa::InFlight::default(),
             wasi: crate::wasi::WasiState::default(),
@@ -236,9 +277,12 @@ impl HostState {
 impl HostState {
     /// Reads `len` bytes of linear memory.
     ///
-    /// What keeps this exclusive is `schedule.rs`, not the absence of threads:
-    /// `ThreadPolicy::Spawn` runs real guest threads over one shared memory, and
-    /// the scheduler is what holds all but one of them outside guest code.
+    /// Concurrent guest writes are expected rather than excluded. `schedule.rs`
+    /// narrows the window — a guest thread holds its turn across the host call
+    /// this read happens inside — but that is bounded, not absolute, and
+    /// `threads.rs` deliberately watches a word another thread is writing. So
+    /// every byte goes through [`load_shared`]: the answer can still mix old
+    /// and new bytes, and now that is a defined outcome instead of a race.
     #[allow(unsafe_code)]
     pub fn read(&self, ptr: u32, len: u32) -> Result<Vec<u8>> {
         let start = ptr as usize;
@@ -254,20 +298,12 @@ impl HostState {
                     data.len()
                 ));
             }
-            // SAFETY: wasmtime exposes shared memory as UnsafeCell because
-            // another thread could write to it. Bounds are checked above, and
-            // the accesses are per-byte through the cell, so no reference to
-            // the memory is formed and no typed invariant can be broken.
-            //
-            // Exclusion comes from the scheduler: a guest thread only runs
-            // while it holds the turn, and it holds the turn across the host
-            // call this read happens inside. That is bounded rather than
-            // absolute — `schedule.rs` lets a thread take its turn after
-            // TURN_TIMEOUT rather than deadlock, and `threads.rs` deliberately
-            // watches a word another thread is writing. Past that point a read
-            // can tear and return a mix of old and new bytes. `forced_turns()`
-            // counts it, and the startup guard keeps it at zero.
-            return Ok(unsafe { data[start..end].iter().map(|cell| *cell.get()).collect() });
+            // Bounds are checked above; each byte is an independent relaxed
+            // atomic load, so a write racing this read yields old or new bytes
+            // rather than undefined behaviour. `forced_turns()` counts how often
+            // the scheduler let that window open, and the startup guard keeps it
+            // at zero.
+            return Ok(data[start..end].iter().map(load_shared).collect());
         }
 
         let (base, size) = self
@@ -298,7 +334,6 @@ impl HostState {
     /// attribution in `install_memory_watch` needs the answer on the way into
     /// guest code as well as on the way out, and a latched check can only ever
     /// say that something happened, never which thread did it.
-    #[allow(unsafe_code)]
     pub fn watch_intact(&self) -> Option<bool> {
         let watch = self.shared.watch.get()?;
         let memory = self.memory.as_ref()?;
@@ -306,13 +341,12 @@ impl HostState {
         let span = memory
             .data()
             .get(start..start.checked_add(watch.expected.len())?)?;
-        // SAFETY: the same argument as `read` — per-byte through the cell, so
-        // no reference into shared memory is formed, and the range came from
-        // `get` rather than from arithmetic.
+        // The same argument as `read`: one relaxed atomic load per byte, and
+        // the range came from `get` rather than from arithmetic.
         Some(
             span.iter()
                 .zip(&watch.expected)
-                .all(|(cell, byte)| unsafe { *cell.get() } == *byte),
+                .all(|(cell, byte)| load_shared(cell) == *byte),
         )
     }
 
@@ -344,13 +378,13 @@ impl HostState {
             if end > data.len() {
                 return Err(anyhow!("write at {ptr}+{} is out of bounds", bytes.len()));
             }
-            // SAFETY: same argument as `read` — per-byte through the cell,
-            // range checked above, exclusion from the scheduler — and the guest
-            // gave us this pointer to write through.
-            unsafe {
-                for (cell, byte) in data[start..end].iter().zip(bytes) {
-                    *cell.get() = *byte;
-                }
+            // Same argument as `read`: one relaxed atomic store per byte, range
+            // checked above, and the guest gave us this pointer to write
+            // through. Byte-at-a-time means a concurrent reader can observe the
+            // write half-done — which is what a guest thread racing the host
+            // would see anyway, and is now defined rather than undefined.
+            for (cell, byte) in data[start..end].iter().zip(bytes) {
+                store_shared(cell, *byte);
             }
             return Ok(());
         }
@@ -409,23 +443,33 @@ impl HostState {
     }
 }
 
-/// Refreshes the host's view of an ordinary exported memory.
+/// Refreshes the host's view of an ordinary memory.
 ///
 /// Must run at the start of every host function that may touch guest memory.
 /// A module whose memory is exported rather than imported is invisible until
 /// this runs, and a stale window would survive a `memory.grow`. Modules with a
 /// shared memory need nothing here, since that handle stays valid on its own.
+///
+/// The imported handle is tried first, because it is the case a name lookup
+/// cannot cover: a module that imports its memory and does not re-export it has
+/// no export to find.
 pub fn sync_memory(caller: &mut Caller<'_, HostState>) {
     if caller.data().memory.is_some() {
         return;
     }
-    let name = caller
-        .data()
-        .memory_export
-        .clone()
-        .unwrap_or_else(|| "memory".to_owned());
-    let Some(Extern::Memory(memory)) = caller.get_export(&name) else {
-        return;
+    let memory = match caller.data().imported_memory {
+        Some(memory) => memory,
+        None => {
+            let name = caller
+                .data()
+                .memory_export
+                .clone()
+                .unwrap_or_else(|| "memory".to_owned());
+            let Some(Extern::Memory(memory)) = caller.get_export(&name) else {
+                return;
+            };
+            memory
+        }
     };
     let window = (memory.data_ptr(&caller) as usize, memory.data_size(&caller));
     caller.data_mut().linear = Some(window);

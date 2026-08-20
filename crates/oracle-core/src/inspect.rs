@@ -217,6 +217,11 @@ fn parse(bytes: &[u8]) -> Result<Parsed> {
     // index resolvable.
     let mut signatures: Vec<String> = Vec::new();
     let mut func_types: Vec<u32> = Vec::new();
+    // Memories and tables in *index-space* order: the imported ones first, then
+    // the locally defined ones, exactly as functions are. An export names an
+    // index into that combined space, so keeping only the local ones made every
+    // table export report the first local table's limits — and a re-exported
+    // imported table, in a module with no local one, report as a global.
     let mut memories: Vec<(u64, Option<u64>, bool)> = Vec::new();
     let mut tables: Vec<(u64, Option<u64>)> = Vec::new();
 
@@ -246,15 +251,21 @@ fn parse(bytes: &[u8]) -> Result<Parsed> {
                             func_types.push(index);
                             EntryKind::Func(signature_of(&signatures, index))
                         }
-                        TypeRef::Memory(ty) => EntryKind::Memory {
-                            min: ty.initial,
-                            max: ty.maximum,
-                            shared: ty.shared,
-                        },
-                        TypeRef::Table(ty) => EntryKind::Table {
-                            min: ty.initial,
-                            max: ty.maximum,
-                        },
+                        TypeRef::Memory(ty) => {
+                            memories.push((ty.initial, ty.maximum, ty.shared));
+                            EntryKind::Memory {
+                                min: ty.initial,
+                                max: ty.maximum,
+                                shared: ty.shared,
+                            }
+                        }
+                        TypeRef::Table(ty) => {
+                            tables.push((ty.initial, ty.maximum));
+                            EntryKind::Table {
+                                min: ty.initial,
+                                max: ty.maximum,
+                            }
+                        }
                         TypeRef::Global(_) | TypeRef::Tag(_) => EntryKind::Global,
                     };
                     if let EntryKind::Memory { shared: true, .. } = kind {
@@ -310,25 +321,17 @@ fn parse(bytes: &[u8]) -> Result<Parsed> {
                                 .map(|ty| signature_of(&signatures, *ty))
                                 .unwrap_or_else(|| "?".to_owned()),
                         ),
-                        wasmparser::ExternalKind::Memory => {
-                            // Exported memories index the locally defined ones,
-                            // after any imported memory.
-                            let local = index.saturating_sub(
-                                out.imports
-                                    .iter()
-                                    .filter(|i| matches!(i.kind, EntryKind::Memory { .. }))
-                                    .count(),
-                            );
-                            match memories.get(local) {
-                                Some((min, max, shared)) => EntryKind::Memory {
-                                    min: *min,
-                                    max: *max,
-                                    shared: *shared,
-                                },
-                                None => EntryKind::Global,
-                            }
-                        }
-                        wasmparser::ExternalKind::Table => match tables.first() {
+                        // `memories` and `tables` are already in index-space
+                        // order, so the export's own index is the lookup.
+                        wasmparser::ExternalKind::Memory => match memories.get(index) {
+                            Some((min, max, shared)) => EntryKind::Memory {
+                                min: *min,
+                                max: *max,
+                                shared: *shared,
+                            },
+                            None => EntryKind::Global,
+                        },
+                        wasmparser::ExternalKind::Table => match tables.get(index) {
                             Some((min, max)) => EntryKind::Table {
                                 min: *min,
                                 max: *max,
@@ -458,4 +461,111 @@ fn producer_strings(data: &[u8]) -> Vec<String> {
         found.push(current);
     }
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_encoder::{
+        EntityType, ExportKind, ExportSection, ImportSection, MemorySection, MemoryType, Module,
+        RefType, TableSection, TableType,
+    };
+
+    fn table_type(minimum: u64, maximum: Option<u64>) -> TableType {
+        TableType {
+            element_type: RefType::FUNCREF,
+            table64: false,
+            minimum,
+            maximum,
+            shared: false,
+        }
+    }
+
+    fn memory_type(minimum: u64, shared: bool) -> MemoryType {
+        MemoryType {
+            minimum,
+            maximum: None,
+            memory64: false,
+            shared,
+            page_size_log2: None,
+        }
+    }
+
+    /// An export names an index into the *whole* space, imports included, and
+    /// each kind gets its own space. Reporting every table export from the
+    /// first locally declared table made a two-table module lie about both, and
+    /// a module whose only table is imported report it as a global.
+    #[test]
+    fn an_export_resolves_to_the_table_its_index_names() {
+        let mut imports = ImportSection::new();
+        imports.import("env", "table", EntityType::Table(table_type(7, Some(7))));
+        imports.import("env", "memory", EntityType::Memory(memory_type(2, true)));
+
+        let mut tables = TableSection::new();
+        tables.table(table_type(11, None));
+        tables.table(table_type(23, Some(99)));
+
+        let mut memories = MemorySection::new();
+        memories.memory(memory_type(5, false));
+
+        let mut exports = ExportSection::new();
+        // Index 0 is the imported table, 1 and 2 the local ones.
+        exports.export("borrowed", ExportKind::Table, 0);
+        exports.export("first", ExportKind::Table, 1);
+        exports.export("second", ExportKind::Table, 2);
+        // And the same for memories: 0 imported, 1 local.
+        exports.export("shared_mem", ExportKind::Memory, 0);
+        exports.export("own_mem", ExportKind::Memory, 1);
+
+        let mut module = Module::new();
+        module.section(&imports);
+        module.section(&tables);
+        module.section(&memories);
+        module.section(&exports);
+
+        let parsed = parse(&module.finish()).expect("parse");
+        let kind = |name: &str| {
+            parsed
+                .exports
+                .iter()
+                .find(|export| export.name == name)
+                .unwrap_or_else(|| panic!("no export `{name}`"))
+                .kind
+                .clone()
+        };
+
+        assert_eq!(
+            kind("borrowed"),
+            EntryKind::Table {
+                min: 7,
+                max: Some(7)
+            },
+            "a re-exported imported table is a table, not a global"
+        );
+        assert_eq!(kind("first"), EntryKind::Table { min: 11, max: None });
+        assert_eq!(
+            kind("second"),
+            EntryKind::Table {
+                min: 23,
+                max: Some(99)
+            },
+            "the second local table must not report the first one's limits"
+        );
+        assert_eq!(
+            kind("shared_mem"),
+            EntryKind::Memory {
+                min: 2,
+                max: None,
+                shared: true
+            }
+        );
+        assert_eq!(
+            kind("own_mem"),
+            EntryKind::Memory {
+                min: 5,
+                max: None,
+                shared: false
+            }
+        );
+    }
 }

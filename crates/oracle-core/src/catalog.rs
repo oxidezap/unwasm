@@ -51,7 +51,27 @@ fn find_capture_dir() -> Option<PathBuf> {
             [fetched, Some(ancestor.join(SIBLING_DIR))]
         })
         .flatten()
-        .find(|candidate| candidate.is_dir())
+        .find(|candidate| holds_a_capture(candidate))
+}
+
+/// Whether a candidate directory is one worth stopping at.
+///
+/// Existing is not enough. A `fetch-wasm.py` run that fails or is interrupted
+/// leaves `wasm/` behind with nothing in it, and that empty directory used to
+/// win over a populated sibling checkout — so the catalogue came back valid and
+/// empty, and every capture-dependent test skipped while the captures were
+/// sitting one directory away. A directory answers only if it actually holds a
+/// `.wasm`.
+fn holds_a_capture(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "wasm")
+    })
 }
 
 /// A captured module found on disk.
@@ -81,8 +101,9 @@ impl Catalog {
             Some(dir) => PathBuf::from(dir),
             None => find_capture_dir().with_context(|| {
                 format!(
-                    "no capture directory found; set {DIR_ENV} to the directory holding the \
-                     captured .wasm files"
+                    "no directory holding captured .wasm files was found (an empty `{FETCH_DIR}/` \
+                     does not count — see `holds_a_capture`); run scripts/fetch-wasm.py, or set \
+                     {DIR_ENV}"
                 )
             })?,
         };
@@ -158,5 +179,56 @@ impl Catalog {
                     self.dir.display()
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scratch directory that removes itself. No `tempfile` dependency: this
+    /// is the only test that needs one.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("oracle-catalog-{name}"));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("scratch directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The failure this guards: `fetch-wasm.py` creates `wasm/` before it
+    /// downloads anything, so an interrupted run leaves an empty directory that
+    /// used to win the search — and the catalogue came back valid and empty
+    /// while a populated sibling checkout sat one directory further up.
+    #[test]
+    fn an_empty_directory_is_not_a_capture_directory() {
+        let scratch = Scratch::new("empty");
+        assert!(
+            !holds_a_capture(&scratch.0),
+            "an empty directory holds no captures"
+        );
+
+        // Nor does one holding something else.
+        std::fs::write(scratch.0.join("notes.md"), b"not a module").expect("write");
+        assert!(!holds_a_capture(&scratch.0));
+
+        std::fs::write(scratch.0.join("Abc123.wasm"), b"\0asm").expect("write");
+        assert!(holds_a_capture(&scratch.0), "one .wasm is enough");
+    }
+
+    #[test]
+    fn a_directory_that_does_not_exist_is_not_one_either() {
+        assert!(!holds_a_capture(Path::new(
+            "/nonexistent/oracle/capture/dir"
+        )));
     }
 }

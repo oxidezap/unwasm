@@ -97,7 +97,18 @@ different code. Treat a capture bump as a re-derivation, never as an update.
   guest-execution window does serialise and is unusable — a two-minute round
   had not finished in ten. Do not write code whose safety argument is "the
   scheduler holds all but one thread outside guest code"; that is not true
-  today. `HostState::read`'s SAFETY note is the one place still saying it.
+  today. `HostState::read` used to say it and no longer does: every byte of
+  shared memory now goes through a relaxed atomic (`load_shared` /
+  `store_shared` in `state.rs`), so a host read racing a guest write can still
+  tear — which is what `forced_turns()` counts — but it is a defined outcome
+  rather than undefined behaviour the compiler may optimise around.
+- **A held turn is released by a guard, not by a paired call.** `run_thread`
+  can fail with `?` between taking its turn and entering the routine —
+  `__emscripten_thread_init` traps, `_emscripten_tls_init` traps — and a dead
+  worker left as the recorded holder makes every later acquisition wait out
+  `TURN_TIMEOUT` and force its way through. One failed initialisation then
+  turns serialisation off for the rest of the run. `Scheduler::turn` returns
+  the guard; `schedule.rs`'s own tests are the check.
 - **Every test that starts an engine takes both locks.** `threaded_guard()`
   serialises within a test binary; `common::engine_lock()` serialises *across*
   them, because cargo runs the binaries in parallel and `threading`,
@@ -144,7 +155,11 @@ Host environment, in the order a module exercises it:
   the sink so nothing is renumbered, and splices raw bytes because a wasm body
   holds no absolute offsets. **Mark the call site, not the body** — a body patch
   reports whichever call ran, which is what made the old null-key measurement
-  weak.
+  weak. **And the sink is chosen by name, not by signature**: the first
+  `(i32, i32) -> ()` import is as likely to be `get_random_bytes_js`, whose
+  marker call would write guest memory, as anything harmless. Only
+  `RECORDING_ONLY_SINKS` is picked automatically; anything else has to be named
+  through `Plan::sink` / `--sink`, and a module with no candidate is refused.
 
 ## Two host bugs worth not repeating
 

@@ -350,12 +350,28 @@ pub(crate) fn build_engine() -> Result<Engine> {
     Engine::new(&config).context("building wasmtime engine")
 }
 
+/// The memory this host created for a module that imports one.
+///
+/// Both variants have to reach `HostState`, and the reason is the same for
+/// each: an import is not an export, so nothing later can look it up by name.
+/// Dropping the ordinary one on the floor left the host with neither `memory`
+/// nor `linear`, and every callback that dereferenced a guest pointer failed
+/// with "module memory is not available to the host" on a module that had
+/// instantiated perfectly.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ImportedMemory {
+    /// A shared memory, readable without a store context.
+    pub shared: Option<SharedMemory>,
+    /// An ordinary one, which needs the store to give up its window.
+    pub ordinary: Option<Memory>,
+}
+
 /// Creates and defines the imported memory, returning it for the host state.
 pub(crate) fn define_memory(
     store: &mut Store<HostState>,
     linker: &mut Linker<HostState>,
     module: &Module,
-) -> Result<Option<SharedMemory>> {
+) -> Result<ImportedMemory> {
     for import in module.imports() {
         let ExternType::Memory(ty) = import.ty() else {
             continue;
@@ -367,15 +383,22 @@ pub(crate) fn define_memory(
             linker
                 .define(&*store, import.module(), import.name(), memory.clone())
                 .context("defining shared memory import")?;
-            return Ok(Some(memory));
+            return Ok(ImportedMemory {
+                shared: Some(memory),
+                ordinary: None,
+            });
         }
 
         let memory = Memory::new(&mut *store, ty.clone()).context("allocating memory")?;
         linker
             .define(&*store, import.module(), import.name(), memory)
             .context("defining memory import")?;
+        return Ok(ImportedMemory {
+            shared: None,
+            ordinary: Some(memory),
+        });
     }
-    Ok(None)
+    Ok(ImportedMemory::default())
 }
 
 /// Defines a recording stub for every import the linker does not already have.

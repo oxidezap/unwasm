@@ -144,6 +144,22 @@ impl Scheduler {
         self.waiting.fetch_sub(1, Ordering::SeqCst);
     }
 
+    /// Takes a turn for `thread` and gives it back when the guard is dropped.
+    ///
+    /// The paired `acquire`/`release` spelling is only correct on a path with
+    /// no early return, and `threads.rs` has several: a worker whose
+    /// `__emscripten_thread_init` traps used to leave itself recorded as the
+    /// holder forever. Every later acquisition then waited out `TURN_TIMEOUT`
+    /// and forced its way through, so one initialisation failure turned the
+    /// scheduler off for the rest of the run.
+    pub fn turn(&self, thread: u64) -> Turn<'_> {
+        self.acquire(thread);
+        Turn {
+            scheduler: self,
+            thread,
+        }
+    }
+
     /// Gives up the turn held by `thread`.
     pub fn release(&self, thread: u64) {
         if !self.is_enabled() {
@@ -168,5 +184,87 @@ impl Scheduler {
         self.release(thread);
         std::thread::yield_now();
         self.acquire(thread);
+    }
+}
+
+/// A held scheduler turn, released on drop. See [`Scheduler::turn`].
+#[derive(Debug)]
+pub struct Turn<'a> {
+    scheduler: &'a Scheduler,
+    thread: u64,
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        self.scheduler.release(self.thread);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The failure the guard exists for: a worker that returns early while
+    /// holding the turn stays the recorded holder, and every later acquisition
+    /// then waits out `TURN_TIMEOUT` and forces its way through — one failed
+    /// initialisation turning serialisation off for the rest of the run.
+    #[test]
+    fn a_turn_is_given_back_when_its_holder_returns_early() {
+        let scheduler = Scheduler::default();
+        scheduler.enable();
+
+        fn fallible(scheduler: &Scheduler) -> Result<(), ()> {
+            let _turn = scheduler.turn(7);
+            Err(())
+        }
+
+        assert!(fallible(&scheduler).is_err());
+        assert!(
+            scheduler
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .holder
+                .is_none(),
+            "the dead holder must not still own the turn"
+        );
+
+        // And another thread takes it without having to force its way in.
+        scheduler.acquire(9);
+        scheduler.release(9);
+        assert_eq!(scheduler.forced_turns(), 0);
+    }
+
+    /// Releasing is still keyed on the holder, so a guard cannot take a turn
+    /// away from whoever actually has it.
+    #[test]
+    fn a_guard_releases_only_its_own_turn() {
+        let scheduler = Scheduler::default();
+        scheduler.enable();
+
+        scheduler.acquire(1);
+        drop(scheduler.turn(1));
+        assert!(
+            scheduler
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .holder
+                .is_none(),
+            "the same thread's guard gives the turn back"
+        );
+
+        scheduler.acquire(1);
+        // A guard for a *different* thread would block, so only the release
+        // path is exercised here: thread 2 releasing does nothing to thread 1.
+        scheduler.release(2);
+        assert_eq!(
+            scheduler
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .holder,
+            Some(1)
+        );
     }
 }

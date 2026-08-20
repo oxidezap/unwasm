@@ -296,8 +296,30 @@ fn a_captured_module_survives_being_instrumented() {
         "sodiumInit makes direct calls, which is what makes it worth marking"
     );
 
-    let (rewritten, map) =
-        patch::instrument(&bytes, &Plan::every_call_in(SODIUM_INIT)).expect("instrument");
+    // Every one of this module's four `(i32, i32) -> ()` imports has real
+    // behaviour behind it — three embind registrations and the `invoke_vi`
+    // exception trampoline — so the default selection refuses rather than
+    // splicing calls to one of them. The refusal has to name them, since
+    // nominating one is the only way forward.
+    let refused = patch::instrument(&bytes, &Plan::every_call_in(SODIUM_INIT))
+        .expect_err("no recording-only sink here");
+    let refusal = refused.to_string();
+    for candidate in ["_embind_register_void", "invoke_vi"] {
+        assert!(
+            refusal.contains(candidate),
+            "the refusal should list the candidates it rejected: {refusal}"
+        );
+    }
+
+    // Nominating one is the caller saying it has checked. It has: the markers
+    // spliced here are never reached — this test instantiates the module and
+    // does not call `sodiumInit` — and `_embind_register_void(id, 0)` reads a
+    // name from address 0 and records nothing when it is empty.
+    let plan = Plan {
+        sink: Some("env::_embind_register_void".to_owned()),
+        ..Plan::every_call_in(SODIUM_INIT)
+    };
+    let (rewritten, map) = patch::instrument(&bytes, &plan).expect("instrument");
     assert_eq!(
         map.markers.len(),
         sites.values().sum::<usize>(),
@@ -311,5 +333,70 @@ fn a_captured_module_survives_being_instrumented() {
         original.functions().len(),
         patched.functions().len(),
         "and exposes the same surface"
+    );
+}
+
+/// The refusal that matters most: an import of the right *shape* whose host
+/// implementation writes guest memory must not be picked by accident.
+///
+/// `env::get_random_bytes_js` is `(len, buf)`, so a marker calling it would ask
+/// for `id` bytes of PRNG output at address `value` — two hundred thousand
+/// bytes written from address zero, on a module that still validates and still
+/// runs. That is the whole reason the sink is chosen by name.
+#[test]
+fn an_import_that_writes_guest_memory_is_not_picked_as_a_sink() {
+    let mut types = TypeSection::new();
+    types.ty().function([ValType::I32, ValType::I32], []);
+    types.ty().function([ValType::I32], [ValType::I32]);
+
+    let mut imports = ImportSection::new();
+    imports.import("env", "get_random_bytes_js", EntityType::Function(0));
+
+    let mut functions = FunctionSection::new();
+    functions.function(1);
+    let mut code = CodeSection::new();
+    let mut identity = Function::new([]);
+    identity.instructions().local_get(0).end();
+    code.function(&identity);
+
+    let mut module = Module::new();
+    module.section(&types);
+    module.section(&imports);
+    module.section(&functions);
+    module.section(&code);
+    let bytes = module.finish();
+
+    let error =
+        patch::instrument(&bytes, &Plan::every_call_in(1)).expect_err("not a recording-only sink");
+    let text = error.to_string();
+    assert!(
+        text.contains("recording-only") && text.contains("env::get_random_bytes_js"),
+        "the refusal should say why, and name the candidate: {text}"
+    );
+
+    // Naming it is allowed — that is the caller taking responsibility — and it
+    // is the only way the module gets instrumented at all.
+    let plan = Plan {
+        sink: Some("get_random_bytes_js".to_owned()),
+        ..Plan::every_call_in(1)
+    };
+    let (_, map) = patch::instrument(&bytes, &plan).expect("a nominated sink is honoured");
+    assert_eq!(map.via_symbol, "env::get_random_bytes_js");
+}
+
+/// A nominated sink that is not there, or is not the right shape, is an error
+/// rather than a fall-back to whatever was.
+#[test]
+fn a_nominated_sink_that_does_not_exist_is_refused() {
+    let bytes = sample();
+    let plan = Plan {
+        sink: Some("env::nowhere".to_owned()),
+        ..Plan::every_call_in(3)
+    };
+    let error = patch::instrument(&bytes, &plan).expect_err("no such import");
+    let text = error.to_string();
+    assert!(
+        text.contains("env::nowhere") && text.contains("env::mark"),
+        "the refusal should name what was asked for and what is available: {text}"
     );
 }

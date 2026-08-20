@@ -11,7 +11,7 @@
 //! because a plausible-but-wrong result from an oracle is worse than no result.
 
 use anyhow::{Context, Result, anyhow};
-use wasmtime::{Extern, Ref, Val};
+use wasmtime::{Ref, Val};
 
 use crate::runtime::Runtime;
 
@@ -324,9 +324,7 @@ impl Runtime {
 
     /// Resolves a function-table index.
     fn table_function(&mut self, index: u32) -> Result<wasmtime::Func> {
-        let Some(Extern::Table(table)) = self.export("__indirect_function_table") else {
-            return Err(anyhow!("module exports no __indirect_function_table"));
-        };
+        let table = self.function_table()?;
         match self.table_get(table, index as u64) {
             Some(Ref::Func(Some(func))) => Ok(func),
             _ => Err(anyhow!("function table entry {index} is not callable")),

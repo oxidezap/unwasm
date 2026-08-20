@@ -34,6 +34,11 @@ const FIRST_FILE_FD: u32 = 4;
 /// The name the root preopen is reported under.
 const ROOT_NAME: &str = "/";
 
+/// WASI clock ids. `2` and `3` are the process and thread CPU-time clocks,
+/// which this host does not have and therefore refuses.
+const CLOCKID_REALTIME: u32 = 0;
+const CLOCKID_MONOTONIC: u32 = 1;
+
 #[derive(Debug, Clone)]
 /// One open descriptor in the in-memory filesystem.
 pub struct OpenFile {
@@ -167,6 +172,37 @@ fn fd_write(caller: &mut Caller<'_, HostState>, fd: u32, iovs: u32, count: u32, 
 }
 
 fn fd_read(caller: &mut Caller<'_, HostState>, fd: u32, iovs: u32, count: u32, out: u32) -> i32 {
+    read_into(caller, fd, iovs, count, None, out)
+}
+
+/// `fd_pread(fd, iovs, iovs_len, offset: u64, nread)`.
+///
+/// A different shape from `fd_read`, not a synonym for it: the offset occupies
+/// one *64-bit* parameter, so the output pointer is argument 4 rather than 3.
+/// Routing it through `fd_read` read the low half of the offset as the address
+/// to report the byte count at, ignored the real one, and moved the descriptor's
+/// cursor — three wrong answers from one alias.
+fn fd_pread(
+    caller: &mut Caller<'_, HostState>,
+    fd: u32,
+    iovs: u32,
+    count: u32,
+    offset: u64,
+    out: u32,
+) -> i32 {
+    read_into(caller, fd, iovs, count, Some(offset), out)
+}
+
+/// The body both reads share. `at` is `None` for a cursor read, which is the
+/// only case that advances the descriptor.
+fn read_into(
+    caller: &mut Caller<'_, HostState>,
+    fd: u32,
+    iovs: u32,
+    count: u32,
+    at: Option<u64>,
+    out: u32,
+) -> i32 {
     if fd == FD_STDIN {
         // Always at end of input; no interactive stdin exists here.
         return match write_u32(caller.data(), out, 0) {
@@ -184,7 +220,7 @@ fn fd_read(caller: &mut Caller<'_, HostState>, fd: u32, iovs: u32, count: u32, o
         return EBADF;
     };
 
-    let mut offset = open.offset as usize;
+    let mut offset = at.unwrap_or(open.offset) as usize;
     let mut total = 0u32;
     for (ptr, len) in vectors {
         if offset >= contents.len() {
@@ -198,10 +234,41 @@ fn fd_read(caller: &mut Caller<'_, HostState>, fd: u32, iovs: u32, count: u32, o
         total += take as u32;
     }
 
-    if let Some(open) = caller.data_mut().wasi.open.get_mut(&fd) {
+    // A positional read leaves the cursor where it was: that is the whole
+    // difference between `pread` and `read`.
+    if at.is_none()
+        && let Some(open) = caller.data_mut().wasi.open.get_mut(&fd)
+    {
         open.offset = offset as u64;
     }
     match write_u32(caller.data(), out, total) {
+        Ok(()) => ESUCCESS,
+        Err(_) => EINVAL,
+    }
+}
+
+/// `clock_time_get(id, precision, out)`.
+///
+/// The clock id is the whole of the question, and ignoring it answered every
+/// one of them with the monotonic counter — so a guest asking for the wall
+/// clock got "nanoseconds since this run started", i.e. a timestamp in 1970,
+/// and a guest asking for a CPU clock got a success it should never have had.
+///
+/// Both clocks come from the same virtual source the emscripten layer uses, so
+/// time is consistent whichever way a module asks for it.
+fn clock_time_get(caller: &mut Caller<'_, HostState>, id: u32, out: u32) -> i32 {
+    let nanos = match id {
+        CLOCKID_REALTIME => {
+            let millis = crate::emscripten::EPOCH_MS + caller.data().shared.tick_wall_clock();
+            (millis * 1_000_000.0) as u64
+        }
+        CLOCKID_MONOTONIC => (caller.data().tick_clock() * 1_000_000.0) as u64,
+        // The two CPU-time clocks. This host has no notion of either, and
+        // reporting success with a number it made up is exactly the "stub that
+        // returns zero is a hypothesis" failure.
+        _ => return ENOSYS,
+    };
+    match write_u64(caller.data(), out, nanos) {
         Ok(()) => ESUCCESS,
         Err(_) => EINVAL,
     }
@@ -447,12 +514,22 @@ fn dispatch(name: &str, caller: &mut Caller<'_, HostState>, params: &[Val]) -> i
             arg(params, 2),
             arg(params, 3),
         ),
-        "fd_read" | "fd_pread" => fd_read(
+        "fd_read" => fd_read(
             caller,
             arg(params, 0),
             arg(params, 1),
             arg(params, 2),
             arg(params, 3),
+        ),
+        // Note the argument positions: the offset is 64 bits wide, so `nread`
+        // is parameter 4. See `fd_pread`.
+        "fd_pread" => fd_pread(
+            caller,
+            arg(params, 0),
+            arg(params, 1),
+            arg(params, 2),
+            arg_i64(params, 3) as u64,
+            arg(params, 4),
         ),
         "fd_seek" => fd_seek(
             caller,
@@ -523,15 +600,7 @@ fn dispatch(name: &str, caller: &mut Caller<'_, HostState>, params: &[Val]) -> i
             let env = env_strings(caller.data());
             write_string_list(caller.data(), &env, arg(params, 0), arg(params, 1))
         }
-        "clock_time_get" => {
-            // Nanoseconds off the same virtual clock the emscripten layer uses,
-            // so time is consistent whichever way the module asks for it.
-            let nanos = (caller.data().tick_clock() * 1_000_000.0) as u64;
-            match write_u64(caller.data(), arg(params, 2), nanos) {
-                Ok(()) => ESUCCESS,
-                Err(_) => EINVAL,
-            }
-        }
+        "clock_time_get" => clock_time_get(caller, arg(params, 0), arg(params, 2)),
         "random_get" => {
             let (ptr, len) = (arg(params, 0), arg(params, 1));
             let mut bytes = Vec::with_capacity(len as usize);

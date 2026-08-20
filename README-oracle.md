@@ -108,7 +108,8 @@ oracle abi <id> [-f name] [--slot N] [--index N] [--body N]
 oracle xref <id> "<text>"                    # find the code that reaches a string
 oracle xref-addr <id> <addr> [--window N]    # ... and the table base that holds it
 oracle callers <id> <index>                  # walk back up the call graph
-oracle instrument <id> --calls-in N -o out.wasm   # trace which call sites ran
+oracle instrument <id> --calls-in N [--sink env::name] -o out.wasm
+                                             # trace which call sites ran
 oracle patch <id> --replace F:AT:N:SPEC -o out.wasm
 ```
 
@@ -141,6 +142,14 @@ Bodies are spliced as raw bytes. That is sound because a wasm body holds no
 absolute offsets — branches carry relative label depths — and the inserted
 sequence is stack-neutral, so it is well-typed anywhere, including between a
 callee's arguments and its `call`.
+
+**The sink is chosen by name, not by signature.** `(i32, i32) -> ()` is also the
+shape of `env::get_random_bytes_js`, which takes `(len, buf)` and writes: a
+marker calling that one asks for two hundred thousand bytes of PRNG output at
+address zero, and the instrumented module still validates and still runs. So
+only imports this host answers without touching the guest are picked
+automatically; a module whose candidates are all something else is refused, and
+the refusal names them so one can be nominated with `--sink module::name`.
 
 Two flags apply to anything that executes a module:
 

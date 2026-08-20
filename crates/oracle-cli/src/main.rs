@@ -30,6 +30,33 @@ struct EngineOpts {
     log: bool,
 }
 
+/// Where the markers go, and what they call. Grouped so `instrument` takes a
+/// spec rather than seven positional flags.
+#[derive(clap::Args)]
+struct MarkOpts {
+    /// Mark the entry of this function. Repeatable.
+    #[arg(long)]
+    entry: Vec<u32>,
+    /// Mark every direct call site in this function. Repeatable.
+    #[arg(long = "calls-in")]
+    calls_in: Vec<u32>,
+    /// Mark this function's entry, reporting one of its locals as the value:
+    /// `FUNC:LOCAL`. For a parameter that is the argument it was called with.
+    /// Repeatable.
+    #[arg(long)]
+    value: Vec<String>,
+    /// Mark every `return` in this function. Repeatable.
+    #[arg(long = "returns-in")]
+    returns_in: Vec<u32>,
+    /// The import a marker calls, as `module::name` or a bare name.
+    ///
+    /// Without this only an import known to be recording-only is used, and a
+    /// module that declares none is refused rather than instrumented with one
+    /// that writes guest memory. The refusal lists the candidates.
+    #[arg(long)]
+    sink: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// List the captured modules.
@@ -213,20 +240,8 @@ enum Command {
         /// Where to write the instrumented copy.
         #[arg(long, short)]
         out: String,
-        /// Mark the entry of this function. Repeatable.
-        #[arg(long)]
-        entry: Vec<u32>,
-        /// Mark every direct call site in this function. Repeatable.
-        #[arg(long = "calls-in")]
-        calls_in: Vec<u32>,
-        /// Mark this function's entry, reporting one of its locals as the
-        /// value: `FUNC:LOCAL`. For a parameter that is the argument it was
-        /// called with. Repeatable.
-        #[arg(long)]
-        value: Vec<String>,
-        /// Mark every `return` in this function. Repeatable.
-        #[arg(long = "returns-in")]
-        returns_in: Vec<u32>,
+        #[command(flatten)]
+        marks: MarkOpts,
     },
     /// Write a copy with instructions replaced, for forcing a gate open.
     ///
@@ -259,22 +274,7 @@ fn main() -> Result<()> {
         Command::Instantiate { target, threads } => instantiate(&catalog, &target, threads),
         Command::Strings { target, min } => strings(&catalog, &target, min),
         Command::Carry { old, new, indices } => carry(&catalog, &old, &new, &indices),
-        Command::Instrument {
-            target,
-            out,
-            entry,
-            calls_in,
-            value,
-            returns_in,
-        } => instrument(
-            &catalog,
-            &target,
-            &out,
-            &entry,
-            &calls_in,
-            &value,
-            &returns_in,
-        ),
+        Command::Instrument { target, out, marks } => instrument(&catalog, &target, &out, &marks),
         Command::Patch {
             target,
             out,
@@ -423,11 +423,12 @@ fn embind(catalog: &Catalog, target: &str, full: bool, opts: &EngineOpts) -> Res
     let registry = runtime.embind();
 
     println!(
-        "{} types, {} functions, {} classes, {} methods\n",
+        "{} types, {} functions, {} classes, {} methods, {} properties\n",
         registry.types.len(),
         registry.functions.len(),
         registry.classes.len(),
-        registry.method_count()
+        registry.method_count(),
+        registry.property_count()
     );
 
     for function in &registry.functions {
@@ -440,12 +441,31 @@ fn embind(catalog: &Catalog, target: &str, full: bool, opts: &EngineOpts) -> Res
 
     if full {
         for class in registry.classes.values() {
-            println!("\n  class {} ({} methods)", class.name, class.methods.len());
+            println!(
+                "\n  class {} ({} methods, {} properties)",
+                class.name,
+                class.methods.len(),
+                class.properties.len()
+            );
             for method in &class.methods {
                 println!(
                     "      {:<44} {}",
                     method.name,
                     registry.signature(&method.arg_types)
+                );
+            }
+            // A property is a field, not a callable, so it is printed as one:
+            // its type, and whether the module registered a setter for it.
+            for property in &class.properties {
+                let access = if property.setter_type.is_some() {
+                    "get/set"
+                } else {
+                    "get"
+                };
+                println!(
+                    "      {:<44} {} [{access}]",
+                    property.name,
+                    registry.type_name(property.field_type)
                 );
             }
         }
@@ -485,8 +505,17 @@ fn call(
     let values: Vec<Value> = args
         .iter()
         .zip(&param_types)
-        .map(|(arg, type_id)| parse_arg(arg, &registry.type_name(*type_id)))
-        .collect();
+        .enumerate()
+        .map(|(position, (arg, type_id))| {
+            let type_name = registry.type_name(*type_id);
+            parse_arg(arg, &type_name).with_context(|| {
+                format!(
+                    "argument {} of `{function}` (declared {type_name})",
+                    position + 1
+                )
+            })
+        })
+        .collect::<Result<_>>()?;
 
     let result = runtime.call_embind(function, &values)?;
     println!("{result:?}");
@@ -499,16 +528,32 @@ fn call(
 }
 
 /// Parses one command-line argument according to its registered C++ type.
-fn parse_arg(raw: &str, type_name: &str) -> Value {
-    match type_name {
-        "bool" => Value::Bool(matches!(raw, "true" | "1" | "yes")),
-        "float" | "double" => raw.parse().map(Value::Double).unwrap_or(Value::Double(0.0)),
+///
+/// A malformed value is an error, not a default. `yse` used to become `false`
+/// and `1.0e` used to become `0.0`, so the guest ran on input the caller never
+/// gave it and answered plausibly about something else — which from an oracle
+/// is the worst available outcome.
+///
+/// The untyped fall-through is different and stays: a type this front end does
+/// not model has no spelling to be wrong about, so a value that parses as an
+/// integer is passed as one and anything else is passed as text.
+fn parse_arg(raw: &str, type_name: &str) -> Result<Value> {
+    Ok(match type_name {
+        "bool" => match raw {
+            "true" | "1" | "yes" => Value::Bool(true),
+            "false" | "0" | "no" => Value::Bool(false),
+            _ => anyhow::bail!("`{raw}` is not a bool; use true/false, 1/0 or yes/no"),
+        },
+        "float" | "double" => Value::Double(
+            raw.parse()
+                .with_context(|| format!("`{raw}` is not a number"))?,
+        ),
         "std::string" => Value::Str(raw.to_owned()),
         _ => match raw.parse::<i64>() {
             Ok(value) => Value::Int(value),
             Err(_) => Value::Str(raw.to_owned()),
         },
-    }
+    })
 }
 
 fn xref(catalog: &Catalog, target: &str, text: &str) -> Result<()> {
@@ -854,19 +899,11 @@ fn human_size(bytes: u64) -> String {
 }
 
 /// Writes an instrumented copy and prints where the markers went.
-fn instrument(
-    catalog: &Catalog,
-    target: &str,
-    out: &str,
-    entry: &[u32],
-    calls_in: &[u32],
-    value: &[String],
-    returns_in: &[u32],
-) -> Result<()> {
+fn instrument(catalog: &Catalog, target: &str, out: &str, marks: &MarkOpts) -> Result<()> {
     use oracle_core::patch::{self, Plan};
 
     let mut value_entry = Vec::new();
-    for spec in value {
+    for spec in &marks.value {
         let (func, local) = spec
             .split_once(':')
             .with_context(|| format!("--value wants FUNC:LOCAL, got `{spec}`"))?;
@@ -880,11 +917,12 @@ fn instrument(
     }
 
     let plan = Plan {
-        entry: entry.to_vec(),
+        entry: marks.entry.clone(),
         value_entry,
-        before_calls: calls_in.iter().map(|func| (*func, None)).collect(),
-        at_returns: returns_in.to_vec(),
+        before_calls: marks.calls_in.iter().map(|func| (*func, None)).collect(),
+        at_returns: marks.returns_in.clone(),
         id_base: patch::DEFAULT_ID_BASE,
+        sink: marks.sink.clone(),
     };
 
     if plan.entry.is_empty()
@@ -981,4 +1019,40 @@ fn carry(catalog: &Catalog, old: &str, new: &str, indices: &[u32]) -> Result<()>
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A malformed typed argument is an error, not a default.
+    ///
+    /// Coercing `yse` to `false` and `1.0e` to `0.0` ran the guest on input the
+    /// caller never gave it, and the answer that came back was plausible and
+    /// about something else — which from an oracle is worse than no answer.
+    #[test]
+    fn a_malformed_typed_argument_is_refused() {
+        assert_eq!(parse_arg("true", "bool").unwrap(), Value::Bool(true));
+        assert_eq!(parse_arg("0", "bool").unwrap(), Value::Bool(false));
+        assert_eq!(parse_arg("-1.5", "double").unwrap(), Value::Double(-1.5));
+
+        for (raw, type_name) in [("yse", "bool"), ("1.0e", "double"), ("", "float")] {
+            let error = parse_arg(raw, type_name).unwrap_err().to_string();
+            assert!(
+                error.contains(raw) || raw.is_empty(),
+                "the refusal should quote what it could not parse: {error}"
+            );
+        }
+    }
+
+    /// The untyped fall-through is deliberate and stays: a type this front end
+    /// does not model has no spelling to be wrong about.
+    #[test]
+    fn an_unmodelled_type_still_takes_an_integer_or_a_string() {
+        assert_eq!(parse_arg("42", "MyEnum").unwrap(), Value::Int(42));
+        assert_eq!(
+            parse_arg("hello", "MyEnum").unwrap(),
+            Value::Str("hello".to_owned())
+        );
+    }
 }

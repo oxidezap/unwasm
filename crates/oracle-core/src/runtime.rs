@@ -176,14 +176,15 @@ impl Runtime {
         linker.allow_shadowing(true);
 
         // The memory has to exist before any host function can read through it.
-        let memory = define_memory(&mut store, &mut linker, &module)?;
-        store.data_mut().memory = memory.clone();
+        let imported = define_memory(&mut store, &mut linker, &module)?;
+        store.data_mut().memory = imported.shared.clone();
+        store.data_mut().imported_memory = imported.ordinary;
         store.data_mut().memory_export = exported_memory_name(&module);
 
         // Only a module with shared memory can have threads: a second instance
         // over a private memory would not see the first one's heap, so its
         // "thread" would operate on a different program's state.
-        if let Some(memory) = memory {
+        if let Some(memory) = imported.shared {
             let shared = Arc::clone(&store.data().shared);
             let policy = store.data().threads;
             store.data_mut().spawner = Some(Arc::new(crate::threads::Spawner::new(
@@ -242,17 +243,24 @@ impl Runtime {
             return Ok(before + pages);
         }
 
-        // Same lesson as `sync_memory`: the export is not always called
-        // `memory`. Looking only for that name silently does nothing on a
-        // minified module.
-        let name = self
-            .store
-            .data()
-            .memory_export
-            .clone()
-            .ok_or_else(|| anyhow!("module neither imports nor exports a memory to grow"))?;
-        let Some(Extern::Memory(memory)) = self.instance.get_export(&mut self.store, &name) else {
-            return Err(anyhow!("module exports no memory named `{name}` to grow"));
+        // An ordinary *imported* memory has the same problem for the same
+        // reason: nothing exports it, so there is no name to look up. The host
+        // holds that handle too.
+        let memory = match self.store.data().imported_memory {
+            Some(memory) => memory,
+            None => {
+                // Same lesson as `sync_memory`: the export is not always called
+                // `memory`. Looking only for that name silently does nothing on
+                // a minified module.
+                let name = self.store.data().memory_export.clone().ok_or_else(|| {
+                    anyhow!("module neither imports nor exports a memory to grow")
+                })?;
+                let Some(Extern::Memory(memory)) = self.instance.get_export(&mut self.store, &name)
+                else {
+                    return Err(anyhow!("module exports no memory named `{name}` to grow"));
+                };
+                memory
+            }
         };
         let before = memory
             .grow(&mut self.store, pages)
@@ -261,19 +269,27 @@ impl Runtime {
         Ok(before + pages)
     }
 
-    /// Refreshes the host's view of an exported memory. See `sync_memory`.
+    /// Refreshes the host's view of an ordinary memory. See `state::sync_memory`
+    /// — including why the imported handle is consulted before the exports.
     fn sync_memory(&mut self) {
         if self.store.data().memory.is_some() {
             return;
         }
-        let name = self
-            .store
-            .data()
-            .memory_export
-            .clone()
-            .unwrap_or_else(|| "memory".to_owned());
-        let Some(Extern::Memory(memory)) = self.instance.get_export(&mut self.store, &name) else {
-            return;
+        let memory = match self.store.data().imported_memory {
+            Some(memory) => memory,
+            None => {
+                let name = self
+                    .store
+                    .data()
+                    .memory_export
+                    .clone()
+                    .unwrap_or_else(|| "memory".to_owned());
+                let Some(Extern::Memory(memory)) = self.instance.get_export(&mut self.store, &name)
+                else {
+                    return;
+                };
+                memory
+            }
         };
         let window = (
             memory.data_ptr(&self.store) as usize,
@@ -540,14 +556,57 @@ impl Runtime {
         table.get(&mut self.store, index)
     }
 
+    /// The module's function table, by the name it actually exports it under.
+    ///
+    /// `__indirect_function_table` is the convention, not the name: a minified
+    /// module exports it as whatever letter the optimiser chose, and asking
+    /// only for the convention made every embind call fail on such a module
+    /// even though `record_module_facts` had already read the real name out of
+    /// it. Same lesson, same shape as `threads::table_entry`. A miss reports
+    /// the near misses rather than just what it wanted — see `exports.rs`.
+    pub(crate) fn function_table(&mut self) -> Result<Table> {
+        const CONVENTION: &str = "__indirect_function_table";
+
+        let recorded = self.store.data().shared.table_export.get().cloned();
+        let name = recorded.clone().unwrap_or_else(|| CONVENTION.to_owned());
+        if let Some(Extern::Table(table)) = self.export(&name) {
+            return Ok(table);
+        }
+        // The recorded name is the module's own statement about itself, but it
+        // is read from the *first* table export, so a module with more than one
+        // can still have the conventional name be the right answer.
+        if recorded.is_some()
+            && let Some(Extern::Table(table)) = self.export(CONVENTION)
+        {
+            return Ok(table);
+        }
+
+        let mut wanted = vec![name.as_str()];
+        if recorded.is_some() {
+            wanted.push(CONVENTION);
+        }
+        Err(crate::exports::missing_from(
+            self.store.data().shared.exports.get(),
+            "function table",
+            &wanted,
+        ))
+    }
+
     pub(crate) fn call_func(
         &mut self,
         func: Func,
         args: &[Val],
         results: &mut [Val],
     ) -> Result<()> {
-        func.call(&mut self.store, args, results)
-            .map_err(|error| anyhow!("{error}"))
+        let outcome = func
+            .call(&mut self.store, args, results)
+            .map_err(|error| anyhow!("{error}"));
+        // Same reason as `call` and `call_table`: an embind constructor,
+        // method or invoker can grow an ordinary exported memory, and a stale
+        // window makes every pointer allocated in the new pages look out of
+        // bounds — or, if the mapping moved, reads the old one.
+        self.sync_memory();
+        outcome
     }
 
     /// Writes bytes at an address the caller already owns.
@@ -615,7 +674,7 @@ impl Runtime {
     /// is how to tell an initialised object from an uninitialised one before
     /// calling and trapping.
     pub fn table_entry_exists(&mut self, index: u32) -> bool {
-        let Some(Extern::Table(table)) = self.export("__indirect_function_table") else {
+        let Ok(table) = self.function_table() else {
             return false;
         };
         matches!(
@@ -636,9 +695,7 @@ impl Runtime {
     /// arguments is refused here rather than trapping inside the guest, because
     /// a trap at an unknown point is the least informative failure available.
     pub fn call_table(&mut self, slot: u32, args: &[Val]) -> Result<Vec<Val>> {
-        let Some(Extern::Table(table)) = self.export("__indirect_function_table") else {
-            return Err(anyhow!("the module exports no __indirect_function_table"));
-        };
+        let table = self.function_table()?;
         let func = match self.table_get(table, slot as u64) {
             Some(Ref::Func(Some(func))) => func,
             _ => return Err(anyhow!("table slot {slot} is empty")),
@@ -938,6 +995,43 @@ impl Runtime {
         &self.store.data().wasi
     }
 
+    /// Lays out `argv` in guest memory for a `main(argc, argv)`.
+    ///
+    /// The block is one allocation: a table of `argc + 1` pointers, then the
+    /// NUL-terminated strings they point at. The trailing null pointer is not
+    /// decoration — a `for (char **p = argv; *p; ++p)` walk is what stops on it.
+    ///
+    /// Uses the guest's own `malloc`, so this needs a module that exports one.
+    /// Refusing there is the honest answer: the alternative is picking an
+    /// address and hoping nothing else owns it.
+    fn marshal_argv(&mut self) -> Result<(i32, u32)> {
+        let mut args = self.store.data().wasi.args.clone();
+        if args.is_empty() {
+            // `set_args` supplies this, but nothing obliges a caller to call it,
+            // and a `main` whose `argv[0]` is null is a crash in most libcs.
+            args.push("module".to_owned());
+        }
+
+        let table = 4 * (args.len() + 1);
+        let text: usize = args.iter().map(|arg| arg.len() + 1).sum();
+        let total = u32::try_from(table + text).context("argv block is too large")?;
+        let block = self
+            .malloc(total)
+            .context("allocating argv for `main`; the module must export `malloc`")?;
+
+        let mut cursor = block + table as u32;
+        for (index, arg) in args.iter().enumerate() {
+            self.write_bytes_at(block + (index * 4) as u32, &cursor.to_le_bytes())?;
+            let mut bytes = arg.clone().into_bytes();
+            bytes.push(0);
+            self.write_bytes_at(cursor, &bytes)?;
+            cursor += bytes.len() as u32;
+        }
+        self.write_bytes_at(block + (args.len() * 4) as u32, &0u32.to_le_bytes())?;
+
+        Ok((args.len() as i32, block))
+    }
+
     /// Runs a WASI command module's entry point.
     ///
     /// `proc_exit` unwinds rather than returning, so a normal exit arrives here
@@ -953,8 +1047,23 @@ impl Runtime {
             .func_type(entry)
             .map(|ty| ty.params().len())
             .unwrap_or(0);
-        // `main` may be declared as either `()` or `(argc, argv)`.
-        let args: Vec<Val> = (0..arity).map(|_| Val::I32(0)).collect();
+        // `main` may be declared as either `()` or `(argc, argv)`. Passing zero
+        // for both used to make a module that *does* take arguments see none —
+        // and dereference a null `argv` — whatever `set_args` had been told, so
+        // the array is marshalled into guest memory instead.
+        let args: Vec<Val> = match arity {
+            0 => Vec::new(),
+            2 => {
+                let (argc, argv) = self.marshal_argv()?;
+                vec![Val::I32(argc), Val::I32(argv as i32)]
+            }
+            other => {
+                return Err(anyhow!(
+                    "`{entry}` takes {other} argument(s); this host can call only `()` or \
+                     `(argc, argv)`"
+                ));
+            }
+        };
 
         match self.call(entry, &args) {
             Ok(results) => Ok(match results.first() {

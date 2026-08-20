@@ -16,11 +16,23 @@
 //!
 //! ## How it avoids renumbering anything
 //!
-//! A marker is a call to an import the module already declares, chosen by
-//! signature. Adding a new import would shift every function index by one and
-//! require rewriting every `call` in the module; reusing one costs nothing.
-//! Ids start high (see [`Plan::id_base`]) so a marker is never mistaken for a
-//! real argument.
+//! A marker is a call to an import the module already declares, named by the
+//! caller or taken from [`RECORDING_ONLY_SINKS`]. Adding a new import would
+//! shift every function index by one and require rewriting every `call` in the
+//! module; reusing one costs nothing. Ids start high (see [`Plan::id_base`]) so
+//! a marker is never mistaken for a real argument.
+//!
+//! ## Why the sink is not simply the first import of the right shape
+//!
+//! It was, and that is not behaviour-neutral. `(i32, i32) -> ()` is the shape of
+//! `env::get_random_bytes_js`, which takes `(len, buf)` and *writes*: a marker
+//! calling it turns the marker id into a length and fills guest memory from
+//! address zero. It is also the shape of `env::_embind_register_void`, which
+//! mutates the type registry. Either way the instrumented module still
+//! validates, still runs, and reports a trace of a program that is not the one
+//! being traced — the exact failure this module exists to make impossible. So
+//! the choice is a short list of imports this host is known to answer without
+//! touching the guest, and anything else has to be named deliberately.
 //!
 //! Bodies are spliced as **raw bytes** rather than decoded and re-encoded. That
 //! is sound for a specific reason: a wasm body contains no absolute byte
@@ -124,6 +136,13 @@ pub struct Plan {
     /// The first marker id. Well clear of anything the module passes for real:
     /// `tag_offer_error_sites.py` used the same base for the same reason.
     pub id_base: i32,
+    /// The import to call, as `module::name` or as a bare name.
+    ///
+    /// `None` picks the first candidate on [`RECORDING_ONLY_SINKS`], and
+    /// refuses when there is none. Naming one is the caller saying it has
+    /// checked what that import does to the guest — see the note at the top of
+    /// this module for what happens when it does something.
+    pub sink: Option<String>,
 }
 
 impl Plan {
@@ -140,6 +159,32 @@ impl Plan {
 
 /// Where marker ids start by default.
 pub const DEFAULT_ID_BASE: i32 = 200_000;
+
+/// Imports `oracle-core` answers without changing anything the guest can see,
+/// so a spliced call to one cannot alter what the module computes.
+///
+/// Each entry is here because of what the *host* does with it, not because of
+/// its name — which is why this list is short and why adding to it means
+/// reading the handler first:
+///
+/// - `env::on_call_event_js_sync` — WhatsApp's own callback. Nothing in this
+///   crate defines it, so `host::define_stubs` answers it: record the
+///   arguments, return nothing.
+/// - `env::loggingCallback_js_sync` — defined, but it only *reads* the guest
+///   (`read_sized`, then `log`). A marker adds a junk log line and nothing
+///   else. Note what a `value_entry` marker costs here: the value is a guest
+///   local, this import reads it as a length, and an out-of-range one comes
+///   back empty rather than failing — so the noise is bounded but the log is
+///   the thing that pays for it.
+/// - `env::mark` — the conventional name for an import a module carries for
+///   exactly this purpose; the fixtures in `tests/patch.rs` use it.
+///
+/// Everything else has to be named through [`Plan::sink`].
+pub const RECORDING_ONLY_SINKS: &[&str] = &[
+    "env::on_call_event_js_sync",
+    "env::loggingCallback_js_sync",
+    "env::mark",
+];
 
 /// One instruction-level replacement, for forcing a branch or neutralising a
 /// call while tracing.
@@ -236,8 +281,11 @@ struct Layout {
     /// Number of imported functions, which is the index the first defined one
     /// takes.
     imported_funcs: u32,
-    /// The chosen marker sink, and its `module::name`.
-    sink: Option<(u32, String)>,
+    /// Every import with the sink signature, as (function index,
+    /// `module::name`), in declaration order. All of them, not the first —
+    /// choosing is [`choose_sink`]'s job, and a refusal has to be able to name
+    /// the ones it rejected.
+    sinks: Vec<(u32, String)>,
     /// Byte range of the whole code section, including its id and size prefix.
     code_section: std::ops::Range<usize>,
     /// Byte range of each defined function's body contents, in index order.
@@ -259,7 +307,7 @@ fn is_sink(ty: &wasmparser::FuncType) -> bool {
 fn read_layout(bytes: &[u8]) -> Result<Layout> {
     let mut types: Vec<wasmparser::FuncType> = Vec::new();
     let mut imported_funcs = 0u32;
-    let mut sink = None;
+    let mut sinks = Vec::new();
     let mut code_section = 0..0;
     let mut bodies = Vec::new();
     let mut code_starts = Vec::new();
@@ -282,12 +330,11 @@ fn read_layout(bytes: &[u8]) -> Result<Layout> {
                     let (TypeRef::Func(index) | TypeRef::FuncExact(index)) = import.ty else {
                         continue;
                     };
-                    // The first import with the sink signature. Which one it is
-                    // does not matter to correctness — only that the host sees
-                    // the call — so the first is as good as any and is stable
-                    // between runs of this tool.
-                    if sink.is_none() && types.get(index as usize).is_some_and(is_sink) {
-                        sink = Some((
+                    // Every import with the sink signature. Which one is used
+                    // very much does matter — see the note at the top of this
+                    // module — so the choice is made later, from names.
+                    if types.get(index as usize).is_some_and(is_sink) {
+                        sinks.push((
                             imported_funcs,
                             format!("{}::{}", import.module, import.name),
                         ));
@@ -319,11 +366,70 @@ fn read_layout(bytes: &[u8]) -> Result<Layout> {
 
     Ok(Layout {
         imported_funcs,
-        sink,
+        sinks,
         code_section,
         bodies,
         code_starts,
     })
+}
+
+/// Picks the import a marker will call, or explains why it will not pick one.
+///
+/// `wanted` is what [`Plan::sink`] asked for: a full `module::name`, or a bare
+/// name when the caller does not want to spell the import module out. Matching
+/// on the bare name is deliberately allowed and deliberately strict about the
+/// result — two imports of the same name in different modules is ambiguous, and
+/// an ambiguous sink is refused rather than resolved, for the same reason a
+/// fingerprint two names share is dropped.
+fn choose_sink(candidates: &[(u32, String)], wanted: Option<&str>) -> Result<(u32, String)> {
+    if candidates.is_empty() {
+        return Err(anyhow!(
+            "module declares no (i32, i32) -> () import to use as a marker sink; \
+             instrumenting would mean adding one, which renumbers every function"
+        ));
+    }
+
+    let names = || {
+        candidates
+            .iter()
+            .map(|(_, symbol)| symbol.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    if let Some(wanted) = wanted {
+        let matched: Vec<&(u32, String)> = candidates
+            .iter()
+            .filter(|(_, symbol)| {
+                symbol == wanted || symbol.rsplit_once("::").is_some_and(|(_, n)| n == wanted)
+            })
+            .collect();
+        return match matched.as_slice() {
+            [one] => Ok((*one).clone()),
+            [] => Err(anyhow!(
+                "`{wanted}` is not an (i32, i32) -> () import of this module; it declares {}",
+                names()
+            )),
+            many => Err(anyhow!(
+                "`{wanted}` is ambiguous: it names {} of this module's imports",
+                many.len()
+            )),
+        };
+    }
+
+    candidates
+        .iter()
+        .find(|(_, symbol)| RECORDING_ONLY_SINKS.contains(&symbol.as_str()))
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!(
+                "none of this module's (i32, i32) -> () imports is known to be recording-only, \
+                 and calling one that is not can change what the module computes: it declares \
+                 {}. Name one through `Plan::sink` (`--sink`) once you have read what the host \
+                 does with it.",
+                names()
+            )
+        })
 }
 
 /// A byte to insert at an absolute file offset.
@@ -357,16 +463,12 @@ fn marker_bytes_local(id: i32, local: u32, sink: u32) -> Vec<u8> {
 /// # Errors
 ///
 /// Returns an error when the module declares no import that can serve as a
-/// marker sink, when it has no code section, or when a named function does not
-/// exist.
+/// marker sink — including when it declares one whose host implementation is
+/// not known to be recording-only, see [`choose_sink`] — when it has no code
+/// section, or when a named function does not exist.
 pub fn instrument(bytes: &[u8], plan: &Plan) -> Result<(Vec<u8>, MarkerMap)> {
     let layout = read_layout(bytes)?;
-    let (sink, sink_symbol) = layout.sink.clone().ok_or_else(|| {
-        anyhow!(
-            "module declares no (i32, i32) -> () import to use as a marker sink; \
-             instrumenting would mean adding one, which renumbers every function"
-        )
-    })?;
+    let (sink, sink_symbol) = choose_sink(&layout.sinks, plan.sink.as_deref())?;
 
     let mut markers = Vec::new();
     let mut splices: Vec<Splice> = Vec::new();

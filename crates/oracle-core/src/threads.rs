@@ -170,14 +170,12 @@ const STACK_SIZE: u32 = 56;
 /// this is how the host watches for `pthread_create` to finish filling in a
 /// control block it does not own.
 fn read_u32(store: &Store<HostState>, at: u32) -> Option<u32> {
-    let memory = store.data().memory.as_ref()?;
-    let data = memory.data();
-    let bytes = data.get(at as usize..at as usize + 4)?;
-    // SAFETY: a racy read of shared memory, deliberately. Each cell is read
-    // once and the result is only ever treated as a hint that is then range
-    // checked, so a torn value cannot become a wild pointer.
-    #[allow(unsafe_code)]
-    let word: Vec<u8> = bytes.iter().map(|cell| unsafe { *cell.get() }).collect();
+    let state = store.data();
+    // A racy read of shared memory, deliberately — and therefore through
+    // `HostState::read`, whose per-byte relaxed atomics make the race defined.
+    // The result is only ever treated as a hint that is then range checked, so
+    // a torn value cannot become a wild pointer.
+    let word = state.read(at, 4).ok()?;
     Some(u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
 }
 
@@ -245,7 +243,12 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
     // anything: emscripten's runtime reads the pthread pointer from TLS, and a
     // routine that starts without it corrupts unrelated state rather than
     // failing.
-    ctx.shared.scheduler.acquire(ctx.id);
+    // A guard rather than a paired release: everything between here and the
+    // entry point can fail with `?`, and a worker that died holding the turn
+    // stays the recorded holder forever — every later acquisition then waits
+    // out `TURN_TIMEOUT` and forces its way through, which turns one failed
+    // initialisation into an unserialised run. See `Scheduler::turn`.
+    let turn = ctx.shared.scheduler.turn(ctx.id);
     // Both spellings, for the same reason the main thread needs both: a module
     // that exports `_emscripten_thread_init` and is asked for
     // `__emscripten_thread_init` silently falls through to the TLS-only path,
@@ -379,7 +382,7 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
             .context("_emscripten_tls_init")?;
     }
 
-    ctx.shared.scheduler.release(ctx.id);
+    drop(turn);
 
     let entry = table_entry(&mut store, &instance, start_routine)?;
     let results = entry.ty(&store).results().len();
@@ -389,11 +392,11 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
         .log(ctx.id, format!("thread {} entering routine", ctx.id));
 
     // Same rule as the main thread: hold a turn while inside guest code.
-    ctx.shared.scheduler.acquire(ctx.id);
+    let turn = ctx.shared.scheduler.turn(ctx.id);
     let outcome = entry
         .call(&mut store, &[Val::I32(arg as i32)], &mut out)
         .context("thread entry point");
-    ctx.shared.scheduler.release(ctx.id);
+    drop(turn);
 
     // Why a worker stopped is the difference between "it finished its work"
     // and "the host cut it short", and the two need telling apart: the VoIP

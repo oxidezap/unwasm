@@ -58,6 +58,35 @@ pub struct EmbindMethod {
     pub is_async: bool,
 }
 
+/// A data member a class registered through `_embind_register_class_property`.
+///
+/// Not a method, and the layout is not a method's either: the third argument is
+/// the field's *type*, and what follows is a getter signature, getter and
+/// context, then the same three for a setter. Reading that as `(argCount,
+/// argTypes…)` took a signature string for an array of type ids and recorded
+/// the wrong invoker, so the registry offered a callable that dispatched to
+/// whatever table slot the misread produced.
+#[derive(Debug, Clone)]
+pub struct EmbindProperty {
+    /// Type id of the class it belongs to.
+    pub class_type: u32,
+    /// The property name.
+    pub name: String,
+    /// Type id of the value the getter returns.
+    pub field_type: u32,
+    /// Table index of the getter's invoker.
+    pub getter: u32,
+    /// First argument that invoker expects.
+    pub getter_context: u32,
+    /// Type id the setter takes, or `None` for a read-only property — which
+    /// embind registers by passing 0 for the setter's type.
+    pub setter_type: Option<u32>,
+    /// Table index of the setter's invoker, 0 when read-only.
+    pub setter: u32,
+    /// First argument that invoker expects.
+    pub setter_context: u32,
+}
+
 /// A registered constructor.
 #[derive(Debug, Clone)]
 pub struct EmbindConstructor {
@@ -86,6 +115,8 @@ pub struct EmbindClass {
     pub methods: Vec<EmbindMethod>,
     /// Its constructors, in registration order.
     pub constructors: Vec<EmbindConstructor>,
+    /// Its data members, in registration order. See [`EmbindProperty`].
+    pub properties: Vec<EmbindProperty>,
 }
 
 /// Everything the module registered, keyed so it can be resolved after the fact.
@@ -104,6 +135,7 @@ pub struct EmbindRegistry {
     /// Registrations whose class had not been registered yet when they arrived.
     orphan_methods: Vec<EmbindMethod>,
     orphan_constructors: Vec<EmbindConstructor>,
+    orphan_properties: Vec<EmbindProperty>,
 }
 
 impl EmbindRegistry {
@@ -165,10 +197,22 @@ impl EmbindRegistry {
                 .constructors
                 .push(constructor);
         }
+        for property in std::mem::take(&mut self.orphan_properties) {
+            self.classes
+                .entry(property.class_type)
+                .or_insert_with(|| EmbindClass {
+                    name: format!("class#{}", property.class_type),
+                    type_id: property.class_type,
+                    ..EmbindClass::default()
+                })
+                .properties
+                .push(property);
+        }
 
         self.functions.sort_by(|a, b| a.name.cmp(&b.name));
         for class in self.classes.values_mut() {
             class.methods.sort_by(|a, b| a.name.cmp(&b.name));
+            class.properties.sort_by(|a, b| a.name.cmp(&b.name));
             if let Some(name) = self.types.get(&class.type_id) {
                 class.name = name.clone();
             }
@@ -179,6 +223,15 @@ impl EmbindRegistry {
     #[must_use]
     pub fn method_count(&self) -> usize {
         self.classes.values().map(|class| class.methods.len()).sum()
+    }
+
+    /// Total data members across every registered class.
+    #[must_use]
+    pub fn property_count(&self) -> usize {
+        self.classes
+            .values()
+            .map(|class| class.properties.len())
+            .sum()
     }
 }
 
@@ -205,8 +258,15 @@ enum Layout {
     Function,
     /// A class declaration.
     Class,
-    /// A method on a class.
-    ClassFunction,
+    /// A method on a class. `is_static` picks between the two spellings, which
+    /// agree up to the last two arguments: an instance method carries
+    /// `(isPureVirtual, isAsync)` and a static one carries `(isAsync)` alone.
+    ClassFunction {
+        /// Whether this is `_embind_register_class_class_function`.
+        is_static: bool,
+    },
+    /// A data member on a class. See [`EmbindProperty`].
+    ClassProperty,
     /// A constructor for a class.
     ClassConstructor,
     /// An enum type, then its values.
@@ -240,9 +300,9 @@ fn layout_of(name: &str) -> Option<Layout> {
 
         "_embind_register_function" => Layout::Function,
         "_embind_register_class" => Layout::Class,
-        "_embind_register_class_function"
-        | "_embind_register_class_property"
-        | "_embind_register_class_class_function" => Layout::ClassFunction,
+        "_embind_register_class_function" => Layout::ClassFunction { is_static: false },
+        "_embind_register_class_class_function" => Layout::ClassFunction { is_static: true },
+        "_embind_register_class_property" => Layout::ClassProperty,
         "_embind_register_class_constructor" => Layout::ClassConstructor,
         "_embind_register_enum_value" | "_embind_register_value_object_field" => Layout::EnumValue,
         "_embind_register_constant" => Layout::Constant,
@@ -313,9 +373,14 @@ fn apply(caller: &mut Caller<'_, HostState>, layout: Layout, args: &[Val]) {
             class.destructor = destructor;
         }
 
-        Layout::ClassFunction => {
+        Layout::ClassFunction { is_static } => {
             // (classType, methodName, argCount, argTypes, invokerSignature,
             //  invoker, context, isPureVirtual, isAsync)
+            //
+            // A static one is the same list without `isPureVirtual`, so the
+            // last argument is `isAsync` and there is no pure-virtual flag to
+            // read. Taking argument 7 for it either way made every async static
+            // method look like one with no body to reach.
             let (Some(class_type), Some(name_ptr), Some(count), Some(types_ptr)) =
                 (arg(args, 0), arg(args, 1), arg(args, 2), arg(args, 3))
             else {
@@ -331,9 +396,39 @@ fn apply(caller: &mut Caller<'_, HostState>, layout: Layout, args: &[Val]) {
                 arg_types,
                 invoker: arg(args, 5).unwrap_or(0),
                 context: arg(args, 6).unwrap_or(0),
-                is_pure_virtual: arg(args, 7).unwrap_or(0) != 0,
-                is_async: arg(args, 8).unwrap_or(0) != 0,
+                is_pure_virtual: !is_static && arg(args, 7).unwrap_or(0) != 0,
+                is_async: arg(args, if is_static { 7 } else { 8 }).unwrap_or(0) != 0,
             });
+        }
+
+        Layout::ClassProperty => {
+            // (classType, fieldName, getterReturnType, getterSignature, getter,
+            //  getterContext, setterArgumentType, setterSignature, setter,
+            //  setterContext)
+            let (Some(class_type), Some(name_ptr), Some(field_type)) =
+                (arg(args, 0), arg(args, 1), arg(args, 2))
+            else {
+                return;
+            };
+            let name = caller.data().read_cstr(name_ptr).unwrap_or_default();
+            // embind registers a read-only property by passing 0 for the
+            // setter's type — there is no setter to record for one.
+            let setter_type = arg(args, 6).filter(|id| *id != 0);
+
+            caller
+                .data_mut()
+                .embind
+                .orphan_properties
+                .push(EmbindProperty {
+                    class_type,
+                    name,
+                    field_type,
+                    getter: arg(args, 4).unwrap_or(0),
+                    getter_context: arg(args, 5).unwrap_or(0),
+                    setter_type,
+                    setter: setter_type.and(arg(args, 8)).unwrap_or(0),
+                    setter_context: setter_type.and(arg(args, 9)).unwrap_or(0),
+                });
         }
 
         Layout::ClassConstructor => {
