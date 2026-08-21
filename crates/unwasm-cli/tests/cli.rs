@@ -1296,8 +1296,21 @@ fn constants_finds_every_site_that_pushes_a_value() {
     assert!(stdout.contains("i64.const at "), "{stdout}");
     assert!(stdout.contains("3 sites push 70008"), "{stdout}");
     assert!(
-        stdout.contains("four bytes appear 1 more time inside the data segments"),
+        stdout.contains("four bytes sit at 1 address inside the data segments"),
         "counting bytes is not counting sites: {stdout}"
+    );
+    // And where in the data, which is the half a search of the code cannot
+    // reach: a function pointer installed in a vtable is pushed by nothing.
+    let (ok, stdout, stderr) = run(&[
+        "constants",
+        path.to_str().expect("utf-8 path"),
+        "70008",
+        "--data",
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("0x00000000") && stdout.contains("aligned"),
+        "--data says where: {stdout}"
     );
     // Every site says where it is and how long it is, which is what a
     // same-length replacement needs.
@@ -1783,4 +1796,277 @@ fn classes_says_so_when_a_module_declares_none() {
     let (ok, _, stderr) = run(&["classes", path.to_str().expect("utf-8 path"), "--all"]);
     assert!(!ok);
     assert!(stderr.contains("unexpected argument `--all`"), "{stderr}");
+}
+
+/// A module with a table of function pointers in its data, a null slot in the
+/// middle of it, and a struct field written through a displaced base.
+///
+/// Everything the three new commands are for, small enough to check by hand.
+const TABLE_AND_FIELDS: &str = r#"(module
+    (memory (export "memory") 4)
+    (table 6 funcref)
+    (elem (i32.const 1) $a $b $c)
+    (data (i32.const 1024) "\01\00\00\00\02\00\00\00\00\00\00\00\03\00\00\00\ff\ff\ff\ff")
+    (data (i32.const 2048) "hello\00")
+    (func $a (param i32))
+    (func $b (param i32) (result i32) local.get 0)
+    (func $c (param i32 i32))
+    (func (export "direct") (param i32)
+        local.get 0 i32.const 7 i32.store8 offset=846)
+    (func (export "displaced") (param i32)
+        (local i32)
+        local.get 0 i32.const -8 i32.add local.set 1
+        local.get 1 i32.const 9 i32.store8 offset=854))"#;
+
+#[test]
+fn data_reads_guest_memory_by_address_rather_than_by_file_offset() {
+    let path = fixture("data-cli", TABLE_AND_FIELDS);
+    let path = path.to_str().expect("utf-8 path");
+    let (ok, stdout, stderr) = run(&["data", path, "0x400", "20"]);
+    assert!(ok, "{stderr}");
+    // Which segment, and the file offset the other commands take.
+    assert!(stdout.contains("data segment #0"), "{stdout}");
+    assert!(stdout.contains("file offset"), "{stdout}");
+    // The words, little-endian, including the null in the middle.
+    assert!(
+        stdout.contains("+0                1  0x00000001"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("+8                0  0x00000000  zero"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("+12               3  0x00000003"),
+        "{stdout}"
+    );
+    // A read that runs past the end of the segment says so rather than
+    // reporting the next segment's bytes as adjacent ones.
+    let (ok, stdout, stderr) = run(&["data", path, "1036", "16"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("are not in the module"), "{stdout}");
+    // And a pointer resolves to the text it points at.
+    let (ok, stdout, stderr) = run(&["data", path, "2048", "8"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("hello"), "{stdout}");
+}
+
+#[test]
+fn data_says_an_uncovered_address_reads_as_zero_rather_than_failing() {
+    let path = fixture("data-gap-cli", TABLE_AND_FIELDS);
+    let (ok, stdout, stderr) = run(&["data", path.to_str().expect("utf-8 path"), "200000", "8"]);
+    // Not an error: memory no segment covers is memory the module never
+    // initialises, and that is an answer.
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("not covered by any data segment"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("zero at run time"), "{stdout}");
+    assert!(stdout.contains("span"), "{stdout}");
+}
+
+#[test]
+fn vtable_names_each_slot_and_calls_out_the_null_one() {
+    let path = fixture("vtable-cli", TABLE_AND_FIELDS);
+    let (ok, stdout, stderr) = run(&["vtable", path.to_str().expect("utf-8 path"), "1024"]);
+    assert!(ok, "{stderr}");
+    // Table index 1 is $a, 2 is $b, 3 is $c — and the module has three
+    // imports-free functions before them, so the indices are their own.
+    assert!(stdout.contains("slot 0"), "{stdout}");
+    assert!(stdout.contains("slot 2"), "{stdout}");
+    assert!(
+        stdout.contains("NULL — pure virtual"),
+        "the zero slot is the whole point: {stdout}"
+    );
+    assert!(stdout.contains("call_indirect(0), which traps"), "{stdout}");
+    // And it stops at the 0xffffffff, which is not a table index.
+    assert!(!stdout.contains("slot 4 "), "{stdout}");
+    assert!(stdout.contains("1 null slot"), "{stdout}");
+}
+
+#[test]
+fn vtable_reads_exactly_what_slots_asks_for() {
+    let path = fixture("vtable-slots-cli", TABLE_AND_FIELDS);
+    let (ok, stdout, stderr) = run(&[
+        "vtable",
+        path.to_str().expect("utf-8 path"),
+        "1024",
+        "--slots",
+        "5",
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("slot 4"),
+        "an explicit count reads past the end: {stdout}"
+    );
+    assert!(stdout.contains("not a live table index"), "{stdout}");
+}
+
+#[test]
+fn stores_finds_the_offset_a_displaced_base_hides() {
+    let path = fixture("stores-cli", TABLE_AND_FIELDS);
+    let path = path.to_str().expect("utf-8 path");
+    let (ok, stdout, stderr) = run(&["stores", path, "--offset", "846", "--size", "1"]);
+    assert!(ok, "{stderr}");
+    // Both: the one that encodes 846, and the one that encodes 854 through a
+    // base eight bytes below the parameter.
+    assert_eq!(stdout.matches("store8").count(), 2, "{stdout}");
+    assert!(stdout.contains("through a base at l0-8"), "{stdout}");
+    assert!(
+        stdout.contains("so the instruction encodes 854"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("2 accesses write offset 846"), "{stdout}");
+
+    // And --exact is the literal search, which finds only one of them.
+    let (ok, stdout, stderr) = run(&["stores", path, "--offset", "846", "--exact"]);
+    assert!(ok, "{stderr}");
+    assert_eq!(stdout.matches("store8").count(), 1, "{stdout}");
+}
+
+#[test]
+fn stores_reads_as_well_as_writes() {
+    let path = fixture("loads-cli", TABLE_AND_FIELDS);
+    let path = path.to_str().expect("utf-8 path");
+    let (ok, stdout, stderr) = run(&["stores", path, "--offset", "846", "--kind", "load"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("0 accesses read offset 846"), "{stdout}");
+    let (ok, _, stderr) = run(&["stores", path, "--offset", "846", "--kind", "both"]);
+    assert!(ok, "{stderr}");
+    let (ok, _, stderr) = run(&["stores", path, "--kind", "sideways", "--offset", "1"]);
+    assert!(!ok, "an unknown kind is not a silent default");
+    assert!(stderr.contains("--kind is store, load or both"), "{stderr}");
+}
+
+#[test]
+fn every_command_answers_help_instead_of_looking_for_a_file_called_help() {
+    for command in [
+        "decompile",
+        "host",
+        "table",
+        "calls",
+        "signatures",
+        "classes",
+        "frames",
+        "data",
+        "vtable",
+        "stores",
+        "bytes",
+        "constants",
+        "patch",
+        "inspect",
+    ] {
+        let (ok, stdout, stderr) = run(&[command, "--help"]);
+        assert!(ok, "{command}: {stderr}");
+        assert!(
+            stdout.starts_with(&format!("usage: unwasm {command}")),
+            "{command}: {stdout}"
+        );
+        let (ok, short, _) = run(&[command, "-h"]);
+        assert!(ok, "{command}");
+        assert_eq!(short, stdout, "{command}: -h and --help are the same");
+    }
+}
+
+#[test]
+fn a_module_after_the_flags_is_an_error_that_says_the_order() {
+    let path = fixture("order-cli", SAMPLE);
+    let (ok, _, stderr) = run(&[
+        "decompile",
+        "--only",
+        "1",
+        "-o",
+        "/dev/null.rs",
+        path.to_str().expect("utf-8 path"),
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("the module comes first"), "{stderr}");
+    assert!(stderr.contains("was read as a flag's value"), "{stderr}");
+}
+
+#[test]
+fn bare_emits_only_what_was_asked_for_and_spans_say_where_it_landed() {
+    let path = fixture("bare-cli", TABLE_AND_FIELDS);
+    let path = path.to_str().expect("utf-8 path");
+    let (ok, stdout, stderr) = run(&["decompile", path, "--only", "4", "--bare"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("--bare"), "{stdout}");
+    assert!(
+        !stdout.contains("pub struct Instance"),
+        "no runtime: {stdout}"
+    );
+    assert!(!stdout.contains("unimplemented!"), "no stubs: {stdout}");
+    assert_eq!(stdout.matches("pub(crate) fn ").count(), 1, "{stdout}");
+
+    // Without a selection it would be the whole module with the scaffolding
+    // removed, which is neither readable nor runnable.
+    let (ok, _, stderr) = run(&["decompile", path, "--bare"]);
+    assert!(!ok);
+    assert!(stderr.contains("--only"), "{stderr}");
+
+    let (ok, stdout, stderr) = run(&["decompile", path, "--only", "3,4", "--spans"]);
+    assert!(ok, "{stderr}");
+    let rows: Vec<&str> = stdout
+        .lines()
+        .skip(1)
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(rows.len(), 2, "one row per function asked for: {stdout}");
+    // The spans have to be usable: first and last are numbers, and the second
+    // function starts after the first ends.
+    let numbers: Vec<(usize, usize)> = rows
+        .iter()
+        .map(|row| {
+            let fields: Vec<&str> = row.split_whitespace().collect();
+            (
+                fields[fields.len() - 2].parse().expect("a first line"),
+                fields[fields.len() - 1].parse().expect("a last line"),
+            )
+        })
+        .collect();
+    assert!(numbers[0].0 < numbers[0].1, "{stdout}");
+    assert!(numbers[0].1 < numbers[1].0, "{stdout}");
+}
+
+#[test]
+fn spans_cut_a_body_that_ends_where_it_says() {
+    // The failure this replaces: slicing with `awk` for the next `fn f<n>` and
+    // stopping at the wrong closing brace, which reads as a complete body.
+    let path = fixture("spans-slice-cli", TABLE_AND_FIELDS);
+    let path = path.to_str().expect("utf-8 path");
+    let destination = scratch().join("spans-slice.rs");
+    let destination = destination.to_str().expect("utf-8 path");
+    let (ok, stdout, stderr) = run(&[
+        "decompile",
+        path,
+        "--only",
+        "4",
+        "--bare",
+        "--spans",
+        "-o",
+        destination,
+    ]);
+    assert!(ok, "{stderr}");
+    let row = stdout.lines().nth(1).expect("a row");
+    let fields: Vec<&str> = row.split_whitespace().collect();
+    let first: usize = fields[fields.len() - 2].parse().expect("a first line");
+    let last: usize = fields[fields.len() - 1].parse().expect("a last line");
+    let text = std::fs::read_to_string(destination).expect("the file it said it wrote");
+    let body: Vec<&str> = text.lines().collect();
+    let slice = &body[first - 1..last];
+    assert!(
+        slice[0].contains("///"),
+        "the doc comment starts it: {:?}",
+        slice[0]
+    );
+    assert!(
+        slice.iter().any(|line| line.contains("pub(crate) fn ")),
+        "{slice:?}"
+    );
+    assert_eq!(
+        slice.iter().filter(|line| line.trim() == "}").count(),
+        1,
+        "the slice closes exactly once: {slice:?}"
+    );
 }

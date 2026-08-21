@@ -802,6 +802,14 @@ pub struct Options {
     /// the doc comment each promoted function carries for what a run of it no
     /// longer matches.
     pub promote_frames: bool,
+    /// Emit only the functions [`Self::only`] names, and nothing else.
+    ///
+    /// No runtime, no imports, no stubs for the other fifteen thousand. The
+    /// result does not compile, and that is the point: reading three functions
+    /// meant slicing a 40 MB file with `awk` looking for the next `fn f<n>`,
+    /// and a slice that stops at the wrong brace is a body that reads as
+    /// complete and is not.
+    pub bare: bool,
     /// **Level 2**: name functions from the C++ RTTI the module carries.
     ///
     /// A class's `type_info` and its vtable are written down by the ABI, so a
@@ -871,6 +879,7 @@ pub fn generate_options(module: &Module, options: &Options) -> Result<Vec<Genera
     generator.stub_recognised = options.stub_recognised;
     generator.promote_frames = options.promote_frames;
     generator.name_classes = options.name_classes;
+    generator.bare = options.bare;
     generator.run()
 }
 
@@ -985,6 +994,8 @@ struct Generator<'a> {
     promote_frames: bool,
     /// Whether the C++ RTTI names the functions it declares — level 2.
     name_classes: bool,
+    /// Whether to emit only the asked-for functions, with nothing around them.
+    bare: bool,
     /// The classes recovered, when it did.
     classes: Vec<crate::analysis::Class>,
     /// What that recovery rested on.
@@ -1003,7 +1014,7 @@ struct Generator<'a> {
     /// body, and the body's own line-to-bytes spans.
     spans: Vec<FunctionSpans>,
     /// Where each function ended up, for the index.
-    located: Vec<(u32, String, String, usize)>,
+    located: Vec<(u32, String, String, usize, usize)>,
 }
 
 impl<'a> Generator<'a> {
@@ -1024,6 +1035,7 @@ impl<'a> Generator<'a> {
             name_classes: false,
             classes: Vec::new(),
             class_evidence: None,
+            bare: false,
             class_methods: Default::default(),
             class_named: BTreeSet::new(),
             spans: Vec::new(),
@@ -1088,14 +1100,18 @@ impl<'a> Generator<'a> {
         let (classes, evidence) = analysis::classes(self.module, &self.analysis.placements);
         let mut owners: std::collections::BTreeMap<u32, Vec<usize>> = Default::default();
         for (at, class) in classes.iter().enumerate() {
-            for func in &class.methods {
+            for func in class.methods.iter().flatten() {
                 owners.entry(*func).or_default().push(at);
             }
         }
         for (func, owning) in owners {
             let [only] = owning[..] else { continue };
             let class = &classes[only];
-            let Some(slot) = class.methods.iter().position(|method| *method == func) else {
+            let Some(slot) = class
+                .methods
+                .iter()
+                .position(|method| *method == Some(func))
+            else {
                 continue;
             };
             self.class_methods.insert(func, (only, slot));
@@ -1221,9 +1237,74 @@ impl<'a> Generator<'a> {
         out
     }
 
+    /// Only the asked-for functions, with nothing around them.
+    ///
+    /// This does not compile and says so at the top. It exists because the
+    /// alternative was slicing a forty-megabyte file with `awk` looking for the
+    /// next `fn f<n>`, and a slice that stopped at the wrong closing brace read
+    /// as a complete body while being half of one.
+    fn bare_run(mut self) -> Result<Vec<GeneratedFile>> {
+        let import_count = self.module.func_imports.len() as u32;
+        let wanted = self.only.clone().unwrap_or_default();
+        let _ = writeln!(
+            self.out,
+            concat!(
+                "// {} function{} of {}, decompiled by unwasm with --bare.\n",
+                "//\n",
+                "// This is not a module and does not compile: no runtime, no imports, and\n",
+                "// no stubs for the functions these call. For something that runs, drop\n",
+                "// --bare.\n"
+            ),
+            wanted.len(),
+            if wanted.len() == 1 { "" } else { "s" },
+            self.module.funcs.len()
+        );
+        let mut lines = self.out.lines().count();
+        for index in &wanted {
+            let Some(func) = self
+                .module
+                .funcs
+                .get(index.saturating_sub(import_count) as usize)
+                .filter(|_| *index >= import_count)
+            else {
+                let _ = writeln!(
+                    self.out,
+                    "// #{index} is an import, and an import has no body to decompile.\n"
+                );
+                lines = self.out.lines().count();
+                continue;
+            };
+            let body = self.function(*index, func)?;
+            let body_lines = body.lines().count();
+            self.located.push((
+                *index,
+                function_ident_with(*index, &self.analysis, &self.recognised),
+                "mod.rs".to_string(),
+                lines + 1,
+                lines + body_lines,
+            ));
+            lines += body_lines;
+            self.out.push_str(&body);
+        }
+        let index = self.index_json();
+        Ok(vec![
+            GeneratedFile {
+                name: "mod.rs".to_string(),
+                contents: self.out,
+            },
+            GeneratedFile {
+                name: "names.json".to_string(),
+                contents: index,
+            },
+        ])
+    }
+
     fn run(mut self) -> Result<Vec<GeneratedFile>> {
         self.recognise();
         self.name_from_classes();
+        if self.bare {
+            return self.bare_run();
+        }
         self.header();
         self.class_summary();
         self.registered_api();
@@ -1281,7 +1362,7 @@ impl<'a> Generator<'a> {
             .collect();
         let mut out = String::from("{\n  \"functions\": [\n");
         let mut written = 0;
-        for (index, _, file, start) in &self.located {
+        for (index, _, file, start, _) in &self.located {
             let Some((before_body, spans)) = mapped.get(index) else {
                 continue;
             };
@@ -1313,7 +1394,7 @@ impl<'a> Generator<'a> {
     /// lines to find the function you already know the number of.
     fn index_json(&self) -> String {
         let mut out = String::from("{\n  \"functions\": [\n");
-        for (at, (index, name, file, line)) in self.located.iter().enumerate() {
+        for (at, (index, name, file, line, last)) in self.located.iter().enumerate() {
             let slots: Vec<String> = self
                 .analysis
                 .table
@@ -1345,7 +1426,7 @@ impl<'a> Generator<'a> {
             let sites = self.analysis.call_graph.sites_reaching(*index);
             let _ = writeln!(
                 out,
-                "    {{\"index\": {index}, \"name\": \"{name}\", \"file\": \"{file}\", \"line\": {line}, \"named_by\": \"{source}\", \"table_slots\": [{}], \"calls\": [{calls}], \"called_by\": [{called_by}], \"call_sites\": {sites}}}{}",
+                "    {{\"index\": {index}, \"name\": \"{name}\", \"file\": \"{file}\", \"line\": {line}, \"last_line\": {last}, \"named_by\": \"{source}\", \"table_slots\": [{}], \"calls\": [{calls}], \"called_by\": [{called_by}], \"call_sites\": {sites}}}{}",
                 slots.join(", "),
                 if at + 1 == self.located.len() {
                     ""
@@ -1829,13 +1910,15 @@ impl<'a> Generator<'a> {
                 for (at, func) in self.module.funcs.iter().enumerate() {
                     let index = import_count + at as u32;
                     let body = self.function(index, func)?;
+                    let body_lines = body.lines().count();
                     self.located.push((
                         index,
                         function_ident_with(index, &self.analysis, &self.recognised),
                         "mod.rs".to_string(),
                         lines + 1,
+                        lines + body_lines,
                     ));
-                    lines += body.lines().count();
+                    lines += body_lines;
                     self.out.push_str(&body);
                 }
                 self.out.push_str("}\n\n");
@@ -1868,6 +1951,7 @@ impl<'a> Generator<'a> {
                 function_ident_with(index, &self.analysis, &self.recognised),
                 file,
                 part_prelude_lines() + lines + 1,
+                part_prelude_lines() + lines + body_lines,
             ));
             current.push_str(&body);
             lines += body_lines;
@@ -3734,7 +3818,18 @@ impl<'a> Body<'a> {
                     }
                     _ => analysis::placed_text(self.module, placements, *value, None),
                 };
+                // A constant that is the right-hand operand of arithmetic is a
+                // displacement, not an address. `l3.wrapping_add(259069)` is a
+                // field of the struct `l3` points at, and quoting the string
+                // that happens to live at 259069 beside it says the opposite of
+                // what is happening. LLVM puts the constant second for `p + k`
+                // and first for `base + i`, so "immediately before the operator"
+                // separates the two cases.
+                let displaced = matches!(self.next_op, Some(Op::Num(num)) if displaces(num));
                 let code = match text {
+                    Some(text) if displaced => {
+                        format!("{} /* ?{} */", format_i32(*value), escape_comment(&text))
+                    }
                     Some(text) => format!("{} /* {} */", format_i32(*value), escape_comment(&text)),
                     // Not text, but shared: a bare number that dozens of
                     // functions reference is state they have in common, and
@@ -4458,6 +4553,33 @@ fn global_ident(index: u32, analysis: &Analysis) -> String {
         Some(found) if found.global == index => format!("g{index}_stack_pointer"),
         _ => format!("g{index}"),
     }
+}
+
+/// Whether a constant immediately before this operator is a displacement.
+///
+/// The arithmetic that combines a base with an offset. A comparison is not
+/// here: comparing a pointer against a string's address is a real thing a
+/// program does, and marking those uncertain would cost more than it saves.
+fn displaces(op: crate::ops::NumOp) -> bool {
+    use crate::ops::NumOp;
+    matches!(
+        op,
+        NumOp::I32Add
+            | NumOp::I32Sub
+            | NumOp::I32Mul
+            | NumOp::I32DivS
+            | NumOp::I32DivU
+            | NumOp::I32RemS
+            | NumOp::I32RemU
+            | NumOp::I32And
+            | NumOp::I32Or
+            | NumOp::I32Xor
+            | NumOp::I32Shl
+            | NumOp::I32ShrS
+            | NumOp::I32ShrU
+            | NumOp::I32Rotl
+            | NumOp::I32Rotr
+    )
 }
 
 /// Makes text safe to sit inside a `/* */` comment.

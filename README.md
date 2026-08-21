@@ -773,6 +773,67 @@ $ unwasm signatures reference.wasm -o libc.sigs   # a catalogue, from a build wi
 $ unwasm decompile module.wasm --signatures libc.sigs
 ```
 
+Every command takes the module first and its flags after it, and every one
+answers `--help` on its own.
+
+### Reading the module's memory rather than its file
+
+```console
+$ unwasm data module.wasm 0x103564 48      # guest memory at an address
+$ unwasm vtable module.wasm 0x103564       # that address read as a vtable
+$ unwasm vtable module.wasm --class N6webrtc20ResidualEchoDetectorE
+$ unwasm stores module.wasm --offset 846 --size 1   # who writes that field
+$ unwasm constants module.wasm 5103 --data # and where the data holds it
+```
+
+`bytes` takes an offset into the wasm *file*. `data` takes an address in the
+*guest*, which is a different number: the segment that covers it decides the
+mapping, and a threaded module's segments are passive and carry no address at
+all until the `memory.init` calls have been resolved. `data` says which segment
+covers the address, the file offset of the byte — the number `bytes` and `patch`
+take — the hex, and the words as u32 with the strings they point at. An address
+no segment covers is not an error; it is memory the module never initialises,
+and it reads as zero at run time.
+
+`vtable` reads the same bytes as a table of function pointers: table index,
+function, signature. **A slot holding 0 is a pure virtual function**, and a
+`call_indirect` reaching one takes table index 0, mismatches its signature and
+traps — which kills the thread rather than returning an error anybody catches.
+From the outside that looks like the engine dying for no reason; here it is one
+line. The read stops at the first word that is neither a live table index nor a
+null run a live index follows, so it does not report the next object's bytes as
+methods. `--class` takes a name `classes` printed and finds the address itself.
+`classes --methods` counts the same slots, nulls included.
+
+`stores` answers "who writes byte +846 of this struct". It follows the constant
+displacements a function applies to its own parameters and locals, so a field
+written through `base = p - 8` as `+854` is still found at 846 — a grep of
+decompiled output finds neither the number nor the write. `--exact` is the
+literal search, `--kind load|store|both` picks the direction, and functions
+whose operand stack the walk lost are named rather than silently skipped.
+
+`constants <n> --data` lists every address in the data segments holding those
+four bytes, marking the four-byte-aligned ones. A function pointer installed in
+a vtable is written by the linker and pushed by no instruction, so a search of
+the code finds nothing at all.
+
+### Reading three functions out of fifteen thousand
+
+```console
+$ unwasm decompile module.wasm --only 7497 --bare    # just that function
+$ unwasm decompile module.wasm --only 7497,7493 --spans
+index   name                                     file        first    last
+7493    f7493_webrtc_v2_aecm_create              mod.rs      167903   168708
+7497    f7497                                    mod.rs      168750   168859
+```
+
+`--only` on its own keeps the other fifteen thousand as stubs so the result
+compiles. `--bare` drops them, and the runtime and the imports with them: the
+result does not compile and is a hundred lines instead of a million. `--spans`
+prints where each function starts and ends in the file that would be written,
+which is what a slice needs — searching for the next `fn f<n>` stops at the
+wrong closing brace, and a truncated body reads as a complete one.
+
 The output is a self-contained Rust module — no dependencies, runtime embedded:
 
 ```rust

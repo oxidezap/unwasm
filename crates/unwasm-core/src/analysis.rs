@@ -1025,6 +1025,98 @@ fn static_data_span(
 }
 
 /// Reads the function table's contents from the element segments.
+/// How long a run of null slots may be before it is the end of the table.
+///
+/// A pure virtual function is a zero in the middle of a vtable; the zeros after
+/// the last method are the next object. Four, because a run longer than that is
+/// more often the end than a run of pure virtuals — and because the *only*
+/// thing that makes a run part of the table is a live table index directly
+/// after it. The next vtable's `{0, type_info}` header does not qualify: the
+/// `type_info` is an address in the hundreds of thousands, not a table index.
+const NULL_RUN: usize = 4;
+
+/// Reads a table of function pointers: each slot as a table index.
+///
+/// `None` is a slot holding 0. The read stops at the first word that is neither
+/// a live table index nor part of a null run a live index follows.
+fn read_pointer_table(
+    image: &DataImage<'_>,
+    table: &std::collections::BTreeMap<u32, u32>,
+    address: i32,
+    highest: u32,
+    cap: usize,
+) -> Vec<Option<u32>> {
+    let live = |word: i32| -> Option<u32> {
+        (word > 0 && word as u32 <= highest)
+            .then(|| table.get(&(word as u32)).copied())
+            .flatten()
+    };
+    let mut slots = Vec::new();
+    let mut cursor = address;
+    while slots.len() < cap {
+        let Some(word) = image.read32(cursor) else {
+            break;
+        };
+        if let Some(func) = live(word) {
+            slots.push(Some(func));
+            cursor += 4;
+            continue;
+        }
+        if word != 0 {
+            break;
+        }
+        // A run of zeros counts only if a real method comes directly after it.
+        let mut run = 1;
+        while run <= NULL_RUN && image.read32(cursor + 4 * run as i32) == Some(0) {
+            run += 1;
+        }
+        let after = image.read32(cursor + 4 * run as i32);
+        if run > NULL_RUN || after.and_then(live).is_none() {
+            break;
+        }
+        for _ in 0..run {
+            slots.push(None);
+        }
+        cursor += 4 * run as i32;
+    }
+    slots.truncate(cap);
+    slots
+}
+
+/// Reads a table of function pointers at an address, for `unwasm vtable`.
+///
+/// Each slot is a table index; `None` is a slot holding 0, which a
+/// `call_indirect` cannot survive. `cap` bounds the read; without one it stops
+/// where the table stops looking like one — see [`read_pointer_table`].
+#[must_use]
+pub fn pointer_table(
+    image: &DataImage<'_>,
+    table: &std::collections::BTreeMap<u32, u32>,
+    address: i32,
+    cap: Option<usize>,
+) -> Vec<Option<u32>> {
+    let highest = table.keys().max().copied().unwrap_or(0);
+    match cap {
+        Some(cap) => {
+            // An explicit count reads that many words whatever they hold: the
+            // caller asked, and refusing would hide the bytes they asked about.
+            let mut slots = Vec::with_capacity(cap);
+            for slot in 0..cap {
+                let Some(word) = image.read32(address.wrapping_add((slot * 4) as i32)) else {
+                    break;
+                };
+                slots.push(
+                    (word > 0)
+                        .then(|| table.get(&(word as u32)).copied())
+                        .flatten(),
+                );
+            }
+            slots
+        }
+        None => read_pointer_table(image, table, address, highest, usize::MAX),
+    }
+}
+
 fn read_table(module: &Module) -> std::collections::BTreeMap<u32, u32> {
     let mut table = std::collections::BTreeMap::new();
     for segment in &module.elems {
@@ -2125,8 +2217,14 @@ pub struct Class {
     pub base: Option<i32>,
     /// Where the vtable sits, when one points at this `type_info`.
     pub vtable: Option<i32>,
-    /// The functions the vtable holds, in order, by function index.
-    pub methods: Vec<u32>,
+    /// The vtable's slots, in order.
+    ///
+    /// `None` is a slot holding 0 — a pure virtual function. It is kept rather
+    /// than skipped for two reasons: the slot numbers after it stay right, and
+    /// a `call_indirect` reaching one takes table index 0, mismatches its
+    /// signature and traps. A vtable read that stopped at the first zero
+    /// under-reported both.
+    pub methods: Vec<Option<u32>>,
 }
 
 /// What the class recovery rests on.
@@ -2176,7 +2274,8 @@ pub fn classes(
     // Every `{something, name}` pair whose second word points at a mangled
     // type name. Most are real; the rest are two words that happened to line up.
     let mut candidates: Vec<(i32, i32, String)> = Vec::new();
-    for (base, bytes) in &image.segments {
+    for placed in &image.segments {
+        let (base, bytes) = (&placed.base, &placed.bytes);
         let mut at = base.next_multiple_of(4);
         while (at as u64) + 8 <= u64::from(*base) + bytes.len() as u64 {
             if let (Some(kind), Some(name_at)) =
@@ -2297,7 +2396,8 @@ pub fn classes(
     // `type_info` already confirmed, and a run of live table slots — which is
     // what makes a vtable recognisable at all.
     let highest = table.keys().max().copied().unwrap_or(0);
-    for (base, bytes) in &image.segments {
+    for placed in &image.segments {
+        let (base, bytes) = (&placed.base, &placed.bytes);
         let mut at = base.next_multiple_of(4);
         while (at as u64) + 8 <= u64::from(*base) + bytes.len() as u64 {
             let here = at as i32;
@@ -2311,19 +2411,8 @@ pub fn classes(
             if !classes.contains_key(&info) {
                 continue;
             }
-            let mut methods = Vec::new();
-            let mut cursor = here + 8;
-            while let Some(slot) = image.read32(cursor) {
-                if slot <= 0 || slot as u32 > highest {
-                    break;
-                }
-                let Some(func) = table.get(&(slot as u32)) else {
-                    break;
-                };
-                methods.push(*func);
-                cursor += 4;
-            }
-            if methods.is_empty() {
+            let methods = read_pointer_table(&image, &table, here + 8, highest, usize::MAX);
+            if !methods.iter().any(Option::is_some) {
                 continue;
             }
             // The first vtable wins. A class has one; a second match at another
@@ -2524,25 +2613,83 @@ fn demangle_type(mangled: &str) -> (String, String) {
     (components.join("::"), short)
 }
 
+/// Where an address sits in the module's data.
+///
+/// The answer a static read of guest memory needs first: an address is not a
+/// file offset, and the segment that covers it is what turns one into the
+/// other. An address no segment covers is not an error — it is memory the
+/// module never initialises, which reads as zero at run time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Located {
+    /// Which data segment, by index into [`Module::datas`].
+    pub segment: u32,
+    /// Where the segment starts in guest memory.
+    pub base: u32,
+    /// How far into the segment the address is.
+    pub offset: u32,
+    /// The segment's length in bytes.
+    pub length: u32,
+    /// Whether the segment declares its own address.
+    ///
+    /// An active segment carries a constant offset. A passive one carries none
+    /// — a threaded module's segments all are — and its address is whatever
+    /// [`Placement`] recovered from the `memory.init` that copies it.
+    pub active: bool,
+    /// Where this address's byte sits in the wasm file.
+    ///
+    /// The number `unwasm bytes` and `unwasm patch` take. Computing it by hand
+    /// means subtracting a constant that holds for one segment and not for the
+    /// next, which is how a read lands past the end of the file.
+    pub file_offset: u32,
+}
+
+impl Located {
+    /// The guest address this located.
+    #[must_use]
+    pub fn address(&self) -> u32 {
+        self.base + self.offset
+    }
+}
+
+/// One placed data segment.
+struct Placed<'a> {
+    index: u32,
+    base: u32,
+    bytes: &'a [u8],
+    active: bool,
+    file_offset: u32,
+}
+
 /// The data segments as one addressable image.
-struct DataImage<'a> {
-    /// Each placed segment: where it starts, and its bytes.
-    segments: Vec<(u32, &'a [u8])>,
+///
+/// Public because reading guest memory by address is a question on its own:
+/// a vtable, a table of function pointers, a struct the module initialises
+/// statically. Everything here is what the module *starts* with — nothing that
+/// ran has written to it yet.
+pub struct DataImage<'a> {
+    /// Each placed segment, sorted by address.
+    segments: Vec<Placed<'a>>,
 }
 
 impl<'a> DataImage<'a> {
-    fn of(module: &'a Module, placements: &std::collections::BTreeMap<u32, Placement>) -> Self {
+    /// Builds the image from a module and the placements the analysis recovered.
+    ///
+    /// A passive segment says nothing about where it goes, so without the
+    /// placements a threaded module's data is entirely unaddressable — see
+    /// [`Placement`].
+    #[must_use]
+    pub fn of(module: &'a Module, placements: &std::collections::BTreeMap<u32, Placement>) -> Self {
         let mut segments = Vec::new();
         for (index, segment) in module.datas.iter().enumerate() {
-            let base = match segment.offset {
-                Some(ConstExpr::I32(base)) => base as u32,
+            let (base, active) = match segment.offset {
+                Some(ConstExpr::I32(base)) => (base as u32, true),
                 Some(_) => continue,
                 None => match placements.get(&(index as u32)) {
                     // The placement records where a *part* of the segment went;
                     // the segment's own start is that much earlier.
                     Some(placement) => {
                         match (placement.address as u32).checked_sub(placement.offset) {
-                            Some(base) => base,
+                            Some(base) => (base, false),
                             None => continue,
                         }
                     }
@@ -2550,36 +2697,161 @@ impl<'a> DataImage<'a> {
                 },
             };
             if !segment.bytes.is_empty() {
-                segments.push((base, segment.bytes.as_slice()));
+                segments.push(Placed {
+                    index: index as u32,
+                    base,
+                    bytes: segment.bytes.as_slice(),
+                    active,
+                    file_offset: segment.file_offset,
+                });
             }
         }
-        segments.sort_by_key(|(base, _)| *base);
+        segments.sort_by_key(|placed| placed.base);
         Self { segments }
     }
 
-    /// The bytes at an address, if a segment covers them.
-    fn bytes(&self, address: i32, length: usize) -> Option<&'a [u8]> {
+    /// How many segments the image could place.
+    #[must_use]
+    pub fn placed(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// The address range the placed segments span, lowest base to highest end.
+    #[must_use]
+    pub fn extent(&self) -> Option<(u32, u32)> {
+        let low = self.segments.first()?.base;
+        let high = self
+            .segments
+            .iter()
+            .map(|placed| placed.base + placed.bytes.len() as u32)
+            .max()?;
+        Some((low, high))
+    }
+
+    /// Which segment covers an address, if one does.
+    ///
+    /// Linear rather than binary: segments can overlap and can share a base, and
+    /// the first covering one is the answer a reader wants rather than the last
+    /// one whose base sorts below the address.
+    #[must_use]
+    pub fn locate(&self, address: i32) -> Option<Located> {
+        let address = address as u32;
+        self.segments
+            .iter()
+            .find(|placed| {
+                address >= placed.base && address - placed.base < placed.bytes.len() as u32
+            })
+            .map(|placed| Located {
+                segment: placed.index,
+                base: placed.base,
+                offset: address - placed.base,
+                length: placed.bytes.len() as u32,
+                active: placed.active,
+                file_offset: placed.file_offset + (address - placed.base),
+            })
+    }
+
+    /// The segment nearest below an address, for saying what a miss is near.
+    #[must_use]
+    pub fn nearest_below(&self, address: i32) -> Option<Located> {
+        let address = address as u32;
+        self.segments
+            .iter()
+            .filter(|placed| placed.base <= address)
+            .max_by_key(|placed| placed.base)
+            .map(|placed| Located {
+                segment: placed.index,
+                base: placed.base,
+                offset: address - placed.base,
+                length: placed.bytes.len() as u32,
+                active: placed.active,
+                file_offset: placed.file_offset + (address - placed.base),
+            })
+    }
+
+    /// The bytes at an address, if a segment covers all of them.
+    ///
+    /// `None` covers both "no segment is there" and "the range runs off the end
+    /// of the one that is": a read that spans two segments is not answered from
+    /// one of them, because the gap between them is not in the module at all.
+    #[must_use]
+    pub fn bytes(&self, address: i32, length: usize) -> Option<&'a [u8]> {
         let address = address as u32;
         let at = self
             .segments
-            .partition_point(|(base, _)| *base <= address)
+            .partition_point(|placed| placed.base <= address)
             .checked_sub(1)?;
-        let (base, bytes) = self.segments[at];
-        let within = (address - base) as usize;
-        bytes.get(within..within + length)
+        let placed = &self.segments[at];
+        let within = (address - placed.base) as usize;
+        placed.bytes.get(within..within.checked_add(length)?)
     }
 
-    fn read32(&self, address: i32) -> Option<i32> {
+    /// The 32-bit little-endian word at an address.
+    #[must_use]
+    pub fn read32(&self, address: i32) -> Option<i32> {
         let bytes = self.bytes(address, 4)?;
         Some(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
-    fn holds(&self, address: i32) -> bool {
+    /// Whether any segment covers this address.
+    #[must_use]
+    pub fn holds(&self, address: i32) -> bool {
         self.bytes(address, 1).is_some()
     }
 
+    /// Every address at which the four bytes of `value` appear in the data.
+    ///
+    /// The other half of `constants`: a function pointer installed in a vtable
+    /// is never pushed by any instruction, so a search of the code finds
+    /// nothing and the table it sits in stays invisible.
+    #[must_use]
+    pub fn find32(&self, value: i32) -> Vec<Located> {
+        let wanted = value.to_le_bytes();
+        let mut found = Vec::new();
+        for placed in &self.segments {
+            for (offset, window) in placed.bytes.windows(4).enumerate() {
+                if window == wanted {
+                    found.push(Located {
+                        segment: placed.index,
+                        base: placed.base,
+                        offset: offset as u32,
+                        length: placed.bytes.len() as u32,
+                        active: placed.active,
+                        file_offset: placed.file_offset + offset as u32,
+                    });
+                }
+            }
+        }
+        found
+    }
+
+    /// The NUL-terminated readable text at an address, spaces included.
+    ///
+    /// [`Self::cstring`] refuses a space because a mangled type name never has
+    /// one, and admitting them there would let a sentence be read as a class.
+    /// A string a reader is being shown has no such constraint, and `"Mobile
+    /// platform audio pr"` is not an improvement on the address.
+    #[must_use]
+    pub fn text(&self, address: i32) -> Option<String> {
+        let mut out = Vec::new();
+        let mut cursor = address;
+        loop {
+            let byte = *self.bytes(cursor, 1)?.first()?;
+            if byte == 0 {
+                break;
+            }
+            if !(byte.is_ascii_graphic() || byte == b' ') || out.len() >= 512 {
+                return None;
+            }
+            out.push(byte);
+            cursor += 1;
+        }
+        (!out.is_empty()).then(|| String::from_utf8_lossy(&out).into_owned())
+    }
+
     /// The NUL-terminated printable text at an address.
-    fn cstring(&self, address: i32) -> Option<String> {
+    #[must_use]
+    pub fn cstring(&self, address: i32) -> Option<String> {
         let bytes = self.bytes(address, 1)?;
         let _ = bytes;
         let mut out = Vec::new();
@@ -2741,6 +3013,627 @@ fn static_text_placed_with(
         };
     }
     None
+}
+
+/// One memory access at a statically-known offset.
+///
+/// The answer to "who writes byte +846 of this struct". Reading it out of the
+/// module is a scan; recovering it by decompiling candidates and grepping the
+/// text is an afternoon, and it misses the ones the compiler wrote through a
+/// displaced base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Access {
+    /// The function that makes it.
+    pub func: u32,
+    /// Where in that function's body, as an index into [`crate::module::Func::body`].
+    pub position: usize,
+    /// Where the instruction sits in the wasm file, when the decoder recorded it.
+    pub file_offset: Option<u32>,
+    /// Whether it reads rather than writes.
+    pub load: bool,
+    /// How many bytes it touches.
+    pub width: u32,
+    /// The offset encoded in the instruction itself.
+    pub encoded: u64,
+    /// What the address operand turned out to be.
+    pub address: AddressOf,
+}
+
+impl Access {
+    /// The offset relative to whatever base the address is expressed against.
+    ///
+    /// For [`AddressOf::Local`] that is the local's value at entry, and this is
+    /// the number a struct field is at. For anything else it is the encoded
+    /// offset, which is all the instruction says.
+    #[must_use]
+    pub fn effective(&self) -> i64 {
+        match self.address {
+            AddressOf::Local { displacement, .. } => displacement + self.encoded as i64,
+            AddressOf::Absolute(base) => base + self.encoded as i64,
+            AddressOf::Unknown => self.encoded as i64,
+        }
+    }
+}
+
+/// What the address operand of an [`Access`] was known to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressOf {
+    /// `local + displacement`, where the local is a parameter or a declared
+    /// local and the displacement is what the function added to it.
+    ///
+    /// This is the case that matters. A function handed a pointer eight bytes
+    /// into a struct writes the field at +846 as +838; one that computes
+    /// `base = p - 8` first writes it as +854. Neither encodes 846 anywhere,
+    /// and a search for the literal finds neither.
+    Local {
+        /// Which local, by index — parameters first.
+        local: u32,
+        /// What was added to it before the instruction's own offset.
+        displacement: i64,
+    },
+    /// A constant address: static memory rather than a field of anything.
+    Absolute(i64),
+    /// An address this could not follow — a load, a call's result, arithmetic
+    /// on two unknowns.
+    Unknown,
+}
+
+/// Which accesses to collect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// Writes only.
+    Store,
+    /// Reads only.
+    Load,
+    /// Both.
+    Both,
+}
+
+impl Kind {
+    fn wants(self, load: bool) -> bool {
+        match self {
+            Self::Store => !load,
+            Self::Load => load,
+            Self::Both => true,
+        }
+    }
+}
+
+/// Every access in the module whose offset matches, and how it was arrived at.
+///
+/// `width` of `None` means any width.
+///
+/// The base tracking is intraprocedural and forward only: a displacement a
+/// caller applied is not visible here, and one applied inside a loop is
+/// discarded rather than carried across the back edge. What it does see is the
+/// straight-line `base = p + k` the compiler emits, which is the case that
+/// hides a field from a literal search.
+#[must_use]
+pub fn accesses_at(
+    module: &Module,
+    offset: i64,
+    width: Option<u32>,
+    kind: Kind,
+    exact: bool,
+) -> AccessReport {
+    let import_count = module.func_imports.len() as u32;
+    let mut report = AccessReport::default();
+    for (at, func) in module.funcs.iter().enumerate() {
+        let index = import_count + at as u32;
+        let mut walk = Walk::new(module, func, index);
+        walk.run();
+        if walk.lost {
+            report.lost.push(index);
+        }
+        for access in walk.found {
+            if !kind.wants(access.load) {
+                continue;
+            }
+            if width.is_some_and(|wanted| wanted != access.width) {
+                continue;
+            }
+            let matched = if exact {
+                access.encoded as i64 == offset
+            } else {
+                access.effective() == offset
+            };
+            if matched {
+                report.found.push(access);
+            }
+        }
+    }
+    report
+}
+
+/// What [`accesses_at`] found, and where it could not look.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccessReport {
+    /// The matching accesses.
+    pub found: Vec<Access>,
+    /// Functions whose operand stack the walk lost track of, after which
+    /// nothing more was recorded for them.
+    ///
+    /// Reported rather than swallowed: a search that silently skipped a
+    /// function is a search whose empty answer means nothing.
+    pub lost: Vec<u32>,
+}
+
+/// A value on the abstract operand stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Abstract {
+    Const(i64),
+    /// `local + displacement`.
+    Local {
+        local: u32,
+        displacement: i64,
+    },
+    Unknown,
+}
+
+/// One open control-flow region.
+struct Region {
+    /// The operand stack height its body starts at.
+    height: usize,
+    /// How many values it leaves behind.
+    results: usize,
+    /// Locals written inside it, which its exit has to forget: a value that was
+    /// only assigned on one path is not the value on the other.
+    written: Vec<u32>,
+}
+
+/// Walks a function's body, following what each address operand is made of.
+struct Walk<'a> {
+    module: &'a Module,
+    func: &'a crate::module::Func,
+    index: u32,
+    stack: Vec<Abstract>,
+    locals: Vec<Abstract>,
+    regions: Vec<Region>,
+    /// Set when the code after a branch cannot be reached, and cleared at the
+    /// `end` or `else` that makes it reachable again.
+    unreachable: bool,
+    /// Nesting still to be skipped while unreachable.
+    skip: usize,
+    /// Set when the stack simulation lost track, after which nothing more is
+    /// recorded for this function rather than recording something wrong.
+    lost: bool,
+    found: Vec<Access>,
+}
+
+impl<'a> Walk<'a> {
+    fn new(module: &'a Module, func: &'a crate::module::Func, index: u32) -> Self {
+        let params = module
+            .func_type(index)
+            .map_or(0, |signature| signature.params.len());
+        let count = params + func.locals.len();
+        // Every local starts as itself at displacement zero, which is true of a
+        // parameter on entry and of a declared local's zero.
+        let locals = (0..count)
+            .map(|local| Abstract::Local {
+                local: local as u32,
+                displacement: 0,
+            })
+            .collect();
+        Self {
+            module,
+            func,
+            index,
+            stack: Vec::new(),
+            locals,
+            regions: Vec::new(),
+            unreachable: false,
+            skip: 0,
+            lost: false,
+            found: Vec::new(),
+        }
+    }
+
+    fn pop(&mut self) -> Abstract {
+        match self.stack.pop() {
+            Some(value) => value,
+            None => {
+                self.lost = true;
+                Abstract::Unknown
+            }
+        }
+    }
+
+    fn popn(&mut self, count: usize) {
+        for _ in 0..count {
+            let _ = self.pop();
+        }
+    }
+
+    fn block_arity(&self, ty: crate::module::BlockType) -> (usize, usize) {
+        match ty {
+            crate::module::BlockType::Empty => (0, 0),
+            crate::module::BlockType::Value(_) => (0, 1),
+            crate::module::BlockType::Func(index) => self
+                .module
+                .types
+                .get(index as usize)
+                .map_or((0, 0), |ty| (ty.params.len(), ty.results.len())),
+        }
+    }
+
+    fn open(&mut self, ty: crate::module::BlockType) {
+        let (params, results) = self.block_arity(ty);
+        let height = self.stack.len().saturating_sub(params);
+        self.regions.push(Region {
+            height,
+            results,
+            written: Vec::new(),
+        });
+    }
+
+    /// Forgets what a region's assignments said, and returns to its height.
+    fn close(&mut self) {
+        let Some(region) = self.regions.pop() else {
+            self.lost = true;
+            return;
+        };
+        for local in &region.written {
+            if let Some(slot) = self.locals.get_mut(*local as usize) {
+                *slot = Abstract::Local {
+                    local: *local,
+                    displacement: 0,
+                };
+            }
+        }
+        self.stack.truncate(region.height);
+        for _ in 0..region.results {
+            self.stack.push(Abstract::Unknown);
+        }
+    }
+
+    fn wrote(&mut self, local: u32) {
+        if let Some(region) = self.regions.last_mut() {
+            region.written.push(local);
+        }
+    }
+
+    fn go_unreachable(&mut self) {
+        self.unreachable = true;
+        self.skip = 0;
+    }
+
+    fn run(&mut self) {
+        for position in 0..self.func.body.len() {
+            if self.lost {
+                return;
+            }
+            let op = &self.func.body[position];
+            if self.unreachable {
+                self.skip_op(op);
+                continue;
+            }
+            self.step(position, op);
+        }
+    }
+
+    /// While unreachable, only the nesting matters.
+    fn skip_op(&mut self, op: &Op) {
+        match op {
+            Op::Block(_) | Op::Loop(_) | Op::If(_) => self.skip += 1,
+            Op::Else if self.skip == 0 => {
+                self.unreachable = false;
+                // The `else` arm starts from where the `if` did.
+                if let Some(region) = self.regions.last() {
+                    let height = region.height;
+                    self.stack.truncate(height);
+                }
+                let written: Vec<u32> = self
+                    .regions
+                    .last()
+                    .map(|region| region.written.clone())
+                    .unwrap_or_default();
+                for local in written {
+                    if let Some(slot) = self.locals.get_mut(local as usize) {
+                        *slot = Abstract::Local {
+                            local,
+                            displacement: 0,
+                        };
+                    }
+                }
+            }
+            Op::End => {
+                if self.skip > 0 {
+                    self.skip -= 1;
+                } else {
+                    self.unreachable = false;
+                    self.close();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn step(&mut self, position: usize, op: &Op) {
+        use crate::module::{AtomicKind, StoreKind};
+        match op {
+            Op::Unreachable => self.go_unreachable(),
+            Op::Nop | Op::DataDrop(_) | Op::AtomicFence => {}
+            Op::Block(ty) | Op::Loop(ty) => {
+                let ty = *ty;
+                // A loop's body can be re-entered with different locals, so
+                // nothing carried into it survives the back edge.
+                if matches!(op, Op::Loop(_)) {
+                    for (local, slot) in self.locals.iter_mut().enumerate() {
+                        *slot = Abstract::Local {
+                            local: local as u32,
+                            displacement: 0,
+                        };
+                    }
+                }
+                self.open(ty);
+            }
+            Op::If(ty) => {
+                let ty = *ty;
+                let _ = self.pop();
+                self.open(ty);
+            }
+            Op::Else => {
+                // Everything the `then` arm assigned is forgotten, and the
+                // stack goes back to where the `if` left it.
+                let (height, written) = match self.regions.last() {
+                    Some(region) => (region.height, region.written.clone()),
+                    None => {
+                        self.lost = true;
+                        return;
+                    }
+                };
+                for local in written {
+                    if let Some(slot) = self.locals.get_mut(local as usize) {
+                        *slot = Abstract::Local {
+                            local,
+                            displacement: 0,
+                        };
+                    }
+                }
+                self.stack.truncate(height);
+            }
+            Op::End => {
+                if self.regions.is_empty() {
+                    // The function's own end.
+                    return;
+                }
+                self.close();
+            }
+            Op::Br(_) | Op::BrTable { .. } | Op::Return => self.go_unreachable(),
+            Op::BrIf(_) => {
+                let _ = self.pop();
+            }
+            Op::Call(callee) => {
+                let (params, results) = self
+                    .module
+                    .func_type(*callee)
+                    .map_or((0, 0), |ty| (ty.params.len(), ty.results.len()));
+                self.popn(params);
+                for _ in 0..results {
+                    self.stack.push(Abstract::Unknown);
+                }
+            }
+            Op::CallIndirect { type_index } => {
+                let (params, results) = self
+                    .module
+                    .types
+                    .get(*type_index as usize)
+                    .map_or((0, 0), |ty| (ty.params.len(), ty.results.len()));
+                // The table index, then the arguments.
+                self.popn(params + 1);
+                for _ in 0..results {
+                    self.stack.push(Abstract::Unknown);
+                }
+            }
+            Op::Drop => {
+                let _ = self.pop();
+            }
+            Op::Select => {
+                self.popn(3);
+                self.stack.push(Abstract::Unknown);
+            }
+            Op::LocalGet(index) => {
+                let value = self
+                    .locals
+                    .get(*index as usize)
+                    .copied()
+                    .unwrap_or(Abstract::Unknown);
+                self.stack.push(value);
+            }
+            Op::LocalSet(index) => {
+                let value = self.pop();
+                self.assign(*index, value);
+            }
+            Op::LocalTee(index) => {
+                let value = self.pop();
+                self.assign(*index, value);
+                let now = self
+                    .locals
+                    .get(*index as usize)
+                    .copied()
+                    .unwrap_or(Abstract::Unknown);
+                self.stack.push(now);
+            }
+            Op::GlobalGet(_) => self.stack.push(Abstract::Unknown),
+            Op::GlobalSet(_) => {
+                let _ = self.pop();
+            }
+            Op::I32Const(value) => self.stack.push(Abstract::Const(i64::from(*value))),
+            Op::I64Const(value) => self.stack.push(Abstract::Const(*value)),
+            Op::F32Const(_) | Op::F64Const(_) => self.stack.push(Abstract::Unknown),
+            Op::Load { kind, mem } => {
+                let address = self.pop();
+                self.record(position, true, load_width(*kind), mem.offset, address);
+                self.stack.push(Abstract::Unknown);
+            }
+            Op::Store { kind, mem } => {
+                let _value = self.pop();
+                let address = self.pop();
+                let width = match kind {
+                    StoreKind::I32Store8 | StoreKind::I64Store8 => 1,
+                    StoreKind::I32Store16 | StoreKind::I64Store16 => 2,
+                    StoreKind::I32 | StoreKind::F32 | StoreKind::I64Store32 => 4,
+                    StoreKind::I64 | StoreKind::F64 => 8,
+                };
+                self.record(position, false, width, mem.offset, address);
+            }
+            Op::MemorySize => self.stack.push(Abstract::Unknown),
+            Op::MemoryGrow => {
+                let _ = self.pop();
+                self.stack.push(Abstract::Unknown);
+            }
+            Op::MemoryCopy | Op::MemoryFill | Op::MemoryInit(_) => self.popn(3),
+            Op::Atomic { op: atomic, mem } => {
+                let (pops, pushes) = match atomic.kind {
+                    AtomicKind::Load => (1, 1),
+                    AtomicKind::Store => (2, 0),
+                    AtomicKind::Rmw(_) => (2, 1),
+                    AtomicKind::Cmpxchg => (3, 1),
+                    AtomicKind::Notify => (2, 1),
+                    AtomicKind::Wait => (3, 1),
+                };
+                // The address is the deepest operand, so it comes off last.
+                let mut operands = Vec::with_capacity(pops);
+                for _ in 0..pops {
+                    operands.push(self.pop());
+                }
+                let address = operands.pop().unwrap_or(Abstract::Unknown);
+                let load = !matches!(atomic.kind, AtomicKind::Store);
+                self.record(position, load, atomic.width, mem.offset, address);
+                for _ in 0..pushes {
+                    self.stack.push(Abstract::Unknown);
+                }
+            }
+            Op::Num(num) => {
+                let operands = num.operands().len();
+                let folded = self.fold(*num, operands);
+                self.popn(operands);
+                self.stack.push(folded);
+            }
+        }
+    }
+
+    /// `a + k` and `a - k`, which is all a base displacement is made of.
+    fn fold(&self, num: crate::ops::NumOp, operands: usize) -> Abstract {
+        use crate::ops::NumOp;
+        if operands != 2 || self.stack.len() < 2 {
+            return Abstract::Unknown;
+        }
+        let right = self.stack[self.stack.len() - 1];
+        let left = self.stack[self.stack.len() - 2];
+        match num {
+            NumOp::I32Add | NumOp::I64Add => match (left, right) {
+                (Abstract::Const(a), Abstract::Const(b)) => Abstract::Const(a.wrapping_add(b)),
+                (
+                    Abstract::Local {
+                        local,
+                        displacement,
+                    },
+                    Abstract::Const(b),
+                )
+                | (
+                    Abstract::Const(b),
+                    Abstract::Local {
+                        local,
+                        displacement,
+                    },
+                ) => Abstract::Local {
+                    local,
+                    displacement: displacement.wrapping_add(b),
+                },
+                _ => Abstract::Unknown,
+            },
+            NumOp::I32Sub | NumOp::I64Sub => match (left, right) {
+                (Abstract::Const(a), Abstract::Const(b)) => Abstract::Const(a.wrapping_sub(b)),
+                (
+                    Abstract::Local {
+                        local,
+                        displacement,
+                    },
+                    Abstract::Const(b),
+                ) => Abstract::Local {
+                    local,
+                    displacement: displacement.wrapping_sub(b),
+                },
+                _ => Abstract::Unknown,
+            },
+            _ => Abstract::Unknown,
+        }
+    }
+
+    fn assign(&mut self, index: u32, value: Abstract) {
+        self.wrote(index);
+        // Anything else that described itself in terms of this local described
+        // the *old* value, and is now stale. A chain kept across a reassignment
+        // is the one way this reports a confident wrong number.
+        for local in 0..self.locals.len() {
+            if local as u32 == index {
+                continue;
+            }
+            if matches!(self.locals[local], Abstract::Local { local: base, .. } if base == index) {
+                self.locals[local] = Abstract::Local {
+                    local: local as u32,
+                    displacement: 0,
+                };
+            }
+        }
+        // A local assigned from itself-plus-something keeps describing itself;
+        // one assigned from another local describes that one. And a local
+        // assigned something this cannot describe still describes *itself* —
+        // which is not a guess, it is what the local now holds, and it is what
+        // makes `frame = g0 - 1264` a base rather than a dead end. Almost every
+        // store in a C function goes through one of those.
+        let described = match value {
+            Abstract::Local { local, .. } if local == index => Abstract::Local {
+                local: index,
+                displacement: 0,
+            },
+            Abstract::Unknown => Abstract::Local {
+                local: index,
+                displacement: 0,
+            },
+            other => other,
+        };
+        if let Some(slot) = self.locals.get_mut(index as usize) {
+            *slot = described;
+        }
+    }
+
+    fn record(&mut self, position: usize, load: bool, width: u32, encoded: u64, address: Abstract) {
+        let address = match address {
+            Abstract::Local {
+                local,
+                displacement,
+            } => AddressOf::Local {
+                local,
+                displacement,
+            },
+            Abstract::Const(value) => AddressOf::Absolute(value),
+            Abstract::Unknown => AddressOf::Unknown,
+        };
+        self.found.push(Access {
+            func: self.index,
+            position,
+            file_offset: self.func.offsets.get(position).map(|(offset, _)| *offset),
+            load,
+            width,
+            encoded,
+            address,
+        });
+    }
+}
+
+fn load_width(kind: crate::module::LoadKind) -> u32 {
+    use crate::module::LoadKind;
+    match kind {
+        LoadKind::I32Load8S | LoadKind::I32Load8U | LoadKind::I64Load8S | LoadKind::I64Load8U => 1,
+        LoadKind::I32Load16S
+        | LoadKind::I32Load16U
+        | LoadKind::I64Load16S
+        | LoadKind::I64Load16U => 2,
+        LoadKind::I32 | LoadKind::F32 | LoadKind::I64Load32S | LoadKind::I64Load32U => 4,
+        LoadKind::I64 | LoadKind::F64 => 8,
+    }
 }
 
 #[cfg(test)]
@@ -2985,11 +3878,363 @@ mod tests {
     fn module_with_data(offset: i32, bytes: &[u8]) -> Module {
         Module {
             datas: vec![DataSegment {
+                file_offset: 0,
                 offset: Some(ConstExpr::I32(offset)),
                 bytes: bytes.to_vec(),
             }],
             ..Module::default()
         }
+    }
+
+    /// A one-function module: one i32 parameter, `locals` extra i32 locals.
+    fn module_with_body(locals: usize, body: Vec<Op>) -> Module {
+        Module {
+            types: vec![FuncType {
+                params: vec![ValType::I32],
+                results: Vec::new(),
+            }],
+            funcs: vec![Func {
+                type_index: 0,
+                locals: vec![ValType::I32; locals],
+                body,
+                offsets: Vec::new(),
+            }],
+            ..Module::default()
+        }
+    }
+
+    fn store8(offset: u64) -> Op {
+        Op::Store {
+            kind: crate::module::StoreKind::I32Store8,
+            mem: crate::module::MemArg { offset },
+        }
+    }
+
+    #[test]
+    fn a_store_through_a_displaced_base_reports_the_offset_it_never_encodes() {
+        // `l1 = p0 - 8; store8(l1 + 854)` writes p0 + 846, and 846 is nowhere
+        // in the instruction stream. This is the write a grep does not find.
+        let module = module_with_body(
+            1,
+            vec![
+                Op::LocalGet(0),
+                Op::I32Const(-8),
+                Op::Num(crate::ops::NumOp::I32Add),
+                Op::LocalSet(1),
+                Op::LocalGet(1),
+                Op::I32Const(9),
+                store8(854),
+                Op::End,
+            ],
+        );
+        let report = accesses_at(&module, 846, Some(1), Kind::Store, false);
+        assert_eq!(report.found.len(), 1, "{:?}", report.found);
+        assert_eq!(
+            report.found[0].address,
+            AddressOf::Local {
+                local: 0,
+                displacement: -8
+            }
+        );
+        assert_eq!(report.found[0].encoded, 854);
+        assert!(report.lost.is_empty());
+
+        // And the literal search finds it at 854 and not at 846, which is the
+        // whole difference.
+        assert!(
+            accesses_at(&module, 846, Some(1), Kind::Store, true)
+                .found
+                .is_empty()
+        );
+        assert_eq!(
+            accesses_at(&module, 854, Some(1), Kind::Store, true)
+                .found
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_local_that_cannot_be_described_still_describes_itself() {
+        // `frame = g0 - 1264` is the shadow stack, and almost every store in a
+        // C function goes through it. Treating the global as unknown and
+        // stopping there would lose all of them.
+        let module = Module {
+            globals: vec![GlobalDef {
+                ty: ValType::I32,
+                mutable: true,
+                init: ConstExpr::I32(0),
+            }],
+            ..module_with_body(
+                1,
+                vec![
+                    Op::GlobalGet(0),
+                    Op::I32Const(1264),
+                    Op::Num(crate::ops::NumOp::I32Sub),
+                    Op::LocalSet(1),
+                    Op::LocalGet(1),
+                    Op::I32Const(7),
+                    store8(846),
+                    Op::End,
+                ],
+            )
+        };
+        let report = accesses_at(&module, 846, Some(1), Kind::Store, false);
+        assert_eq!(report.found.len(), 1);
+        assert_eq!(
+            report.found[0].address,
+            AddressOf::Local {
+                local: 1,
+                displacement: 0
+            },
+            "the offset is relative to the frame, which is what a struct field is"
+        );
+    }
+
+    #[test]
+    fn a_chain_across_a_reassignment_is_dropped_rather_than_carried() {
+        // `l1 = p0 + 100; p0 = something else; store8(l1 + 46)` no longer
+        // writes p0 + 146 — p0 moved. Keeping the chain is the one way this
+        // reports a confident wrong number.
+        let module = module_with_body(
+            1,
+            vec![
+                Op::LocalGet(0),
+                Op::I32Const(100),
+                Op::Num(crate::ops::NumOp::I32Add),
+                Op::LocalSet(1),
+                Op::I32Const(4096),
+                Op::LocalSet(0),
+                Op::LocalGet(1),
+                Op::I32Const(7),
+                store8(46),
+                Op::End,
+            ],
+        );
+        assert!(
+            accesses_at(&module, 146, Some(1), Kind::Store, false)
+                .found
+                .is_empty(),
+            "p0 is not what it was"
+        );
+        // It is still found relative to the local it actually goes through.
+        let report = accesses_at(&module, 46, Some(1), Kind::Store, false);
+        assert_eq!(
+            report.found[0].address,
+            AddressOf::Local {
+                local: 1,
+                displacement: 0
+            }
+        );
+    }
+
+    #[test]
+    fn a_displacement_formed_inside_a_loop_does_not_cross_the_back_edge() {
+        // The walk is forward only, so a value carried round a loop is not
+        // something it can claim to know.
+        let module = module_with_body(
+            1,
+            vec![
+                Op::Loop(crate::module::BlockType::Empty),
+                Op::LocalGet(1),
+                Op::I32Const(7),
+                store8(846),
+                Op::LocalGet(0),
+                Op::I32Const(-8),
+                Op::Num(crate::ops::NumOp::I32Add),
+                Op::LocalSet(1),
+                Op::End,
+                Op::End,
+            ],
+        );
+        let report = accesses_at(&module, 846, Some(1), Kind::Store, false);
+        assert_eq!(report.found.len(), 1);
+        assert_eq!(
+            report.found[0].address,
+            AddressOf::Local {
+                local: 1,
+                displacement: 0
+            },
+            "not p0 - 8: that assignment happens after this read, and again before it"
+        );
+    }
+
+    #[test]
+    fn a_store_at_a_constant_address_is_not_a_field_of_anything() {
+        let module = module_with_body(
+            0,
+            vec![Op::I32Const(1024), Op::I32Const(7), store8(20), Op::End],
+        );
+        let report = accesses_at(&module, 1044, Some(1), Kind::Store, false);
+        assert_eq!(report.found.len(), 1);
+        assert_eq!(report.found[0].address, AddressOf::Absolute(1024));
+    }
+
+    #[test]
+    fn loads_and_stores_are_asked_for_separately() {
+        let module = module_with_body(
+            0,
+            vec![
+                Op::LocalGet(0),
+                Op::Load {
+                    kind: crate::module::LoadKind::I32,
+                    mem: crate::module::MemArg { offset: 20 },
+                },
+                Op::Drop,
+                Op::End,
+            ],
+        );
+        assert!(
+            accesses_at(&module, 20, Some(4), Kind::Store, false)
+                .found
+                .is_empty()
+        );
+        assert_eq!(
+            accesses_at(&module, 20, Some(4), Kind::Load, false)
+                .found
+                .len(),
+            1
+        );
+        assert_eq!(
+            accesses_at(&module, 20, Some(4), Kind::Both, false)
+                .found
+                .len(),
+            1
+        );
+        // The width matters: the same offset at another width is another field.
+        assert!(
+            accesses_at(&module, 20, Some(1), Kind::Load, false)
+                .found
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_data_image_says_which_segment_covers_an_address() {
+        let module = Module {
+            datas: vec![
+                DataSegment {
+                    file_offset: 100,
+                    offset: Some(ConstExpr::I32(1024)),
+                    bytes: vec![1, 2, 3, 4],
+                },
+                DataSegment {
+                    file_offset: 200,
+                    offset: Some(ConstExpr::I32(4096)),
+                    bytes: vec![9, 9],
+                },
+            ],
+            ..Module::default()
+        };
+        let image = DataImage::of(&module, &Default::default());
+        let found = image.locate(1026).expect("covered");
+        assert_eq!(found.segment, 0);
+        assert_eq!(found.offset, 2);
+        assert_eq!(found.address(), 1026);
+        // The file offset is the whole point: an address and an offset into the
+        // wasm file are different numbers, and recovering one from the other by
+        // subtracting a constant holds for one segment and not for the next.
+        assert_eq!(found.file_offset, 102);
+        assert!(found.active);
+        assert_eq!(image.locate(4097).map(|found| found.file_offset), Some(201));
+
+        // A gap is not an error; it is memory the module never initialises.
+        assert_eq!(image.locate(2048), None);
+        assert_eq!(image.extent(), Some((1024, 4098)));
+        assert_eq!(image.nearest_below(2048).map(|near| near.segment), Some(0));
+        // And a read that would span two segments is answered by neither: the
+        // bytes between them are not in the module at all.
+        assert_eq!(image.bytes(1026, 4), None);
+    }
+
+    #[test]
+    fn a_passive_segment_is_addressable_once_its_placement_is_known() {
+        let module = Module {
+            datas: vec![DataSegment {
+                file_offset: 42,
+                offset: None,
+                bytes: vec![7, 0, 0, 0],
+            }],
+            ..Module::default()
+        };
+        // Unplaced, a passive segment has no address at all.
+        let image = DataImage::of(&module, &Default::default());
+        assert!(!image.holds(2048));
+
+        let placements = [(
+            0u32,
+            Placement {
+                address: 2048,
+                offset: 0,
+                length: 4,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let image = DataImage::of(&module, &placements);
+        assert_eq!(image.read32(2048), Some(7));
+        let found = image.locate(2048).expect("placed");
+        assert!(
+            !found.active,
+            "placed by a memory.init, not by its own offset"
+        );
+        assert_eq!(found.file_offset, 42);
+    }
+
+    #[test]
+    fn find32_locates_a_word_no_instruction_ever_pushes() {
+        // A function pointer installed in a vtable is written by the linker,
+        // not by any code, so a search of the instructions finds nothing.
+        let module = module_with_data(1024, &[0, 0, 0, 0, 0x2f, 0x14, 0, 0]);
+        let image = DataImage::of(&module, &Default::default());
+        let found = image.find32(5167);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].address(), 1028);
+    }
+
+    #[test]
+    fn a_pointer_table_stops_where_it_stops_looking_like_one() {
+        let table: std::collections::BTreeMap<u32, u32> =
+            [(1u32, 10u32), (2, 20), (3, 30)].into_iter().collect();
+        let mut bytes = Vec::new();
+        for word in [1i32, 2, 0, 0, 3, -1, 1] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        let module = module_with_data(1024, &bytes);
+        let image = DataImage::of(&module, &Default::default());
+
+        // The nulls in the middle are pure virtuals — a real entry follows
+        // them. The -1 is not a table index, and it ends the table; the 1 after
+        // it belongs to whatever comes next.
+        let slots = pointer_table(&image, &table, 1024, None);
+        assert_eq!(
+            slots,
+            vec![Some(10), Some(20), None, None, Some(30)],
+            "a null slot is kept, so the numbering after it stays right"
+        );
+
+        // An explicit count reads what was asked for, whatever is there.
+        let slots = pointer_table(&image, &table, 1024, Some(7));
+        assert_eq!(slots.len(), 7);
+        assert_eq!(slots[5], None, "-1 is not a table index");
+    }
+
+    #[test]
+    fn a_run_of_nulls_that_nothing_follows_is_the_end_of_the_table() {
+        // The case that matters: two vtables laid out next to each other. The
+        // second one's `{0, type_info}` header would read as a null slot and a
+        // huge word — and following it would report the next class's methods as
+        // this one's.
+        let table: std::collections::BTreeMap<u32, u32> =
+            [(1u32, 10u32), (2, 20)].into_iter().collect();
+        let mut bytes = Vec::new();
+        for word in [1i32, 0, 999_999, 2] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        let module = module_with_data(1024, &bytes);
+        let image = DataImage::of(&module, &Default::default());
+        let slots = pointer_table(&image, &table, 1024, None);
+        assert_eq!(slots, vec![Some(10)], "the next object is not this table");
     }
 
     #[test]
@@ -3938,6 +5183,7 @@ mod tests {
         // Both belong to it alone; the longer identifier says more.
         let module = Module {
             datas: vec![DataSegment {
+                file_offset: 0,
                 offset: Some(ConstExpr::I32(0)),
                 bytes: b"short_one: x\0handle_incoming_signalling_offer: y\0".to_vec(),
             }],
@@ -3963,14 +5209,17 @@ mod tests {
         let module = Module {
             datas: vec![
                 DataSegment {
+                    file_offset: 0,
                     offset: Some(ConstExpr::GlobalGet(0)),
                     bytes: vec![1, 2, 3, 4],
                 },
                 DataSegment {
+                    file_offset: 0,
                     offset: None,
                     bytes: vec![5, 6, 7, 8],
                 },
                 DataSegment {
+                    file_offset: 0,
                     offset: Some(ConstExpr::I32(4096)),
                     bytes: vec![9, 0, 0, 0],
                 },
@@ -3990,6 +5239,7 @@ mod tests {
         // here — so nothing in that segment resolves.
         let module = Module {
             datas: vec![DataSegment {
+                file_offset: 0,
                 offset: Some(ConstExpr::GlobalGet(0)),
                 bytes: b"unreachable_text\0".to_vec(),
             }],
@@ -4034,6 +5284,7 @@ mod tests {
                 },
             ],
             datas: vec![DataSegment {
+                file_offset: 0,
                 offset: Some(ConstExpr::I32(0)),
                 bytes: b"registered_name\0".to_vec(),
             }],
@@ -4140,6 +5391,7 @@ mod tests {
         // somewhere, so they cannot answer this question.
         let module = Module {
             datas: vec![DataSegment {
+                file_offset: 0,
                 offset: None,
                 bytes: b"hello\0".to_vec(),
             }],
