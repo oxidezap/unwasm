@@ -1848,18 +1848,22 @@ fn stores(arguments: &[String]) -> Result<String, String> {
             Some(frame) if frame.base_local == local => "frame".to_string(),
             _ => format!("l{local}"),
         };
+        // The effective offset rather than the one asked for: under --exact the
+        // two are not the same number, and printing the request back would say
+        // a write lands somewhere it does not.
+        let effective = access.effective();
         let (where_, note) = match access.address {
             unwasm_core::analysis::AddressOf::Local {
                 local,
                 displacement: 0,
-            } => (format!("{}+{offset}", base_name(local)), String::new()),
+            } => (format!("{}+{effective}", base_name(local)), String::new()),
             unwasm_core::analysis::AddressOf::Local {
                 local,
                 displacement,
             } => {
                 through_a_base += 1;
                 (
-                    format!("{}+{offset}", base_name(local)),
+                    format!("{}+{effective}", base_name(local)),
                     format!(
                         "  through a base at {}{}{}, so the instruction encodes {}",
                         base_name(local),
@@ -1869,8 +1873,8 @@ fn stores(arguments: &[String]) -> Result<String, String> {
                     ),
                 )
             }
-            unwasm_core::analysis::AddressOf::Absolute(base) => (
-                format!("{}", base + access.encoded as i64),
+            unwasm_core::analysis::AddressOf::Absolute(_) => (
+                format!("{effective}"),
                 "  a constant address, not a field of anything".to_string(),
             ),
             unwasm_core::analysis::AddressOf::Unknown => (
@@ -1923,8 +1927,10 @@ fn stores(arguments: &[String]) -> Result<String, String> {
     } else {
         // The next command, spelled out: a list of indices is not an answer
         // until something reads them.
-        let mut indices: Vec<String> = found.iter().map(|access| access.func.to_string()).collect();
-        indices.dedup();
+        let mut functions: Vec<u32> = found.iter().map(|access| access.func).collect();
+        functions.sort_unstable();
+        functions.dedup();
+        let indices: Vec<String> = functions.iter().map(u32::to_string).collect();
         format!(
             "\nRead {}: unwasm decompile {path} --only {} --bare\n",
             if indices.len() == 1 { "it" } else { "them" },
@@ -2097,7 +2103,7 @@ word that is neither zero nor a live table index.",
         "stores",
         "\
 usage: unwasm stores <module.wasm> --offset <n> [--size 1|2|4|8]
-                     [--kind store|load|both] [--exact]
+                     [--kind store|load|both] [--loads] [--exact]
 
 Every function that writes (or reads) a constant offset. The question is \"who
 writes byte +846 of this struct\", and the answer used to be decompiling
