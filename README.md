@@ -14,6 +14,45 @@ rather than asserted.** Every test below runs the same calls twice — once on t
 wasm module in V8, once on the generated Rust — and compares the returned value,
 the trap, and the final contents of linear memory.
 
+## Two halves, and why they do not share a host
+
+This repository holds two ways of running the same captured module:
+
+| | what it does | crates |
+| --- | --- | --- |
+| **unwasm** | decompiles wasm to Rust and runs *that* | `unwasm-core`, `unwasm-cli` |
+| **oracle** | runs the original `.wasm` under wasmtime | `oracle-core`, `oracle-cli` |
+
+Both implement WASI, the C++ runtime, emscripten's runtime and threads, and
+**neither shares a line of that with the other**. Merging them would remove
+about 4,700 lines and destroy the property they exist for: two implementations
+that share lineage agree on their shared defects, so a third opinion only helps
+when it shares no ancestry. The argument is RFC-0005 of the sibling
+`wa-codegen-research`; the `Cargo.toml` here carries it in full.
+
+What they *do* share is one capture set, one lock, and one small piece of code —
+`oracle carry`, which finds a function again after WhatsApp renumbers
+everything. That one is the reason co-location pays:
+
+```console
+$ oracle carry D5pLH9sfOOl JgwtTQVeWPm 13445 11198
+D5pLH9sfOOl (13347 functions) -> JgwtTQVeWPm (14733): 6561 carry one-to-one
+  13445 -> 14839
+  11198 -> changed; no mechanical route, re-derive it
+```
+
+Everything else that looks like duplication was measured before being left
+alone. `oracle inspect` streams a module without building its bodies and answers
+in **under 10 ms**; `unwasm`'s `Module::parse` builds the whole instruction
+model and costs **~300 ms**. Sharing the decoder is the obvious de-duplication
+and the one to refuse — which is why the inspection, call-graph and xref paths
+stay separate. `carry` is the exception because it is asked once per capture
+bump rather than once per question.
+
+`cargo build -p unwasm-cli` still resolves **4 packages**. The decompiler's
+single dependency survived the merge, and must: a decompiler whose output needs
+a runtime to link against is not self-contained.
+
 ## Why another one
 
 The field, as of July 2026:
@@ -733,6 +772,67 @@ $ unwasm decompile module.wasm -o out/ --reachable-from 10425 --direct-only
 $ unwasm signatures reference.wasm -o libc.sigs   # a catalogue, from a build with names
 $ unwasm decompile module.wasm --signatures libc.sigs
 ```
+
+Every command takes the module first and its flags after it, and every one
+answers `--help` on its own.
+
+### Reading the module's memory rather than its file
+
+```console
+$ unwasm data module.wasm 0x103564 48      # guest memory at an address
+$ unwasm vtable module.wasm 0x103564       # that address read as a vtable
+$ unwasm vtable module.wasm --class N6webrtc20ResidualEchoDetectorE
+$ unwasm stores module.wasm --offset 846 --size 1   # who writes that field
+$ unwasm constants module.wasm 5103 --data # and where the data holds it
+```
+
+`bytes` takes an offset into the wasm *file*. `data` takes an address in the
+*guest*, which is a different number: the segment that covers it decides the
+mapping, and a threaded module's segments are passive and carry no address at
+all until the `memory.init` calls have been resolved. `data` says which segment
+covers the address, the file offset of the byte — the number `bytes` and `patch`
+take — the hex, and the words as u32 with the strings they point at. An address
+no segment covers is not an error; it is memory the module never initialises,
+and it reads as zero at run time.
+
+`vtable` reads the same bytes as a table of function pointers: table index,
+function, signature. **A slot holding 0 is a pure virtual function**, and a
+`call_indirect` reaching one takes table index 0, mismatches its signature and
+traps — which kills the thread rather than returning an error anybody catches.
+From the outside that looks like the engine dying for no reason; here it is one
+line. The read stops at the first word that is neither a live table index nor a
+null run a live index follows, so it does not report the next object's bytes as
+methods. `--class` takes a name `classes` printed and finds the address itself.
+`classes --methods` counts the same slots, nulls included.
+
+`stores` answers "who writes byte +846 of this struct". It follows the constant
+displacements a function applies to its own parameters and locals, so a field
+written through `base = p - 8` as `+854` is still found at 846 — a grep of
+decompiled output finds neither the number nor the write. `--exact` is the
+literal search, `--kind load|store|both` picks the direction, and functions
+whose operand stack the walk lost are named rather than silently skipped.
+
+`constants <n> --data` lists every address in the data segments holding those
+four bytes, marking the four-byte-aligned ones. A function pointer installed in
+a vtable is written by the linker and pushed by no instruction, so a search of
+the code finds nothing at all.
+
+### Reading three functions out of fifteen thousand
+
+```console
+$ unwasm decompile module.wasm --only 7497 --bare    # just that function
+$ unwasm decompile module.wasm --only 7497,7493 --spans
+index   name                                     file        first    last
+7493    f7493_webrtc_v2_aecm_create              mod.rs      167903   168708
+7497    f7497                                    mod.rs      168750   168859
+```
+
+`--only` on its own keeps the other fifteen thousand as stubs so the result
+compiles. `--bare` drops them, and the runtime and the imports with them: the
+result does not compile and is a hundred lines instead of a million. `--spans`
+prints where each function starts and ends in the file that would be written,
+which is what a slice needs — searching for the next `fn f<n>` stops at the
+wrong closing brace, and a truncated body reads as a complete one.
 
 The output is a self-contained Rust module — no dependencies, runtime embedded:
 

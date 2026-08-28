@@ -351,6 +351,14 @@ pub struct DataSegment {
     pub offset: Option<ConstExpr>,
     /// The bytes.
     pub bytes: Vec<u8>,
+    /// Where the bytes start in the wasm file.
+    ///
+    /// An address in the guest and an offset in the file are different numbers,
+    /// and recovering one from the other by hand — subtracting a constant that
+    /// happens to hold for one segment — is how a read lands past the end of
+    /// the file. The decoder already knows this; carrying it is four bytes a
+    /// segment.
+    pub file_offset: u32,
 }
 
 /// An element segment: the function table's contents.
@@ -561,9 +569,14 @@ impl Module {
                             }
                             wasmparser::DataKind::Passive => None,
                         };
+                        // wasmparser gives the record's range; the bytes are
+                        // its tail, after the kind and the length.
+                        let file_offset =
+                            u32::try_from(data.range.end - data.data.len()).unwrap_or(0);
                         module.datas.push(DataSegment {
                             offset,
                             bytes: data.data.to_vec(),
+                            file_offset,
                         });
                     }
                 }

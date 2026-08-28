@@ -15,7 +15,8 @@ unwasm — a WebAssembly decompiler whose output compiles
 
 usage:
   unwasm decompile <module.wasm> [-o <out>] [--level <n>] [--split <n>]
-                   [--only <indices>] [--reachable-from <indices>]
+                   [--only <indices>] [--bare] [--spans]
+                   [--reachable-from <indices>]
                    [--signatures <file>] [--stub-recognised]
                    [--instrument-stores] [--offsets]
   unwasm host      <module.wasm> [-o <host.rs>] [--defaults]
@@ -24,10 +25,16 @@ usage:
   unwasm signatures <module.wasm> [-o <sigs.txt>]
   unwasm classes   <module.wasm> [--methods]
   unwasm frames    <module.wasm> [--outside]
+  unwasm data      <module.wasm> <address> [<length>]
+  unwasm vtable    <module.wasm> <address|--class <name>> [--slots <n>]
+  unwasm stores    <module.wasm> --offset <n> [--size <n>] [--kind <k>]
   unwasm bytes     <module.wasm> <offset> <length>
-  unwasm constants <module.wasm> <value>
+  unwasm constants <module.wasm> <value> [--data]
   unwasm patch     <module.wasm> <offset> <value> -o <patched.wasm>
   unwasm inspect   <module.wasm>
+
+Every command takes the module first and its flags after it, and every one
+answers `--help` on its own.
 
   -o <out>       a path ending in .rs writes one file; any other path is a
                  directory, written as mod.rs plus part0.rs, part1.rs, …
@@ -81,6 +88,20 @@ for, its name as the compiler mangled it, and the functions its vtable holds.
 That is a declaration rather than an inference — the ABI writes both down — and
 it is what `decompile --level 2` names functions after. `--methods` lists the
 vtable slot by slot.
+
+`data` reads guest memory at an address rather than an offset into the file:
+which segment covers it, the file offset of the byte, the hex, and the words as
+u32 with the strings they point at. An address no segment covers reads as zero
+at run time, and it says so.
+
+`vtable` reads a C++ vtable slot by slot: table index, function, signature —
+and marks the slots holding 0, which are pure virtual. A `call_indirect` on one
+of those reaches table slot 0, mismatches its signature and traps, which from
+the outside looks like the engine dying for no reason.
+
+`stores` answers \"who writes offset N of this struct\", following the constant
+displacements a function applies to its own parameters so a field at +846
+written through `p - 8` as +854 is still found.
 
 `constants` finds every site that pushes a value, with the file offset and the
 encoded length of each — all of them, which a hand-counted subset is not. An
@@ -151,6 +172,9 @@ fn run(arguments: &[String]) -> Result<String, String> {
         Some("classes") => classes(&arguments[1..]),
         Some("frames") => frames(&arguments[1..]),
         Some("bytes") => bytes(&arguments[1..]),
+        Some("data") => data(&arguments[1..]),
+        Some("vtable") => vtable(&arguments[1..]),
+        Some("stores") => stores(&arguments[1..]),
         Some("patch") => patch(&arguments[1..]),
         Some("constants") => constants(&arguments[1..]),
         Some("inspect") => inspect(&arguments[1..]),
@@ -160,19 +184,24 @@ fn run(arguments: &[String]) -> Result<String, String> {
 }
 
 fn decompile(arguments: &[String]) -> Result<String, String> {
-    let path = arguments.first().ok_or("decompile needs a module path")?;
+    if wants_help(arguments) {
+        return help_for("decompile");
+    }
+    let (path, rest_args) = positional(arguments, "decompile")?;
     let mut destination = None;
     let mut split = None;
     let mut only: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let mut catalogue: Option<codegen::Signatures> = None;
     let mut with_callees = false;
+    let mut bare = false;
+    let mut spans = false;
     let mut reachable_from: Vec<u32> = Vec::new();
     let mut direct_only = false;
     let mut instrument = false;
     let mut stub_recognised = false;
     let mut level = 0u8;
     let mut map_offsets = false;
-    let mut rest = arguments[1..].iter();
+    let mut rest = rest_args.iter();
     while let Some(argument) = rest.next() {
         match argument.as_str() {
             "-o" | "--output" => {
@@ -191,6 +220,8 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
                 catalogue = Some(read_signatures(value)?);
             }
             "--with-callees" => with_callees = true,
+            "--bare" => bare = true,
+            "--spans" => spans = true,
             "--direct-only" => direct_only = true,
             "--reachable-from" => {
                 let value = rest
@@ -237,7 +268,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
                     return Err("--only needs at least one index".to_string());
                 }
             }
-            other => return Err(format!("unexpected argument `{other}`")),
+            other => return Err(unexpected("decompile", other)),
         }
     }
 
@@ -303,6 +334,106 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
         0
     };
 
+    // `--bare` is meaningless without a selection: it *is* the selection,
+    // emitted alone, and without one it would print the whole module with the
+    // scaffolding removed — which is neither readable nor runnable.
+    if bare && only.is_empty() {
+        return Err(
+            "--bare emits only the functions asked for, so it needs --only or --reachable-from"
+                .to_string(),
+        );
+    }
+    if bare && map_offsets {
+        return Err(
+            "--offsets maps a file this does not write; drop --bare or --offsets".to_string(),
+        );
+    }
+
+    // The spans of what would be written, so a slice of it can be cut exactly.
+    // Grepping for the next `fn f<n>` is how a body gets truncated at the wrong
+    // closing brace, and a truncated body reads as a complete one.
+    if spans {
+        let files = codegen::generate_options(
+            &module,
+            &codegen::Options {
+                layout: match (&destination, split) {
+                    (Some(path), None) if path.ends_with(".rs") => codegen::Layout::Single,
+                    (None, None) => codegen::Layout::Single,
+                    (_, Some(lines_per_file)) => codegen::Layout::Split { lines_per_file },
+                    (Some(_), None) => codegen::Layout::for_module(&module),
+                },
+                only: (!only.is_empty()).then(|| only.clone()),
+                signatures: catalogue.clone().unwrap_or_default(),
+                instrument_stores: instrument,
+                map_offsets: false,
+                stub_recognised,
+                promote_frames: level >= 1,
+                name_classes: level >= 2,
+                bare,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let index = files
+            .iter()
+            .find(|file| file.name == "names.json")
+            .ok_or("the generator wrote no index")?;
+        let mut out = String::from(
+            "index   name                                     file        first    last\n",
+        );
+        for line in index.contents.lines() {
+            let field = |key: &str| -> Option<String> {
+                let at = line.find(&format!("\"{key}\": "))? + key.len() + 4;
+                let rest = &line[at..];
+                let end = rest.find([',', '}'])?;
+                Some(rest[..end].trim().trim_matches('"').to_string())
+            };
+            let (Some(index), Some(name), Some(file), Some(first), Some(last)) = (
+                field("index"),
+                field("name"),
+                field("file"),
+                field("line"),
+                field("last_line"),
+            ) else {
+                continue;
+            };
+            // Only what was asked for: the stubs have spans too, and fifteen
+            // thousand of them is the problem this is here to solve.
+            if let Ok(number) = index.parse::<u32>()
+                && !only.is_empty()
+                && !only.contains(&number)
+            {
+                continue;
+            }
+            // The generator calls its single file `mod.rs`; a reader slicing
+            // one wants the name they asked for.
+            let file = match (&destination, split) {
+                (Some(path), None) if path.ends_with(".rs") && file == "mod.rs" => path.clone(),
+                _ => file,
+            };
+            let _ = writeln!(out, "{index:<7} {name:<40} {file:<11} {first:<8} {last}");
+        }
+        // Written as well, when a destination was given: the spans describe a
+        // file, and a file nobody wrote is spans of nothing.
+        if let Some(destination) = &destination {
+            let single = destination.ends_with(".rs") && split.is_none();
+            if single {
+                std::fs::write(destination, &files[0].contents)
+                    .map_err(|error| format!("writing {destination}: {error}"))?;
+            } else {
+                let directory = Path::new(destination);
+                std::fs::create_dir_all(directory)
+                    .map_err(|error| format!("creating {destination}: {error}"))?;
+                for file in &files {
+                    let at = directory.join(&file.name);
+                    std::fs::write(&at, &file.contents)
+                        .map_err(|error| format!("writing {}: {error}", at.display()))?;
+                }
+            }
+            let _ = writeln!(out, "\nwrote {destination}");
+        }
+        return Ok(out);
+    }
+
     let Some(destination) = destination else {
         if split.is_some() {
             return Err("--split writes several files, so it needs -o <directory>".to_string());
@@ -313,7 +444,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
                     .to_string(),
             );
         }
-        if only.is_empty() && catalogue.is_none() && !instrument && level == 0 {
+        if only.is_empty() && catalogue.is_none() && !instrument && level == 0 && !bare {
             return codegen::generate(&module).map_err(|error| error.to_string());
         }
         let files = codegen::generate_options(
@@ -327,6 +458,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
                 stub_recognised,
                 promote_frames: level >= 1,
                 name_classes: level >= 2,
+                bare,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -357,6 +489,7 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
             stub_recognised,
             promote_frames: level >= 1,
             name_classes: level >= 2,
+            bare,
         },
     )
     .map_err(|error| error.to_string())?;
@@ -411,10 +544,13 @@ fn decompile(arguments: &[String]) -> Result<String, String> {
 }
 
 fn host(arguments: &[String]) -> Result<String, String> {
+    if wants_help(arguments) {
+        return help_for("host");
+    }
     let mut defaults = false;
-    let path = arguments.first().ok_or("host needs a module path")?;
+    let (path, rest_args) = positional(arguments, "host")?;
     let mut destination = None;
-    let mut rest = arguments[1..].iter();
+    let mut rest = rest_args.iter();
     while let Some(argument) = rest.next() {
         match argument.as_str() {
             "-o" | "--output" => {
@@ -459,7 +595,10 @@ fn host(arguments: &[String]) -> Result<String, String> {
 /// Same length or nothing: a shorter or longer encoding would move every byte
 /// after it, and every offset anybody had written down with it.
 fn patch(arguments: &[String]) -> Result<String, String> {
-    let path = arguments.first().ok_or("patch needs a module path")?;
+    if wants_help(arguments) {
+        return help_for("patch");
+    }
+    let (path, rest_args) = positional(arguments, "patch")?;
     let offset: usize = arguments
         .get(1)
         .ok_or("patch needs the offset of the instruction")?
@@ -471,7 +610,7 @@ fn patch(arguments: &[String]) -> Result<String, String> {
         .parse()
         .map_err(|_| "the value must be a number".to_string())?;
     let mut destination = None;
-    let mut rest = arguments[3..].iter();
+    let mut rest = rest_args[2..].iter();
     while let Some(argument) = rest.next() {
         match argument.as_str() {
             "-o" | "--output" => {
@@ -561,14 +700,21 @@ fn signed_leb(mut value: i64) -> Vec<u8> {
 /// the offset of each and the number of bytes it occupies — a replacement of
 /// the same encoded length moves nothing else in the module.
 fn constants(arguments: &[String]) -> Result<String, String> {
-    let path = arguments.first().ok_or("constants needs a module path")?;
+    if wants_help(arguments) {
+        return help_for("constants");
+    }
+    let (path, rest_args) = positional(arguments, "constants")?;
     let value: i64 = arguments
         .get(1)
         .ok_or("constants needs a value")?
         .parse()
         .map_err(|_| "the value must be a number".to_string())?;
-    if let Some(extra) = arguments.get(2) {
-        return Err(format!("unexpected argument `{extra}`"));
+    let mut in_data = false;
+    for extra in &rest_args[1..] {
+        match extra.as_str() {
+            "--data" => in_data = true,
+            other => return Err(unexpected("constants", other)),
+        }
     }
 
     let module = read(path)?;
@@ -600,30 +746,64 @@ fn constants(arguments: &[String]) -> Result<String, String> {
 
     // The same number can sit in the data as well, which is why counting
     // occurrences of its bytes is not the same as counting the sites that
-    // push it.
-    let bytes = (value as i32).to_le_bytes();
-    let in_data: usize = module
-        .datas
+    // push it — and why a function pointer installed in a vtable is invisible
+    // to a search of the code. Nothing ever pushes it; a data segment holds it.
+    let image = unwasm_core::analysis::DataImage::of(&module, &analysis.placements);
+    let holders = image.find32(value as i32);
+
+    // A word in a table is four-byte aligned. An unaligned match is four bytes
+    // of something else that happen to read as this number, and on a 10 MiB
+    // module there are always a few — which is why they are marked rather than
+    // listed as if they were the same kind of thing.
+    let aligned = holders
         .iter()
-        .map(|segment| {
-            segment
-                .bytes
-                .windows(4)
-                .filter(|window| *window == bytes)
-                .count()
-        })
-        .sum();
+        .filter(|held| held.address().is_multiple_of(4))
+        .count();
+    if in_data && !holders.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nand at {} address{} in the data, which no instruction pushes ({aligned} \
+             four-byte aligned):",
+            holders.len(),
+            if holders.len() == 1 { "" } else { "es" }
+        );
+        for held in holders.iter().take(200) {
+            let at = held.address();
+            let _ = writeln!(
+                out,
+                "  {} segment #{:<4} file {:<10} {}",
+                hex_addr(at as i32),
+                held.segment,
+                held.file_offset,
+                if at.is_multiple_of(4) {
+                    format!("aligned — `unwasm data {at} 32` or `unwasm vtable {at}` reads it")
+                } else {
+                    "not aligned: four bytes of something else that read as this".to_string()
+                }
+            );
+        }
+        if holders.len() > 200 {
+            let _ = writeln!(out, "  … and {} more", holders.len() - 200);
+        }
+    }
 
     Ok(format!(
         "{out}\n{sites} site{} push {value}{}\n",
         if sites == 1 { "" } else { "s" },
-        if in_data > 0 {
-            format!(
-                ", and its four bytes appear {in_data} more time{} inside the data segments",
-                if in_data == 1 { "" } else { "s" }
-            )
-        } else {
+        if holders.is_empty() {
             String::new()
+        } else {
+            format!(
+                ", and its four bytes sit at {} address{} inside the data segments \
+                 ({aligned} aligned){}",
+                holders.len(),
+                if holders.len() == 1 { "" } else { "es" },
+                if in_data {
+                    ""
+                } else {
+                    " — `--data` lists them"
+                }
+            )
         }
     ))
 }
@@ -634,7 +814,10 @@ fn constants(arguments: &[String]) -> Result<String, String> {
 /// answered by computing LEB encodings by hand: what is actually there, and
 /// will the pattern I am about to search for match one place or forty.
 fn bytes(arguments: &[String]) -> Result<String, String> {
-    let path = arguments.first().ok_or("bytes needs a module path")?;
+    if wants_help(arguments) {
+        return help_for("bytes");
+    }
+    let (path, rest_args) = positional(arguments, "bytes")?;
     let offset: usize = arguments
         .get(1)
         .ok_or("bytes needs an offset")?
@@ -645,7 +828,7 @@ fn bytes(arguments: &[String]) -> Result<String, String> {
         .ok_or("bytes needs a length")?
         .parse()
         .map_err(|_| "the length must be a number".to_string())?;
-    if let Some(extra) = arguments.get(3) {
+    if let Some(extra) = rest_args.get(2) {
         return Err(format!("unexpected argument `{extra}`"));
     }
 
@@ -687,9 +870,12 @@ fn bytes(arguments: &[String]) -> Result<String, String> {
 
 /// `classes`: what the C++ ABI wrote down about the module's own types.
 fn classes(arguments: &[String]) -> Result<String, String> {
-    let path = arguments.first().ok_or("classes needs a module path")?;
+    if wants_help(arguments) {
+        return help_for("classes");
+    }
+    let (path, rest_args) = positional(arguments, "classes")?;
     let mut methods = false;
-    for argument in &arguments[1..] {
+    for argument in rest_args {
         match argument.as_str() {
             "--methods" => methods = true,
             other => return Err(format!("unexpected argument `{other}`")),
@@ -728,7 +914,19 @@ fn classes(arguments: &[String]) -> Result<String, String> {
             "  {:<60} {}",
             class.name,
             match class.vtable {
-                Some(at) => format!("vtable {at:#x}, {} methods", class.methods.len()),
+                Some(at) => {
+                    let nulls = class.methods.iter().filter(|slot| slot.is_none()).count();
+                    format!(
+                        "vtable {at:#x}, {} slots, {} methods{}",
+                        class.methods.len(),
+                        class.methods.len() - nulls,
+                        if nulls == 0 {
+                            String::new()
+                        } else {
+                            format!(", {nulls} pure virtual")
+                        }
+                    )
+                }
                 None => "no vtable".to_string(),
             }
         );
@@ -744,7 +942,12 @@ fn classes(arguments: &[String]) -> Result<String, String> {
         }
         if methods {
             for (slot, func) in class.methods.iter().enumerate() {
-                let _ = writeln!(out, "      slot {slot:<3} f{func}");
+                let _ = match func {
+                    Some(func) => writeln!(out, "      slot {slot:<3} f{func}"),
+                    // A zero here is a pure virtual, and `unwasm vtable` says
+                    // what calling one does.
+                    None => writeln!(out, "      slot {slot:<3} 0 — pure virtual"),
+                };
             }
         }
     }
@@ -752,9 +955,12 @@ fn classes(arguments: &[String]) -> Result<String, String> {
 }
 
 fn frames(arguments: &[String]) -> Result<String, String> {
-    let path = arguments.first().ok_or("frames needs a module path")?;
+    if wants_help(arguments) {
+        return help_for("frames");
+    }
+    let (path, rest_args) = positional(arguments, "frames")?;
     let mut only_outside = false;
-    for argument in &arguments[1..] {
+    for argument in rest_args {
         match argument.as_str() {
             "--outside" => only_outside = true,
             other => return Err(format!("unexpected argument `{other}`")),
@@ -806,9 +1012,12 @@ fn frames(arguments: &[String]) -> Result<String, String> {
 }
 
 fn signatures(arguments: &[String]) -> Result<String, String> {
-    let path = arguments.first().ok_or("signatures needs a module path")?;
+    if wants_help(arguments) {
+        return help_for("signatures");
+    }
+    let (path, rest_args) = positional(arguments, "signatures")?;
     let mut destination = None;
-    let mut rest = arguments[1..].iter();
+    let mut rest = rest_args.iter();
     while let Some(argument) = rest.next() {
         match argument.as_str() {
             "-o" | "--output" => {
@@ -865,13 +1074,16 @@ fn read_signatures(path: &str) -> Result<codegen::Signatures, String> {
 }
 
 fn calls(arguments: &[String]) -> Result<String, String> {
-    let path = arguments.first().ok_or("calls needs a module path")?;
+    if wants_help(arguments) {
+        return help_for("calls");
+    }
+    let (path, rest_args) = positional(arguments, "calls")?;
     let index = arguments
         .get(1)
         .ok_or("calls needs a function index")?
         .parse::<u32>()
         .map_err(|_| "calls takes a function index".to_string())?;
-    if let Some(extra) = arguments.get(2) {
+    if let Some(extra) = rest_args.get(1) {
         return Err(format!("unexpected argument `{extra}`"));
     }
 
@@ -957,9 +1169,12 @@ fn calls(arguments: &[String]) -> Result<String, String> {
 }
 
 fn table(arguments: &[String]) -> Result<String, String> {
-    let path = arguments.first().ok_or("table needs a module path")?;
+    if wants_help(arguments) {
+        return help_for("table");
+    }
+    let (path, rest_args) = positional(arguments, "table")?;
     let mut wanted = None;
-    let mut rest = arguments[1..].iter();
+    let mut rest = rest_args.iter();
     while let Some(argument) = rest.next() {
         match argument.as_str() {
             "--type" => wanted = Some(rest.next().ok_or("--type needs a signature")?.clone()),
@@ -1014,7 +1229,13 @@ fn table(arguments: &[String]) -> Result<String, String> {
 }
 
 fn inspect(arguments: &[String]) -> Result<String, String> {
-    let path = arguments.first().ok_or("inspect needs a module path")?;
+    if wants_help(arguments) {
+        return help_for("inspect");
+    }
+    let (path, rest_args) = positional(arguments, "inspect")?;
+    if let Some(extra) = rest_args.first() {
+        return Err(unexpected("inspect", extra));
+    }
     let module = read(path)?;
     let mut out = String::new();
     out.push_str(&format!(
@@ -1122,6 +1343,876 @@ fn inspect(arguments: &[String]) -> Result<String, String> {
         ));
     }
     Ok(out)
+}
+
+/// Parses a number that may be hexadecimal, decimal, or underscored.
+///
+/// An address written down in a debugger is `0x103564`; one measured at run
+/// time is `1_324_800`. Making the reader convert between them is the step at
+/// which the wrong number gets typed.
+fn number(text: &str, what: &str) -> Result<i64, String> {
+    let tidy: String = text.chars().filter(|ch| *ch != '_').collect();
+    let (body, radix) = match tidy.strip_prefix("0x").or_else(|| tidy.strip_prefix("0X")) {
+        Some(rest) => (rest, 16),
+        None => (tidy.as_str(), 10),
+    };
+    i64::from_str_radix(body, radix)
+        .map_err(|_| format!("{what} takes a number, decimal or 0x-prefixed, not `{text}`"))
+}
+
+/// Guest memory at an address, as the module's data segments leave it.
+///
+/// The question `bytes` cannot answer. `bytes` takes an offset into the *file*,
+/// and turning a guest address into one means knowing which segment covers it
+/// and where that segment's bytes start — a subtraction that holds for one
+/// segment and silently lands somewhere else for the next. A threaded module
+/// makes it worse: its segments are passive and carry no address at all, so the
+/// mapping only exists once the `memory.init` calls have been resolved.
+///
+/// An address no segment covers is not an error. It is memory the module never
+/// initialises, and it reads as zero at run time — which is an answer, and
+/// often the answer being looked for.
+fn data(arguments: &[String]) -> Result<String, String> {
+    if wants_help(arguments) {
+        return help_for("data");
+    }
+    let (path, rest) = positional(arguments, "data")?;
+    let address = number(
+        rest.first()
+            .ok_or("data needs an address in guest memory")?,
+        "the address",
+    )? as i32;
+    let length = match rest.get(1) {
+        Some(text) => number(text, "the length")?,
+        None => 32,
+    };
+    let length = usize::try_from(length).map_err(|_| "the length must not be negative")?;
+    if let Some(extra) = rest.get(2) {
+        return Err(format!("unexpected argument `{extra}`"));
+    }
+
+    let module = read(path)?;
+    let analysis = unwasm_core::analysis::analyse(&module);
+    let image = unwasm_core::analysis::DataImage::of(&module, &analysis.placements);
+    Ok(dump(&image, address, length))
+}
+
+/// The body of `data`, so `vtable` can print the same block.
+fn dump(image: &unwasm_core::analysis::DataImage<'_>, address: i32, length: usize) -> String {
+    let mut out = String::new();
+    let Some(located) = image.locate(address) else {
+        let _ = writeln!(
+            out,
+            "{} ({address}) is not covered by any data segment — zero at run time.",
+            hex_addr(address)
+        );
+        match image.extent() {
+            Some((low, high)) => {
+                let _ = writeln!(
+                    out,
+                    "The module's {} placed segments span {} .. {} ({low} .. {high}).",
+                    image.placed(),
+                    hex_addr(low as i32),
+                    hex_addr(high as i32)
+                );
+            }
+            None => out.push_str("The module places no data segment at a known address.\n"),
+        }
+        // Only when it is near one. "Ends 98 megabytes before this" is not a
+        // near miss, and printing it as one invites reading it as one.
+        if let Some(near) = image.nearest_below(address) {
+            let short = near.offset - near.length + 1;
+            if short <= 65536 {
+                let _ = writeln!(
+                    out,
+                    "The nearest segment below is #{} at {} + {} bytes, which ends {short} \
+                     byte{} before this.",
+                    near.segment,
+                    hex_addr(near.base as i32),
+                    near.length,
+                    if short == 1 { "" } else { "s" }
+                );
+            }
+        }
+        return out;
+    };
+
+    let _ = writeln!(
+        out,
+        "{} ({address}) is in data segment #{} ({}), which covers {} + {} bytes.",
+        hex_addr(address),
+        located.segment,
+        if located.active {
+            "active, its own offset"
+        } else {
+            "passive, placed by a memory.init"
+        },
+        hex_addr(located.base as i32),
+        located.length
+    );
+    let _ = writeln!(
+        out,
+        "At {} into the segment; the byte is at file offset {} — that is what `bytes` and `patch` take.",
+        located.offset, located.file_offset
+    );
+
+    // What is actually readable: the read stops where the segment does rather
+    // than reporting bytes from the next one, which are not adjacent in memory.
+    let available = (located.length - located.offset) as usize;
+    if length > available {
+        let _ = writeln!(
+            out,
+            "\nSegment #{} ends {} bytes in, so {} of the {length} asked for are not in the module.",
+            located.segment,
+            available,
+            length - available
+        );
+    }
+    let readable = length.min(available);
+    let bytes = image.bytes(address, readable).unwrap_or_default();
+
+    out.push('\n');
+    for (row, chunk) in bytes.chunks(16).enumerate() {
+        let at = address.wrapping_add((row * 16) as i32);
+        let hex: Vec<String> = chunk.iter().map(|byte| format!("{byte:02x}")).collect();
+        let text: String = chunk
+            .iter()
+            .map(|byte| {
+                if byte.is_ascii_graphic() || *byte == b' ' {
+                    *byte as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        let _ = writeln!(
+            out,
+            "  {:<10} {:<47}  |{text}|",
+            hex_addr(at),
+            hex.join(" ")
+        );
+    }
+
+    if readable >= 4 {
+        out.push_str("\nas u32 little-endian:\n");
+        for (word, chunk) in bytes.chunks_exact(4).enumerate() {
+            let value = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let note = if value == 0 {
+                "  zero".to_string()
+            } else {
+                match image.text(value) {
+                    Some(text) => format!("  -> \"{}\"", text.escape_default()),
+                    None if image.holds(value) => "  -> into the data".to_string(),
+                    None => String::new(),
+                }
+            };
+            let _ = writeln!(
+                out,
+                "  +{:<5} {:>12}  {}{note}",
+                word * 4,
+                value,
+                hex_addr(value)
+            );
+        }
+    }
+    out
+}
+
+fn hex_addr(value: i32) -> String {
+    if value < 0 {
+        format!("{value:#x}")
+    } else {
+        format!("{value:#010x}")
+    }
+}
+
+/// Reads a C++ vtable: each slot as a table index, and what it reaches.
+///
+/// The defect this exists for: a slot holding 0 is a pure virtual function, and
+/// a `call_indirect` on it goes to table index 0 — a slot whose signature is
+/// not the one the call site declared, so the engine traps and the thread dies.
+/// From the outside that looks like the engine failing for no reason; from
+/// here it is one line of output.
+fn vtable(arguments: &[String]) -> Result<String, String> {
+    if wants_help(arguments) {
+        return help_for("vtable");
+    }
+    let (path, rest) = positional(arguments, "vtable")?;
+    let mut slots: Option<usize> = None;
+    let mut class: Option<String> = None;
+    let mut address: Option<i32> = None;
+    let mut rest = rest.iter();
+    while let Some(argument) = rest.next() {
+        match argument.as_str() {
+            "--slots" => {
+                let value = rest.next().ok_or("--slots needs a number")?;
+                slots = Some(number(value, "--slots")?.max(0) as usize);
+            }
+            "--class" => class = Some(rest.next().ok_or("--class needs a name")?.clone()),
+            other if !other.starts_with('-') && address.is_none() => {
+                address = Some(number(other, "the address")? as i32);
+            }
+            other => return Err(unexpected("vtable", other)),
+        }
+    }
+    if address.is_some() && class.is_some() {
+        return Err("vtable takes an address or --class, not both".to_string());
+    }
+
+    let module = read(path)?;
+    let analysis = unwasm_core::analysis::analyse(&module);
+    let image = unwasm_core::analysis::DataImage::of(&module, &analysis.placements);
+    let (classes, _) = unwasm_core::analysis::classes(&module, &analysis.placements);
+
+    let mut out = String::new();
+    let address = match (address, &class) {
+        (Some(address), _) => address,
+        (None, Some(wanted)) => {
+            // Exact first — the mangled name is the unique one, and the
+            // readable one loses the template arguments, so six classes in this
+            // module are all called `webrtc::RefCountedObject<…>`. Then a
+            // substring, which is how a reader who knows the C++ name types it.
+            let exact: Vec<&unwasm_core::analysis::Class> = classes
+                .iter()
+                .filter(|class| class.mangled == *wanted)
+                .collect();
+            let matches = if exact.is_empty() {
+                let named: Vec<&unwasm_core::analysis::Class> = classes
+                    .iter()
+                    .filter(|class| class.name == *wanted)
+                    .collect();
+                if named.is_empty() {
+                    classes
+                        .iter()
+                        .filter(|class| {
+                            class.mangled.contains(wanted.as_str())
+                                || class.name.contains(wanted.as_str())
+                        })
+                        .collect()
+                } else {
+                    named
+                }
+            } else {
+                exact
+            };
+            let found = match matches.as_slice() {
+                [only] => *only,
+                [] => {
+                    return Err(format!(
+                        "no class named `{wanted}`. `unwasm classes {path}` lists the {} it found",
+                        classes.len()
+                    ));
+                }
+                several => {
+                    // Refused rather than picked: which of six vtables was
+                    // meant is not something the name decides.
+                    return Err(format!(
+                        "`{wanted}` matches {} classes. The mangled name is the unique one:\n{}",
+                        several.len(),
+                        several
+                            .iter()
+                            .take(12)
+                            .map(|class| format!("       {}", class.mangled))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ));
+                }
+            };
+            let header = found.vtable.ok_or_else(|| {
+                format!(
+                    "`{}` declares a type_info but no vtable points at it",
+                    found.name
+                )
+            })?;
+            let _ = writeln!(
+                out,
+                "`{}`: type_info at {}, vtable header at {}, slots from {}.",
+                found.name,
+                hex_addr(found.type_info),
+                hex_addr(header),
+                hex_addr(header + 8)
+            );
+            // Itanium puts `{offset-to-top, type_info}` in front of the slots,
+            // and the pointer an object holds is the slots' address.
+            header + 8
+        }
+        (None, None) => return Err("vtable needs an address, or --class <name>".to_string()),
+    };
+
+    if !image.holds(address) {
+        return Ok(format!("{out}{}", dump(&image, address, 32)));
+    }
+
+    // The Itanium header, when the two words before the slots are one. A zero
+    // and a word that points at *some* data is not a header — the second word
+    // has to be a `type_info` a class was actually recovered from, or the
+    // claim is two coincidences read as a declaration.
+    let owner = match (image.read32(address - 8), image.read32(address - 4)) {
+        (Some(0), Some(info)) => classes
+            .iter()
+            .find(|class| class.type_info == info)
+            .map(|class| (info, class)),
+        _ => None,
+    };
+    match owner {
+        Some((info, class)) => {
+            let _ = writeln!(
+                out,
+                "header at {}: offset-to-top 0, type_info {} — `{}`{}",
+                hex_addr(address - 8),
+                hex_addr(info),
+                class.name,
+                // The mangled form as well: the readable one loses the template
+                // arguments, and `RefCountedObject<…>` names nothing while
+                // `…ResidualEchoDetector…` names the class.
+                if class.mangled == class.name {
+                    String::new()
+                } else {
+                    format!(" ({})", class.mangled)
+                }
+            );
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "no C++ vtable header at {}: the two words before the slots are not \
+                 `{{0, type_info}}`\nfor any class this module declares. Either the address \
+                 given is the header rather than\nthe slots, or this is a plain table of \
+                 function pointers — a C ops struct, which\nreads the same way and traps the \
+                 same way on a null slot.",
+                hex_addr(address - 8)
+            );
+        }
+    }
+
+    // Where to stop. A vtable ends at the first word that is neither a live
+    // table index nor a zero followed by more of them — reading past that
+    // reports the next object's bytes as methods.
+    // Where the table stops: the same rule the class recovery uses, so
+    // `classes --methods` and this never disagree about how long a vtable is.
+    let words = unwasm_core::analysis::pointer_table(&image, &analysis.table, address, slots);
+
+    if words.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nnothing at {} looks like a table of function pointers: the first word is \
+             neither\nzero nor a live table index. Pass --slots <n> to read it anyway, or \
+             `unwasm data`\nto see the bytes.",
+            hex_addr(address)
+        );
+        return Ok(out);
+    }
+
+    let _ = writeln!(
+        out,
+        "\n{} slots at {}{}:",
+        words.len(),
+        hex_addr(address),
+        if slots.is_none() {
+            " (stopped at the first word that is neither a live table index nor a null \
+             followed by one — `--slots <n>` reads further)"
+        } else {
+            ""
+        }
+    );
+    let mut pure = Vec::new();
+    for (slot, func) in words.iter().enumerate() {
+        let at = slot * 4;
+        let word = image
+            .read32(address.wrapping_add(at as i32))
+            .unwrap_or_default();
+        match func {
+            Some(func) => {
+                let signature = module
+                    .func_type(*func)
+                    .map_or_else(|| "?".to_string(), unwasm_core::codegen::signature_text);
+                let name = module
+                    .func_name(*func)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        analysis
+                            .derived_names
+                            .get(func)
+                            .map(|derived| format!("{} (guessed)", derived.name))
+                    })
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    out,
+                    "  slot {slot:<3} +{at:<5} {word:>10}   f{func:<6} {signature}{}{name}",
+                    if name.is_empty() { "" } else { "  " }
+                );
+            }
+            None if word == 0 => {
+                pure.push(slot);
+                let _ = writeln!(
+                    out,
+                    "  slot {slot:<3} +{at:<5} {word:>10}   NULL — pure virtual, or an operation \
+                     this build does not provide;\n{:<34}a call here is call_indirect(0), \
+                     which traps",
+                    ""
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "  slot {slot:<3} +{at:<5} {word:>10}   not a live table index{}",
+                    match image.text(word) {
+                        Some(text) => format!(" — points at \"{}\"", text.escape_default()),
+                        None => String::new(),
+                    }
+                );
+            }
+        }
+    }
+
+    if !pure.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n{} null slot{}: {}.\nA `call_indirect` reaching one of these takes table \
+             index 0, whose signature is not the\ncall site's, so the engine traps — which \
+             kills the thread rather than returning an\nerror anybody catches.",
+            pure.len(),
+            if pure.len() == 1 { "" } else { "s" },
+            pure.iter()
+                .map(|slot| format!("{slot} (+{})", slot * 4))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(out)
+}
+
+/// Every function that reads or writes a given offset.
+///
+/// "Who writes byte +846 of this struct" is answerable from the module, and the
+/// way it was being answered — decompiling candidates and grepping the text —
+/// misses the ones the compiler wrote through a displaced base. So this follows
+/// the displacement.
+fn stores(arguments: &[String]) -> Result<String, String> {
+    if wants_help(arguments) {
+        return help_for("stores");
+    }
+    let (path, rest) = positional(arguments, "stores")?;
+    let mut offset: Option<i64> = None;
+    let mut width: Option<u32> = None;
+    let mut kind = unwasm_core::analysis::Kind::Store;
+    let mut exact = false;
+    let mut rest = rest.iter();
+    while let Some(argument) = rest.next() {
+        match argument.as_str() {
+            "--offset" => {
+                let value = rest.next().ok_or("--offset needs a number")?;
+                offset = Some(number(value, "--offset")?);
+            }
+            "--size" => {
+                let value = rest.next().ok_or("--size needs 1, 2, 4 or 8")?;
+                let size = number(value, "--size")?;
+                if !matches!(size, 1 | 2 | 4 | 8) {
+                    return Err(format!("--size is 1, 2, 4 or 8, not `{value}`"));
+                }
+                width = Some(size as u32);
+            }
+            "--kind" => {
+                let value = rest.next().ok_or("--kind is store, load or both")?;
+                kind = match value.as_str() {
+                    "store" => unwasm_core::analysis::Kind::Store,
+                    "load" => unwasm_core::analysis::Kind::Load,
+                    "both" => unwasm_core::analysis::Kind::Both,
+                    other => return Err(format!("--kind is store, load or both, not `{other}`")),
+                };
+            }
+            "--loads" => kind = unwasm_core::analysis::Kind::Load,
+            "--exact" => exact = true,
+            other => return Err(unexpected("stores", other)),
+        }
+    }
+    let offset = offset.ok_or("stores needs --offset <n>")?;
+
+    let module = read(path)?;
+    let analysis = unwasm_core::analysis::analyse(&module);
+    let report = unwasm_core::analysis::accesses_at(&module, offset, width, kind, exact);
+
+    let mut out = String::new();
+    let mut through_a_base = 0usize;
+    for access in &report.found {
+        let name = unwasm_core::codegen::function_ident(access.func, &analysis);
+        let what = format!(
+            "{}{}",
+            if access.load { "load" } else { "store" },
+            access.width * 8
+        );
+        // The frame base by name: `l2 + 846` in a function whose frame lives in
+        // local 2 is the shadow stack, and saying so saves the reader looking
+        // it up.
+        let base_name = |local: u32| match analysis.frames.get(&access.func) {
+            Some(frame) if frame.base_local == local => "frame".to_string(),
+            _ => format!("l{local}"),
+        };
+        // The effective offset rather than the one asked for: under --exact the
+        // two are not the same number, and printing the request back would say
+        // a write lands somewhere it does not.
+        let effective = access.effective();
+        let (where_, note) = match access.address {
+            unwasm_core::analysis::AddressOf::Local {
+                local,
+                displacement: 0,
+            } => (format!("{}+{effective}", base_name(local)), String::new()),
+            unwasm_core::analysis::AddressOf::Local {
+                local,
+                displacement,
+            } => {
+                through_a_base += 1;
+                (
+                    format!("{}+{effective}", base_name(local)),
+                    format!(
+                        "  through a base at {}{}{}, so the instruction encodes {}",
+                        base_name(local),
+                        if displacement < 0 { "-" } else { "+" },
+                        displacement.abs(),
+                        access.encoded
+                    ),
+                )
+            }
+            unwasm_core::analysis::AddressOf::Absolute(_) => (
+                format!("{effective}"),
+                "  a constant address, not a field of anything".to_string(),
+            ),
+            unwasm_core::analysis::AddressOf::Unknown => (
+                format!("?+{}", access.encoded),
+                "  through an address this could not follow".to_string(),
+            ),
+        };
+        let _ = writeln!(
+            out,
+            "{name:<38} {what:<8} op #{:<6}{}  {where_}{note}",
+            access.position,
+            match access.file_offset {
+                Some(at) => format!(" file {at:<9}"),
+                None => String::new(),
+            }
+        );
+    }
+    let found = report.found;
+
+    let kind = match kind {
+        unwasm_core::analysis::Kind::Store => "write",
+        unwasm_core::analysis::Kind::Load => "read",
+        unwasm_core::analysis::Kind::Both => "touch",
+    };
+    Ok(format!(
+        "{out}\n{} access{} {kind} offset {offset}{}{}{}\n",
+        found.len(),
+        if found.len() == 1 { "" } else { "es" },
+        width.map_or(String::new(), |width| format!(
+            " at {width} byte{}",
+            if width == 1 { "" } else { "s" }
+        )),
+        if exact {
+            ", matching the encoded offset only"
+        } else {
+            ""
+        },
+        if through_a_base > 0 {
+            format!(
+                "\n{through_a_base} of them reach it through a displaced base, and encode a \
+                 different number — a\ngrep for {offset} in decompiled output would not have \
+                 found {}.",
+                if through_a_base == 1 { "it" } else { "them" }
+            )
+        } else {
+            String::new()
+        }
+    ) + &if found.is_empty() {
+        String::new()
+    } else {
+        // The next command, spelled out: a list of indices is not an answer
+        // until something reads them.
+        let mut functions: Vec<u32> = found.iter().map(|access| access.func).collect();
+        functions.sort_unstable();
+        functions.dedup();
+        let indices: Vec<String> = functions.iter().map(u32::to_string).collect();
+        format!(
+            "\nRead {}: unwasm decompile {path} --only {} --bare\n",
+            if indices.len() == 1 { "it" } else { "them" },
+            indices.join(",")
+        )
+    } + &if report.lost.is_empty() {
+        String::new()
+    } else {
+        // Said rather than swallowed: an empty answer from a search that
+        // skipped functions means nothing.
+        format!(
+            "\nThe operand stack could not be followed in {} function{} \
+             ({}{}), and nothing\nafter that point in them was searched.\n",
+            report.lost.len(),
+            if report.lost.len() == 1 { "" } else { "s" },
+            report
+                .lost
+                .iter()
+                .take(6)
+                .map(|index| format!("f{index}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if report.lost.len() > 6 { ", …" } else { "" }
+        )
+    })
+}
+
+/// Whether the arguments ask for help rather than for work.
+///
+/// Checked before anything is parsed, because `unwasm decompile --help` used to
+/// be read as "decompile the module named `--help`" and answered with a file
+/// system error. A tool nobody can ask about is a tool nobody uses twice.
+fn wants_help(arguments: &[String]) -> bool {
+    arguments
+        .iter()
+        .any(|argument| argument == "-h" || argument == "--help")
+}
+
+/// Splits off the module path, which every command takes first.
+///
+/// The order is not negotiable — the flags are parsed positionally after it —
+/// so when a flag comes first the module ends up swallowed as some flag's
+/// value, and the error that reaches the user names an index rather than the
+/// order. This says the order instead.
+fn positional<'a>(
+    arguments: &'a [String],
+    command: &str,
+) -> Result<(&'a str, &'a [String]), String> {
+    match arguments.first() {
+        None => Err(format!("{command} needs a module path")),
+        Some(first) if first.starts_with('-') => {
+            let path = arguments
+                .iter()
+                .skip(1)
+                .find(|argument| argument.ends_with(".wasm"));
+            Err(match path {
+                Some(path) => format!(
+                    "the module comes first: `unwasm {command} {path} {}`.\n       \
+                     `{first}` came first, so {path} was read as a flag's value \
+                     rather than as the module.",
+                    arguments
+                        .iter()
+                        .filter(|argument| *argument != path)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+                None => format!(
+                    "the module comes first: `unwasm {command} <module.wasm> …`, \
+                     and `{first}` is a flag.\n       Try `unwasm {command} --help`."
+                ),
+            })
+        }
+        Some(path) => Ok((path.as_str(), &arguments[1..])),
+    }
+}
+
+/// The error an unrecognised argument gets, with the ordering rule when the
+/// argument looks like it was meant to be the module.
+fn unexpected(command: &str, argument: &str) -> String {
+    if argument.starts_with('-') {
+        format!("unexpected argument `{argument}`\n       Try `unwasm {command} --help`.")
+    } else {
+        format!(
+            "unexpected argument `{argument}`: `{command}` takes the module first \
+             and flags after it.\n       Try `unwasm {command} --help`."
+        )
+    }
+}
+
+/// Per-command help.
+///
+/// The whole `USAGE` is four screens, and a reader who typed one verb wants one
+/// verb's worth of it.
+const HELP: &[(&str, &str)] = &[
+    (
+        "decompile",
+        "\
+usage: unwasm decompile <module.wasm> [-o <out>] [--level <n>] [--split <n>]
+                        [--only <indices>] [--with-callees] [--bare] [--spans]
+                        [--reachable-from <indices>] [--direct-only]
+                        [--signatures <file>] [--stub-recognised]
+                        [--instrument-stores] [--offsets]
+
+  -o <out>       a path ending in .rs writes one file; any other path is a
+                 directory, written as mod.rs plus part0.rs, part1.rs, …
+                 Without -o, the Rust goes to stdout.
+  --split <n>    roughly how many lines to put in each part file. Implies a
+                 directory.
+  --only <list>  decompile only these function indices; the rest keep their
+                 signatures and become `unimplemented!()`, so the result
+                 still compiles.
+  --with-callees  with --only: and everything they call directly
+  --bare         with --only: emit *only* those functions, with no stubs, no
+                 runtime and no imports. The result does not compile — it is
+                 for reading, and it is a few dozen lines rather than fifteen
+                 thousand stubs to slice with awk.
+  --spans        print `index  name  first  last` for the generated file
+                 instead of the Rust, so a slice of it can be cut exactly.
+  --reachable-from <list>  decompile what these can reach, stub the rest
+  --direct-only  with --reachable-from: follow direct calls only
+  --level <n>    0 faithful, 1 frame slots as bindings, 2 also RTTI names
+  --signatures <file>  name library code using a catalogue from `signatures`
+  --stub-recognised  with --signatures: leave recognised bodies out
+  --instrument-stores  route every memory write through the watchpoint runtime
+  --offsets      also write offsets.json: which wasm bytes made each line
+
+A directory output also gets `names.json`: every function's index, name, file,
+line and table slots.",
+    ),
+    (
+        "data",
+        "\
+usage: unwasm data <module.wasm> <address> [<length>]
+
+Reads guest memory at an address, as the data segments leave it before anything
+runs. `<address>` may be decimal or 0x-prefixed; `<length>` defaults to 32.
+
+This is the command `bytes` is not: `bytes` takes an offset into the wasm file,
+and converting an address into one by hand means subtracting a constant that
+holds for one segment and lands past the end of the file for the next. It
+prints which segment covers the address, the file offset of the byte — the
+number `bytes` and `patch` take — the hex, and the words as u32 little-endian
+with any string or in-data pointer each one resolves to.
+
+An address no segment covers is not an error: it is memory the module never
+initialises, and it reads as zero at run time.",
+    ),
+    (
+        "vtable",
+        "\
+usage: unwasm vtable <module.wasm> <address> [--slots <n>]
+       unwasm vtable <module.wasm> --class <name> [--slots <n>]
+
+Reads a C++ vtable: each slot as a table index, the function it names, and its
+signature. `<address>` is where the *slots* start — the value an object holds —
+so the Itanium header (offset-to-top, type_info) is the two words before it.
+`--class` takes the name `unwasm classes` prints and finds the address itself.
+
+A slot holding 0 is a pure virtual function. Calling one is
+`call_indirect(0)`, which reaches table slot 0 — a signature mismatch, and a
+trap that kills the thread. Those slots are called out, because a vtable whose
+zero slot is reached looks from the outside like the engine dying for no
+reason.
+
+Without --slots the read stops where the vtable stops looking like one: at a
+word that is neither zero nor a live table index.",
+    ),
+    (
+        "stores",
+        "\
+usage: unwasm stores <module.wasm> --offset <n> [--size 1|2|4|8]
+                     [--kind store|load|both] [--loads] [--exact]
+
+Every function that writes (or reads) a constant offset. The question is \"who
+writes byte +846 of this struct\", and the answer used to be decompiling
+candidates and grepping the text.
+
+Compilers do not always write the offset you are looking for. A function given
+a pointer eight bytes into a struct writes the field at +846 as +838, and one
+that computes `base = p - 8` first writes it as +854. So the default follows
+the constant displacements a function applies to its own parameters and locals
+and reports the *effective* offset relative to the base, saying which local it
+went through. `--exact` turns that off and matches the encoded offset only.",
+    ),
+    (
+        "host",
+        "\
+usage: unwasm host <module.wasm> [-o <host.rs>] [--defaults]
+
+Writes a skeleton `impl Imports`: every import the module still needs, grouped
+by where it comes from, each one a `todo!()`. `--defaults` answers what nothing
+here can with the zero of its type and records that it did.",
+    ),
+    (
+        "table",
+        "\
+usage: unwasm table <module.wasm> [--type <signature>]
+
+What the function table holds, slot by slot, with each entry's signature.
+`call_indirect` takes a table index rather than a function index, so this is
+what says which slot a call site reaches. `--type \"(i32,i32,i32)->()\"`
+narrows it to one signature.",
+    ),
+    (
+        "calls",
+        "\
+usage: unwasm calls <module.wasm> <index>
+
+What reaches a function: its callers, its callees, the table slots it sits in,
+and the signatures it calls through the table. The module says what each
+function calls; nothing in it says what calls a given one.",
+    ),
+    (
+        "signatures",
+        "\
+usage: unwasm signatures <module.wasm> [-o <sigs.txt>]
+
+Writes a catalogue of fingerprint-to-name from a module that kept its names.
+`decompile --signatures <file>` uses one to name library code in a module that
+did not.",
+    ),
+    (
+        "classes",
+        "\
+usage: unwasm classes <module.wasm> [--methods]
+
+The C++ RTTI: every class the module declares a `type_info` for, its mangled
+name, and the functions its vtable holds. `--methods` lists the vtable slot by
+slot. The vtable address printed is the Itanium header; the slots start eight
+bytes after it, and `unwasm vtable --class <name>` reads them from there.",
+    ),
+    (
+        "frames",
+        "\
+usage: unwasm frames <module.wasm> [--outside]
+
+Each function's stack frame. `--outside` lists the ones whose stores land past
+the end of their own frame — the short list of suspects when an address is
+being corrupted.",
+    ),
+    (
+        "bytes",
+        "\
+usage: unwasm bytes <module.wasm> <offset> <length>
+
+The bytes at an offset *into the wasm file*, and whether that sequence is
+unique. For an address in guest memory, use `unwasm data`.",
+    ),
+    (
+        "constants",
+        "\
+usage: unwasm constants <module.wasm> <value> [--data]
+
+Every site that pushes a value, with the file offset and encoded length of
+each. `--data` also lists every address in the data segments that holds those
+four bytes — which is where a function pointer installed in a vtable lives, and
+no instruction ever pushes it.",
+    ),
+    (
+        "patch",
+        "\
+usage: unwasm patch <module.wasm> <offset> <value> -o <patched.wasm>
+
+Rewrites the `i32.const` at a file offset, keeping the encoding the same length
+so nothing else in the module moves.",
+    ),
+    (
+        "inspect",
+        "\
+usage: unwasm inspect <module.wasm>
+
+What the module is, in a screen: counts, memory, imports, the stack pointer,
+frames, embind registrations and exports.",
+    ),
+];
+
+fn help_for(command: &str) -> Result<String, String> {
+    HELP.iter()
+        .find(|(name, _)| *name == command)
+        .map(|(_, text)| format!("{text}\n"))
+        .ok_or_else(|| format!("no help for `{command}`"))
 }
 
 fn read(path: &str) -> Result<Module, String> {

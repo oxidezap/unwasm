@@ -190,7 +190,7 @@ fn what_level_2_reads_out_of_each_capture() {
         // the second number is not small and dropping it is the point.
         let mut owners: std::collections::BTreeMap<u32, usize> = Default::default();
         for class in &classes {
-            for func in &class.methods {
+            for func in class.methods.iter().flatten() {
                 *owners.entry(*func).or_default() += 1;
             }
         }

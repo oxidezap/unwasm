@@ -1,20 +1,95 @@
 [workspace]
-members = ["crates/unwasm-core", "crates/unwasm-cli"]
+members = [
+    "crates/unwasm-core",
+    "crates/unwasm-cli",
+    "crates/oracle-core",
+    "crates/oracle-cli",
+]
 resolver = "3"
 
 [workspace.package]
 edition = "2024"
+# Set by wacore-binary 0.7, the signaling tests' stanza builder.
 rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.dependencies]
 unwasm-core = { path = "crates/unwasm-core" }
+oracle-core = { path = "crates/oracle-core" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+# Static inspection, shared by both halves. Nothing here compiles or decodes a
+# module body, which is what keeps `oracle inspect` instant on a 10 MB file.
+wasmparser = { version = "0.254", default-features = false, features = ["std", "validate"] }
+# Writing modules back out, for `oracle-core`'s `patch.rs`. Same `wasm-tools`
+# release as wasmparser, so it brings no second parser: the graph goes from 147
+# packages to 148, since wasmtime already pulls `leb128fmt` in behind its own
+# `wasm-encoder` 0.243.
+wasm-encoder = "0.254"
+# Execution, for the oracle half only. Trimmed hard: it runs plain core-wasm
+# modules from disk, so the component model, GC, async, the Winch backend,
+# debug tooling and the WAT parser are all dead weight it would otherwise
+# compile and link. `unwasm` does not depend on this and must not start to —
+# see "Two runtimes, on purpose" below.
+wasmtime = { version = "41.0.4", default-features = false, features = [
+    "runtime",
+    "cranelift",
+    "std",
+    "threads",
+    "parallel-compilation",
+    "cache",
+    "addr2line",
+    "demangle",
+    "call-hook",
+] }
+
+# ---------------------------------------------------------------------------
+# Two runtimes, two host environments, on purpose
+# ---------------------------------------------------------------------------
+#
+# This workspace holds two ways of running the same captured module, and the
+# duplication between them is the point rather than debt waiting to be paid.
+#
+#   unwasm    decompiles wasm to Rust and runs *that*, over its own `rt.rs`
+#             and `hostlib.rs`
+#   oracle    runs the original `.wasm` under wasmtime, over `wasi.rs`,
+#             `cxa.rs` and `emscripten.rs`
+#
+# Both implement WASI, the C++ runtime, emscripten's runtime and threads, and
+# neither shares a line with the other. Merging them would remove roughly 4,700
+# lines and destroy the property they exist for.
+#
+# The reason is n-version voting, argued in RFC-0005 of the sibling
+# `wa-codegen-research`: two implementations that share lineage agree on their
+# shared defects, so a candidate tuned against one of them reproduces its errors
+# with perfect agreement and green CI. A third opinion only helps if it shares
+# no lineage. Here the three are the real `.wasm` under wasmtime, the same
+# module decompiled to Rust, and whatever implementation is being checked. A
+# shared host collapses the first two into one vote, and the collapse is silent.
+#
+# So: `oracle-core` may depend on `unwasm-core` for things that are facts about
+# the bytes. It must not depend on it for anything that *answers* for the guest.
+# And `unwasm-core` must keep its single dependency — a decompiler whose output
+# needs a runtime to link against is not self-contained.
+#
+# What was measured before deciding, on `JgwtTQVeWPm`:
+#
+#   oracle inspect (streams, never builds bodies)   < 10 ms
+#   unwasm Module::parse (full instruction decode)  ~300 ms
+#
+# which is why the decoding, call-graph and xref paths are *not* unified either:
+# sharing them would trade a documented 30x for tidiness. See `AGENTS.md`.
 
 [workspace.lints.rust]
-# The generated code is plain safe Rust: linear memory is a `Vec<u8>` and every
-# access is bounds-checked. A decompiler that needs `unsafe` to model wasm has
-# modelled it wrong.
+# The decompiler and what it emits are plain safe Rust: linear memory is a
+# `Vec<u8>` and every access is bounds-checked. A decompiler that needs `unsafe`
+# to model wasm has modelled it wrong.
+#
+# `oracle-core` overrides this to `deny` in its own manifest, because reading
+# wasmtime's shared memory requires `unsafe` and each site carries a SAFETY
+# note. Lints are per-package, so the two coexist without either being relaxed.
 unsafe_code = "forbid"
 missing_docs = "warn"
 
