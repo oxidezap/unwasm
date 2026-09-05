@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-wa-store = { git = "https://github.com/oxidezap/whatspec.git", rev = "a0ef88eaa4d165b58ed1bc2449aaa1bbca5c47a1" }
+wa-store = { git = "https://github.com/oxidezap/whatspec.git", rev = "10a66fdaab616c9ef6b3f5e6b197bdddfabc142a" }
 sha2 = "0.11"
 hex = "0.4"
 
