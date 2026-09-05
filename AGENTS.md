@@ -3,39 +3,20 @@
 A WebAssembly decompiler that emits Rust. Read `README.md` first — it holds the
 level model, what the real modules do, and the known limits.
 
-## This workspace holds two projects, and they are deliberately not one
+## Repository boundary
 
-`crates/oracle-core` and `crates/oracle-cli` are the other half: they run the
-original `.wasm` under wasmtime instead of decompiling it. **`AGENTS-oracle.md`
-is their guide and it is not optional reading before touching them** — it
-carries the host-environment rules, the capture-lock rules, and a table of
-hypotheses already ruled out by measurement.
-
-Three things that catch people out when working across both:
-
-- **The duplication between the two host environments is the design.** See the
-  long note in `Cargo.toml`. If you are about to remove it, read RFC-0005 of
-  `wa-codegen-research` first.
-- **`oracle-core` may depend on `unwasm-core`; never the reverse.** The
-  decompiler's one dependency is a property its output relies on. Today the
-  dependency is used in exactly one place, `carry.rs`.
-- **Lints differ per crate in exactly one respect.** The decompiler keeps
-  `unsafe_code = "forbid"`; the oracle sets `deny`, because reading wasmtime's
-  shared memory needs `unsafe` and each site carries a SAFETY note. Everything
-  else, `missing_docs` included, is the workspace's and is enforced on both
-  halves — the 154 undocumented public items the oracle arrived with are paid
-  off, so `-D warnings` is clean across the workspace and stays that way.
-
-Running `cargo test --workspace` runs both, which takes about four minutes
-because the oracle brings up a PJSIP worker pool. `cargo test -p unwasm-core`
-is still the fast loop.
+Only application-agnostic decompilation belongs here. A downstream executable
+oracle may depend on `unwasm-core` for static facts such as fingerprints, but
+`unwasm-core` must never depend on an application host, capture catalog,
+protocol crate or codec recipe. WhatsApp-specific execution and MLOW derivation
+live in `whatsapp-rust/tools`; verified capture transport lives in whatspec's
+`wa-store` crate.
 
 ## Repository tasks
 
-Use `cargo xt --help` for capture fetching, diagnostic patches and MLOW
-specification/fixture work. First-party task logic is Rust under `tools/xtask`;
-`tools/xtask-support` is the reusable host-only library also consumed by
-whatsapp-rust. Neither belongs in a runtime crate or default-members.
+Use `cargo xt --help` for the external regression corpus. It delegates verified
+capture restoration to a commit-pinned `wa-store`; no HTTP/archive machinery
+or application recipe belongs to this repository.
 
 ## Build & verify
 

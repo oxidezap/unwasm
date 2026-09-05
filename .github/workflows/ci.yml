@@ -96,8 +96,8 @@ jobs:
 
   # The tier that needs the real modules: ~19 MB of captures to download, so it
   # does not run on every push. Start it by hand from the Actions tab, or let
-  # the weekly run take it — which also catches WhatsApp rolling a capture out
-  # of the published archive, since that is what the fetch script fails on.
+  # the weekly run take it. whatspec's wa-store restores each file by its
+  # pinned content identity, independent of the current live rollout.
   captures:
     if: github.event_name != 'push' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -136,7 +136,7 @@ jobs:
       - name: Every capture, decompiled — and one of them run
         run: cargo test --test captured -- --ignored --nocapture
 
-      - name: The VoIP module's host, names, registrations and trampolines
+      - name: Large Emscripten corpus: host, names, registrations and trampolines
         run: |
           cargo test --test host --test names --test embind --test trampolines \
             -- --ignored --nocapture
