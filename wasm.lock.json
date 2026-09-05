@@ -92,6 +92,13 @@
       "sha256": "00811f91c1ff7452d788062085bb723a609b0d74c5da19e49df3e5afcaf39e8d",
       "size": 9794866,
       "what": "VoIP engine, previous capture \u2014 kept so `carry` can be tested across a real bump"
+    },
+    {
+      "fileName": "S_ivh1PriOA.wasm",
+      "url": "https://static.whatsapp.net/rsrc.php/yZ/r/S_ivh1PriOA.wasm",
+      "sha256": "e55e43babf85e2c0fc76ec65dcb8d47beba0f58b03b135b37a5aaaff7fe70e2f",
+      "size": 10856103,
+      "what": "VoIP MLOW migration oracle; whatspec 3110bdab^ generated/wasm.lock.json"
     }
   ]
 }
