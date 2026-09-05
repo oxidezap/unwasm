@@ -573,32 +573,11 @@ which build you measured.
 
 ## Open work
 
-1. **Drive the VoIP module.** `unwasm host` writes **103 methods for
-   `JgwtTQVeWPm`, 35 of them still `todo!()`**. Its allocator already runs:
-   `captured.rs` compiles a 42-function slice and compares it against the
-   engine, linear memory included. What the remaining 35 are is worth knowing
-   before adding to them:
+Application callbacks are deliberately outside this list. `unwasm host`
+declares unresolved imports, but implementing a protocol callback belongs to
+the consuming application's host adapter.
 
-   - **22 are WhatsApp's own callbacks** — eleven `call_*_js_sync` capture and
-     playback drivers, plus `on_call_event_js_sync`, `renderVideoFrame_js`,
-     `sendSignalingXMPP_js_sync` and the rest. Nothing but the application can
-     answer them.
-   - **6 are the C++ catch-matching and primary-exception entry points**,
-     refused on purpose — see the note on `__cxa_find_matching_catch_*` above.
-   - **2 are `asm_const`**, JavaScript the module carries.
-   - the rest are `gethostbyname`, the offscreen canvas, `longjmp`,
-     `emscripten_receive_on_main_thread_js` and the mailbox postmessage.
-
-   The last two are the only ones a capability would unblock, and neither is a
-   missing capability — `emscripten_receive_on_main_thread_js` marshals its
-   arguments as *doubles* and relies on JavaScript coercing each one to the
-   callee's parameter type, and reproducing that coercion is a guess about a
-   conversion nobody here can check. It stays a `todo!()` for the same reason
-   `__cxa_find_matching_catch_*` does.
-
-   What is *not* left is anything a standard already decides, or anything that
-   needed the instance. Both of those were written.
-2. **Level 2 — the rest of it.** The half that is in is the half the module
+1. **Level 2 — the rest of it.** The half that is in is the half the module
    writes down: class names and vtables from the C++ RTTI (`--level 2`,
    `unwasm classes`), and what embind's registrations declare. What is still
    open is the half that has to be inferred — structs from access patterns, and
@@ -606,7 +585,7 @@ which build you measured.
    `wa-wasm-oracle`'s `abi.rs`: dereferenced means pointer, and the access width
    says what it points at. That half *is* speculative, and it needs the same
    treatment level 1 got — opt-in, and saying at every site what it rests on.
-3. **Improve what a catalogue recognises.** `--stub-recognised` leaves the
+2. **Improve what a catalogue recognises.** `--stub-recognised` leaves the
    bodies out now, so the size of the cut is exactly the catalogue's recall:
    ~91% across builds of one toolchain and a handful across emscripten
    versions. The mechanism is not the limit; the fingerprint is.

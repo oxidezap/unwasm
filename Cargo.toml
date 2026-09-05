@@ -20,8 +20,7 @@ wa-store = { git = "https://github.com/oxidezap/whatspec.git", rev = "76a2747012
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-# Static inspection, shared by both halves. Nothing here compiles or decodes a
-# module body, which is what keeps `oracle inspect` instant on a 10 MB file.
+# The one parser used by decoding and static analysis.
 wasmparser = { version = "0.254", default-features = false, features = ["std", "validate"] }
 
 [workspace.lints.rust]
