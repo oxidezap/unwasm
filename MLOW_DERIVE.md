@@ -540,5 +540,8 @@ Validação local concluída: 17 testes oracle, 6 testes das tarefas/utilitário
 clippy do workspace com warnings negados e download limpo das oito capturas.
 Os workflows agora executam as tarefas Rust e seus testes. O consumidor usa
 um pin Git de `xtask-support`; nenhum utilitário entra no runtime do codec
-ou no decompilador. A confirmação remota desta migração será registrada
-após a publicação dos dois pins.
+ou no decompilador.
+
+CI remoto da migração: [J/S e utilitários Rust aprovados](https://github.com/oxidezap/unwasm/actions/runs/33945252397),
+no commit `6043ff49a2e37667a9a7d65ff2bcc5ea9d140c00`. O recibo do consumidor
+fica em `TASK.md` da branch `mlow-wasm-vectors` de whatsapp-rust.
