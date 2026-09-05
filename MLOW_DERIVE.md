@@ -14,9 +14,8 @@
 > por captura implementados. Auditores C preservados em formato compacto.
 > Consumidor: 2261 testes wacore aprovados (131 mlow; 2 ignorados existentes),
 > clippy workspace e clippy voip-mlow limpos. Tool: 17 testes lib e clippy
-> workspace limpos. Primeira CI remota passou testes/derivações J/S; o
-> upload precisou habilitar a pasta oculta de evidências. Correção publicada
-> e confirmação da execução completa em andamento.
+> workspace limpos. CI remota da ferramenta (J/S) e do consumidor aprovadas;
+> execução e evidências registradas na seção 7. Escopo concluído e commitado.
 
 ## 1. O módulo pinado
 
@@ -53,10 +52,10 @@ Vtable que `opus_alloc_codec` grava no state de 824 B (lido do corpo de
 #6655 — são **slots**):
 
 ```text
-state+0=5039  +8=5053 +12=5052 +16=5051 +20=5050 +24=5049 +28=5048
+state+0=pool  +4=0  +8=5053 +12=5052 +16=5051 +20=5050 +24=5049 +28=5048
 +32=5047 +36=5046 +40=5045 +44=5044 +48=5043 +52=5042 +56=5041
-+60=5040 +68=5038 +72=5037 +76=5036 +80=5035 +84=5034 +88=5033
-+96=5031 +100=5030 +816=1        (+4/+64/+92 = 0)
++60=5040 +64=5039 +68=5038 +72=5037 +76=5036 +80=5035 +84=5034 +88=5033 +92=5032
++96=5031 +100=5030 +816=1        (layout antes de opus_codec_open)
 codec+8=state  codec+12=1377164 (factory)  codec+20=1312704
 ```
 
@@ -499,3 +498,17 @@ porque upload-artifact exclui diretórios ocultos por padrão. O workflow
 agora habilita arquivos ocultos apenas nos paths de logs/manifests listados.
 O consumidor também isola os rustflags do build stable do oracle: um clone
 aninhado sob whatsapp-rust herdava as flags nightly do `.cargo/config`.
+
+### Execuções remotas aprovadas
+
+- [unwasm: J/S e 17 testes da ferramenta](https://github.com/oxidezap/unwasm/actions/runs/33938645892).
+- [whatsapp-rust: re-derivação dos dois módulos e 131 testes MLOW](https://github.com/oxidezap/whatsapp-rust/actions/runs/33938854330).
+
+Os problemas de infraestrutura da primeira tentativa foram corrigidos e
+as novas execuções concluíram com sucesso, incluindo publicação das evidências.
+A comparação PCM de 60 ms foi fortalecida para exigir 960 amostras em TODOS
+os 110 pacotes. A antiga afirmação de que estes pacotes DTX decodificavam
+curto era incorreta; essa checagem adicional também passou localmente.
+Os arquivos grandes antigos foram aposentados, mantendo auditores C compactos;
+o testdata do consumidor caiu de 15.8 MB para aproximadamente 9.1 MB mesmo
+com toda a nova cobertura. Não restam itens de decode S, DSP ou spact parked.
