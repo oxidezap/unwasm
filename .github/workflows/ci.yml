@@ -136,7 +136,7 @@ jobs:
       - name: Every capture, decompiled — and one of them run
         run: cargo test --test captured -- --ignored --nocapture
 
-      - name: Large Emscripten corpus: host, names, registrations and trampolines
+      - name: "Large Emscripten corpus: host, names, registrations and trampolines"
         run: |
           cargo test --test host --test names --test embind --test trampolines \
             -- --ignored --nocapture
