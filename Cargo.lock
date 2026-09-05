@@ -803,6 +803,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
+name = "oxitls-rustcrypto-provider"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18bd3866bdaa054b6f018b47b01baac05f8b6a8d789ebfb341d0e909e34917c5"
+dependencies = [
+ "aead",
+ "aes-gcm",
+ "chacha20",
+ "chacha20poly1305",
+ "crypto-common 0.1.7",
+ "der",
+ "digest 0.10.7",
+ "ecdsa",
+ "ed25519-dalek",
+ "hmac",
+ "p256",
+ "p384",
+ "paste",
+ "pkcs8",
+ "rand_core",
+ "rsa",
+ "rustls",
+ "rustls-pki-types",
+ "sec1",
+ "sha2 0.10.9",
+ "signature",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "p256"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1049,7 +1079,7 @@ dependencies = [
  "log",
  "once_cell",
  "rustls-pki-types",
- "rustls-webpki 0.103.15",
+ "rustls-webpki",
  "subtle",
  "zeroize",
 ]
@@ -1061,47 +1091,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f4925028c7eb5d1fcdaf196971378ed9d2c1c4efc7dc5d011256f76c99c0a96"
 dependencies = [
  "zeroize",
-]
-
-[[package]]
-name = "rustls-rustcrypto"
-version = "0.0.2-alpha"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f12052947763ab8515f753315357599e9b0b4dab3b8ba15f30f725fe6d025557"
-dependencies = [
- "aead",
- "aes-gcm",
- "chacha20poly1305",
- "crypto-common 0.1.7",
- "der",
- "digest 0.10.7",
- "ecdsa",
- "ed25519-dalek",
- "hmac",
- "p256",
- "p384",
- "paste",
- "pkcs8",
- "rand_core",
- "rsa",
- "rustls",
- "rustls-pki-types",
- "rustls-webpki 0.102.8",
- "sec1",
- "sha2 0.10.9",
- "signature",
- "x25519-dalek",
-]
-
-[[package]]
-name = "rustls-webpki"
-version = "0.102.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64ca1bc8749bd4cf37b5ce386cc146580777b4e8572c7b97baf22c83f444bee9"
-dependencies = [
- "ring",
- "rustls-pki-types",
- "untrusted",
 ]
 
 [[package]]
@@ -1404,10 +1393,10 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "wa-fetch"
 version = "0.1.0"
-source = "git+https://github.com/oxidezap/whatspec.git?rev=76a27470124eaaa70eedba584274c83adfda701e#76a27470124eaaa70eedba584274c83adfda701e"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=62c9b59e1910e50870d195373e636b4ddcf25ca3#62c9b59e1910e50870d195373e636b4ddcf25ca3"
 dependencies = [
  "anyhow",
- "rustls-rustcrypto",
+ "oxitls-rustcrypto-provider",
  "serde",
  "serde_json",
  "ureq",
@@ -1417,7 +1406,7 @@ dependencies = [
 [[package]]
 name = "wa-store"
 version = "0.1.0"
-source = "git+https://github.com/oxidezap/whatspec.git?rev=76a27470124eaaa70eedba584274c83adfda701e#76a27470124eaaa70eedba584274c83adfda701e"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=62c9b59e1910e50870d195373e636b4ddcf25ca3#62c9b59e1910e50870d195373e636b4ddcf25ca3"
 dependencies = [
  "anyhow",
  "flate2",
@@ -1433,7 +1422,7 @@ dependencies = [
 [[package]]
 name = "wa-text"
 version = "0.1.0"
-source = "git+https://github.com/oxidezap/whatspec.git?rev=76a27470124eaaa70eedba584274c83adfda701e#76a27470124eaaa70eedba584274c83adfda701e"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=62c9b59e1910e50870d195373e636b4ddcf25ca3#62c9b59e1910e50870d195373e636b4ddcf25ca3"
 dependencies = [
  "sha2 0.10.9",
 ]
