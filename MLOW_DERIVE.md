@@ -14,7 +14,9 @@
 > por captura implementados. Auditores C preservados em formato compacto.
 > Consumidor: 2261 testes wacore aprovados (131 mlow; 2 ignorados existentes),
 > clippy workspace e clippy voip-mlow limpos. Tool: 17 testes lib e clippy
-> workspace limpos. Publicação dos commits/primeira execução remota em andamento.
+> workspace limpos. Primeira CI remota passou testes/derivações J/S; o
+> upload precisou habilitar a pasta oculta de evidências. Correção publicada
+> e confirmação da execução completa em andamento.
 
 ## 1. O módulo pinado
 
@@ -488,3 +490,12 @@ parcial, e `derive` recusa referências ausentes antes de instanciar. Isso
 impede executar acidentalmente o índice antigo sob o hash da captura nova.
 A captura de memória/f32 é testada quanto à neutralidade, aos limites e à
 contagem obrigatória de hits. Nenhum `unsafe` foi acrescentado.
+
+## 7. Integração remota
+
+Em 2026-09-04, a execução 33938093701 passou os testes e a re-derivação
+das duas capturas em runners limpos. Falhou somente ao publicar evidências,
+porque upload-artifact exclui diretórios ocultos por padrão. O workflow
+agora habilita arquivos ocultos apenas nos paths de logs/manifests listados.
+O consumidor também isola os rustflags do build stable do oracle: um clone
+aninhado sob whatsapp-rust herdava as flags nightly do `.cargo/config`.
