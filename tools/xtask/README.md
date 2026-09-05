@@ -1,8 +1,8 @@
 # Rust tasks
 
-Run `cargo xt --help` from this workspace. The alias builds the host-only task
-crate in release mode; it is outside default-members and adds no dependency to
-the decompiler or codec runtime.
+Run `cargo xt --help` from this workspace. The alias builds the standalone
+host-only task crate in release mode. It is excluded from workspace resolution,
+so a decompiler-only build never resolves its network or archive dependencies.
 
 | Task | Purpose |
 |---|---|

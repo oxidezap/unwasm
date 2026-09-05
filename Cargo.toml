@@ -1,9 +1,9 @@
 [workspace]
 members = [
-    "tools/xtask",
     "crates/unwasm-core",
     "crates/unwasm-cli",
 ]
+exclude = ["tools/xtask"]
 default-members = ["crates/unwasm-core", "crates/unwasm-cli"]
 resolver = "3"
 
@@ -16,8 +16,6 @@ publish = false
 
 [workspace.dependencies]
 unwasm-core = { path = "crates/unwasm-core" }
-wa-store = { git = "https://github.com/oxidezap/whatspec.git", rev = "963b21803b9f6541440b15b05e77291856fd0f0f" }
-
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 # The one parser used by decoding and static analysis.

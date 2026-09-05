@@ -1,4 +1,5 @@
 /target
+/tools/xtask/target/
 /.cache/
 # External regression corpus restored by `cargo xt fetch-captures` and
 # verified against `fixtures/captures.sha256`.
