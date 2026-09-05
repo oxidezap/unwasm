@@ -31,6 +31,38 @@ fn root() -> Result<PathBuf> {
         .join("../..")
         .canonicalize()?)
 }
+
+fn parse_captures(data: &str) -> Result<Vec<WasmCapture>> {
+    data.lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+        .map(|(index, line)| {
+            let mut fields = line.split_whitespace();
+            let sha256 = fields
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("line {}: capture hash missing", index + 1))?;
+            let size = fields
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("line {}: capture size missing", index + 1))?
+                .parse::<u64>()?;
+            let file_name = fields
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("line {}: capture filename missing", index + 1))?;
+            anyhow::ensure!(
+                fields.next().is_none(),
+                "line {}: unexpected capture fields",
+                index + 1
+            );
+            Ok(WasmCapture {
+                sha256: sha256.into(),
+                file_name: file_name.trim_start_matches('*').into(),
+                size: Some(size),
+                url: None,
+            })
+        })
+        .collect()
+}
+
 fn main() -> Result<()> {
     let root = root()?;
     match Args::parse().task {
@@ -45,26 +77,7 @@ fn main() -> Result<()> {
         }
         Task::FetchCaptures { destination } => {
             let data = std::fs::read_to_string(root.join("fixtures/captures.sha256"))?;
-            let captures = data
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| {
-                    let mut p = l.split_whitespace();
-                    Ok(WasmCapture {
-                        sha256: p
-                            .next()
-                            .ok_or_else(|| anyhow::anyhow!("capture hash missing"))?
-                            .into(),
-                        file_name: p
-                            .next()
-                            .ok_or_else(|| anyhow::anyhow!("capture filename missing"))?
-                            .trim_start_matches('*')
-                            .into(),
-                        size: None,
-                        url: None,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let captures = parse_captures(&data)?;
             restore_captures(
                 &captures,
                 &[ReleaseSource {
@@ -74,5 +87,18 @@ fn main() -> Result<()> {
                 &destination.unwrap_or(root.join("fixtures/wasm")),
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_manifest_requires_hash_size_and_name() {
+        let captures = parse_captures(&format!("{} 4 tiny.wasm\n", "a".repeat(64))).unwrap();
+        assert_eq!(captures[0].size, Some(4));
+        assert!(parse_captures("abc tiny.wasm\n").is_err());
+        assert!(parse_captures("abc 4 tiny.wasm extra\n").is_err());
     }
 }

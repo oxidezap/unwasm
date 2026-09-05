@@ -908,7 +908,7 @@ The `#[ignore]`d tiers run against the real WhatsApp Web modules. Those are
 megabytes of somebody else's build output, so they are not committed:
 `cargo xt fetch-captures` downloads them into `fixtures/wasm` (git-ignored)
 from the public [`oxidezap/whatspec`](https://github.com/oxidezap/whatspec)
-archive, and checks each one against the sha256 pinned in
+archive, and checks each one against the size and SHA-256 pinned in
 `fixtures/captures.sha256`. A capture that arrives with different bytes is not
 the module the tests pin their numbers to, and is refused rather than used.
 

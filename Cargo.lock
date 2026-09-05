@@ -1393,7 +1393,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "wa-fetch"
 version = "0.1.0"
-source = "git+https://github.com/oxidezap/whatspec.git?rev=62c9b59e1910e50870d195373e636b4ddcf25ca3#62c9b59e1910e50870d195373e636b4ddcf25ca3"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=963b21803b9f6541440b15b05e77291856fd0f0f#963b21803b9f6541440b15b05e77291856fd0f0f"
 dependencies = [
  "anyhow",
  "oxitls-rustcrypto-provider",
@@ -1406,7 +1406,7 @@ dependencies = [
 [[package]]
 name = "wa-store"
 version = "0.1.0"
-source = "git+https://github.com/oxidezap/whatspec.git?rev=62c9b59e1910e50870d195373e636b4ddcf25ca3#62c9b59e1910e50870d195373e636b4ddcf25ca3"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=963b21803b9f6541440b15b05e77291856fd0f0f#963b21803b9f6541440b15b05e77291856fd0f0f"
 dependencies = [
  "anyhow",
  "flate2",
@@ -1422,7 +1422,7 @@ dependencies = [
 [[package]]
 name = "wa-text"
 version = "0.1.0"
-source = "git+https://github.com/oxidezap/whatspec.git?rev=62c9b59e1910e50870d195373e636b4ddcf25ca3#62c9b59e1910e50870d195373e636b4ddcf25ca3"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=963b21803b9f6541440b15b05e77291856fd0f0f#963b21803b9f6541440b15b05e77291856fd0f0f"
 dependencies = [
  "sha2 0.10.9",
 ]
