@@ -30,6 +30,13 @@ Running `cargo test --workspace` runs both, which takes about four minutes
 because the oracle brings up a PJSIP worker pool. `cargo test -p unwasm-core`
 is still the fast loop.
 
+## Repository tasks
+
+Use `cargo xt --help` for capture fetching, diagnostic patches and MLOW
+specification/fixture work. First-party task logic is Rust under `tools/xtask`;
+`tools/xtask-support` is the reusable host-only library also consumed by
+whatsapp-rust. Neither belongs in a runtime crate or default-members.
+
 ## Build & verify
 
 ```sh
@@ -568,7 +575,7 @@ easy to get wrong:
 ## The corpus rolls, and a measurement is dated by the build it was taken on
 
 WhatsApp reissues these payloads under new ids and stops serving the old ones.
-`scripts/fetch-captures.sh` pulls what is still published from the public
+`cargo xt fetch-captures` pulls what is still published from the public
 `oxidezap/whatspec` archive and checks each against a pinned sha256; the two
 captures more than one test names are constants in `tests/common/mod.rs`.
 

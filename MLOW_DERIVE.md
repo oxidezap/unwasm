@@ -20,7 +20,7 @@
 ## 1. O módulo pinado
 
 Tudo roda contra estes bytes exatos; spec com hash divergente é recusada
-antes de instanciar (como `scripts/fetch-wasm.py`).
+antes de instanciar (como `cargo xt fetch-wasm`).
 
 | Arquivo | Tamanho | SHA-256 |
 |---|---|---|
@@ -275,7 +275,7 @@ Limite conhecido: imports com handler `func_wrap` (ex.
     inclusive escritas duplicadas em +64/+92 que restauravam valores de J.
     `specs/mlow_encode_s.json`: rc/encrc/decrc = 0/1/0; pacote 137 B
     (`e4b19307…`), PCM 1920 B (`7b3552b8…`), iguais a J.
-    `scripts/mlow/capture_specs.py` gera `mlow_110frames_s.json` e
+    `cargo xt mlow specs` gera `mlow_110frames_s.json` e
     `mlow_120ms_s.json` a partir das specs J, conservando os hashes esperados.
     **110-frame S executado: 220/220 hashes aprovados**, sem trap.
     **120 ms em S executado: 16/16 hashes aprovados** (8 pacotes + 8 PCM).
@@ -292,8 +292,8 @@ Limite conhecido: imports com handler `func_wrap` (ex.
     de NoiseGenerator (11 floats + 3 i32; seed em +52). Entrada: 1320 casos
     sintéticos preservados do corpus C, sem seus valores esperados, em
     `specs/mlow_inputs/gennoise_input.bin`. Receita executável:
-    `scripts/mlow/gennoise.py spec INPUT SPEC`, `oracle derive --spec SPEC
-    --out RUN`, `gennoise.py assemble INPUT OUTPUT --run RUN`.
+    O replay inicial foi substituído por `cargo xt mlow verify`; os dados
+    atuais vêm diretamente dos snapshots do stream wasm.
     **1320 chamadas executadas**, com 2640 saídas de ruído/estado. Primeiro
     caso: diferença máxima de ruído vs C = 3.7253e-9 e seed bit-idêntica.
     **Integração concluída: testes Rust contra wasm e C passaram (1320 casos cada).**
@@ -322,7 +322,7 @@ Limite conhecido: imports com handler `func_wrap` (ex.
     escreve no guest; exige número exato de hits e limita o total a 64 MiB.
     A memória é lida pelos accessors existentes (sem novo unsafe). Necessário
     porque pitch/signal-mode estão inlined em J#10736, sem função exportável.
-    `scripts/mlow/signal_trace.py` registra entradas/saídas do VUV nas
+    `cargo xt mlow spec signal` registra entradas/saídas do VUV nas
     instruções 4280/4584. **330 frames capturados com os 220 hashes originais
     aprovados**. Integração Rust desses vetores ainda em andamento; testes
     unitários adicionais da ferramenta também pendentes.
@@ -336,7 +336,7 @@ Limite conhecido: imports com handler `func_wrap` (ex.
     nem afrouxar tolerâncias. **5/5 testes focados passaram:** front-end wasm/C, signal-mode wasm/C e
     gennoise wasm. Qualidade e golden do encoder ainda precisam revalidar.
 
-34. **LSF quantização: 330/330 aprovados.** `kernel_trace.py` captura J#10804
+34. **LSF quantização: 330/330 aprovados.** `cargo xt mlow spec kernel` captura J#10804
     na entrada e no retorno implícito (op1099), com A, RD weight, seleção de
     tabelas, centroides condicionais e outputs. O teste Rust roda os wrappers
     completos `lsf_quant`/`lsf_quant_cond`, encadeando qlsf anterior, e compara
@@ -346,7 +346,7 @@ Limite conhecido: imports com handler `func_wrap` (ex.
     LTP/F2/estado anterior e saída extraídos nos ops1691/4266 de J#10736.
     O teste passou frame 0 e falhou na correlação do frame 1; não reduzir a
     tolerância sem explicar a diferença. Estado e tuning sendo conferidos.
-36. **Postfilters extraídos.** `postfilter_trace.py` captura HP em
+36. **Postfilters extraídos.** `cargo xt mlow spec postfilter` captura HP em
     J#10726 ops5550/5820 (330 frames, estado 1332B) e harmônico em
     ops7728/8368 (110 pacotes, estado 9260B). Os 220 hashes continuam iguais.
     Integração Rust em andamento; o harmônico também tem tuning diferente:
@@ -381,7 +381,7 @@ Limite conhecido: imports com handler `func_wrap` (ex.
 42. **SPACT saiu do parked: 330/330 bit-exatos.** O `vad_results` do Rust
     concorda exatamente com as probabilidades capturadas pelo signal trace.
     Não é mais necessário depender do prefixo C para essa propriedade.
-43. **Gennoise e excitação agora partem do stream wasm.** `gennoise_trace.py`
+43. **Gennoise e excitação agora partem do stream wasm.** `cargo xt mlow spec gennoise`
     observa somente o chamador decoder J#10726 (ops2631/2632), evitando
     misturar as chamadas do encoder. 1320 casos derivados com entradas e
     saídas originais; teste de gennoise e teste da excitação ACB/LTP ambos
@@ -390,7 +390,7 @@ Limite conhecido: imports com handler `func_wrap` (ex.
 44. **Postfilter harmônico aprovado** após adotar feedback=0.4/strength=0.713
     lidos do wasm (110 pacotes); HP também aprovado (330 frames). Os auditores
     C mantêm a parametrização antiga explicitamente.
-45. **Front-end também capturado ao vivo.** `fe_trace.py` observa os 330
+45. **Front-end também capturado ao vivo.** `cargo xt mlow spec fe` observa os 330
     frames, incluindo A antes e depois do loop BWE original (op1422). Nenhum
     cálculo host passa a ser parte do resultado esperado. Integração substitui
     os 40 replays C usados inicialmente; teste ainda a reexecutar.
@@ -415,7 +415,7 @@ Limite conhecido: imports com handler `func_wrap` (ex.
     também compara o solve sobre R exato em TODOS os casos, incluindo silêncio;
     diferenças de FFT em LPC mal-condicionado são limitadas por erro de predição
     <1 LSB i16, sem simplesmente ignorar os coeficientes silenciosos.
-49. **Receita completa executada.** `scripts/mlow/verify.py` reconstrói e
+49. **Receita completa executada.** `cargo xt mlow verify` reconstrói e
     verifica specs geradas, valida/faz fetch dos módulos pinados, executa 11
     derivações e verifica TODOS os outputs por hash de árvore e resoluções.
     `specs/mlow.lock.json` trava inputs, módulos, specs, seletores e outputs.
@@ -423,9 +423,9 @@ Limite conhecido: imports com handler `func_wrap` (ex.
     `.github/workflows/mlow-derive.yml` divide J/S em jobs e arquiva logs e
     manifests. O job remoto ainda não foi executado nesta rodada.
 50. **Retirada dos JSON grandes em andamento.** No consumidor,
-    `pack-legacy.py` reconstrói auditores C a partir do commit histórico
+    `cargo xt mlow pack-legacy` reconstrói auditores C a partir do commit histórico
     pinado, mantendo uma amostra determinística de gennoise/param/EXC e os
-    outros testes C. `regenerate-wasm.py` verifica o tool pin, TODOS os hashes
+    outros testes C. `cargo xt mlow regenerate` verifica o tool pin, TODOS os hashes
     da derivação e compara CBOR canônico (independente da versão do compressor).
     JSON grandes e postfilter RAW substituídos por CBOR/zstd e RAW/zstd.
     Reteste conjunto e pin final do commit da ferramenta ainda pendentes.
@@ -434,12 +434,12 @@ Limite conhecido: imports com handler `func_wrap` (ex.
 
 ```sh
 cargo build --release --locked -p oracle-cli
-python3 scripts/mlow/verify.py --out .derive-mlow
+cargo xt mlow verify --out .derive-mlow
 cargo test --release -p oracle-core --lib
 cargo clippy --workspace --all-targets --release -- -D warnings
 ```
 
-`verify.py` funciona de qualquer diretório. Faz fetch dos módulos pinados
+`cargo xt mlow verify` funciona de qualquer diretório. Faz fetch dos módulos pinados
 quando necessário, recompõe as specs geradas e recusa drift de inputs,
 seletores, specs ou de qualquer output. `--capture JgwtTQVeWPm` e
 `--capture S_ivh1PriOA` são os shards usados pela CI. `--update-lock` é
@@ -447,7 +447,7 @@ somente para uma re-derivação intencional com revisão dos resultados; CI
 nunca usa essa opção. As duas capturas mantêm hashes de packets/PCM iguais.
 
 Os artefatos JSON intermediários e PCM montados ficam em `--out/artifacts`.
-No whatsapp-rust, `scripts/mlow-vectors/regenerate-wasm.py` verifica o commit
+No whatsapp-rust, `cargo xt mlow regenerate` verifica o commit
 pinado da ferramenta e o hash de `mlow.lock.json`, executa a derivação,
 empacota CBOR+zstd e compara os bytes CBOR no modo `--check`. As versões do
 compressor podem escolher uma representação zstd diferente; os valores
@@ -468,7 +468,7 @@ são dev-dependencies e não entram no runtime.
 | `mlow_gennoise_trace` | 1320 excitações/noises/estados/energias |
 | `mlow_postfilter_trace` | 330 HP e 110 harmônicos, entradas/saídas/estados |
 
-Os auditores C permanecem independentes: `pack-legacy.py` no consumidor
+Os auditores C permanecem independentes: `cargo xt mlow pack-legacy` no consumidor
 reconstrói a seleção a partir de um commit histórico imutável. Nenhum output
 C foi corrigido para concordar com Rust. Onde a captura usa tuning diferente,
 o teste C explicita o perfil antigo e o teste wasm verifica o perfil atual.
@@ -512,3 +512,33 @@ curto era incorreta; essa checagem adicional também passou localmente.
 Os arquivos grandes antigos foram aposentados, mantendo auditores C compactos;
 o testdata do consumidor caiu de 15.8 MB para aproximadamente 9.1 MB mesmo
 com toda a nova cobertura. Não restam itens de decode S, DSP ou spact parked.
+
+## Migração para cargo xt (2026-09-05)
+
+Pedido novo: substituir todos os scripts Python/Bash dos dois repositórios
+por tarefas Rust. Bibliotecas compartilhadas serão somente de tooling; os
+dois ambientes host continuam independentes. A validação precisa preservar
+os hashes binários dos oráculos e as recusas de dados divergentes.
+
+### Progresso cargo xt
+
+As tarefas nativas reproduziram os hashes de árvore de todas as derivações
+J/S. Somente os hashes de serialização das specs mudaram ao passar para o
+writer Rust; `--refresh-spec-hashes` recusaria qualquer alteração dos módulos,
+resoluções ou outputs. O consumidor confirmou CBOR e streams byte-idênticos.
+Os 14 arquivos Python/Bash próprios foram removidos. Os patches diagnósticos
+mantêm as recusas por captura divergente e padrão ambíguo; export-globals foi
+comparado byte a byte com a implementação anterior na captura J.
+
+A implementação Rust também passou nas verificações do consumidor sem mudar
+nenhum byte CBOR ou packet/PCM. `cargo xt mlow verify --from-derived` compara
+o hash da spec atual com o lock antes de reutilizar snapshots. Os utilitários
+compartilhados têm testes para tipos numéricos, snapshots truncados, status de
+processos e captura de arquivos sem aceitar hashes/caminhos do arquivo baixado.
+
+Validação local concluída: 17 testes oracle, 6 testes das tarefas/utilitários,
+clippy do workspace com warnings negados e download limpo das oito capturas.
+Os workflows agora executam as tarefas Rust e seus testes. O consumidor usa
+um pin Git de `xtask-support`; nenhum utilitário entra no runtime do codec
+ou no decompilador. A confirmação remota desta migração será registrada
+após a publicação dos dois pins.

@@ -19,12 +19,12 @@ out of.
 ## Getting set up
 
 ```sh
-python3 scripts/fetch-wasm.py     # captured modules -> ./wasm, checked by hash
+cargo xt fetch-wasm     # captured modules -> ./wasm, checked by hash
 cargo build --release             # always --release; see below
 cargo test --release -- --nocapture
 ```
 
-`fetch-wasm.py` reads `wasm.lock.json` and refuses any payload whose SHA-256
+`cargo xt fetch-wasm` reads `wasm.lock.json` and refuses any payload whose SHA-256
 does not match. Three sources, tried in order:
 
 - **`static.whatsapp.net` — the capture's own origin**, one url per module,
@@ -798,7 +798,7 @@ Two tools exist because inference from disassembly kept being wrong:
 
 ```sh
 # Export a module's globals into a copy, so the host can read them.
-python3 scripts/export_globals.py <src.wasm> <out.wasm> <global-count>
+cargo xt export-globals <src.wasm> <out.wasm> <global-count>
 
 # Read the engine's own view of a call — the only window into its state,
 # since the call context is reachable from guest code alone.
@@ -818,7 +818,7 @@ tool; it is not affiliated with, authorised by, or endorsed by WhatsApp or Meta.
 ## Reproducible MLOW oracle corpus
 
 `cargo build --release --locked -p oracle-cli` followed by
-`python3 scripts/mlow/verify.py` re-derives the codec corpus from the pinned
+`cargo xt mlow verify` re-derives the codec corpus from the pinned
 J/S captures. The lock verifies every output and selector; the capture CI
 runs both modules independently. See [MLOW_DERIVE.md](MLOW_DERIVE.md) for the
 recovered layouts, DSP boundaries, migration refusals and measured results.

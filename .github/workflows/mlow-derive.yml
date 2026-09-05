@@ -2,9 +2,9 @@ name: MLOW capture derivation
 
 on:
   push:
-    paths: ['crates/oracle-*/**', 'scripts/mlow/**', 'specs/**', 'wasm.lock.json', 'Cargo.lock', '.github/workflows/mlow-derive.yml']
+    paths: ['crates/oracle-*/**', 'tools/xtask/**', 'tools/xtask-support/**', '.cargo/config.toml', 'specs/**', 'wasm.lock.json', 'Cargo.lock', '.github/workflows/mlow-derive.yml']
   pull_request:
-    paths: ['crates/oracle-*/**', 'scripts/mlow/**', 'specs/**', 'wasm.lock.json', 'Cargo.lock', '.github/workflows/mlow-derive.yml']
+    paths: ['crates/oracle-*/**', 'tools/xtask/**', 'tools/xtask-support/**', '.cargo/config.toml', 'specs/**', 'wasm.lock.json', 'Cargo.lock', '.github/workflows/mlow-derive.yml']
   workflow_dispatch:
   schedule:
     - cron: '41 5 * * 1'
@@ -24,14 +24,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install corpus packaging tool
-        run: sudo apt-get update && sudo apt-get install -y zstd
       - name: Build pinned oracle dependencies
-        run: cargo build --release --locked -p oracle-cli
+        run: cargo build --release --locked -p unwasm-xtask
       - name: Test derivation and migration
         run: cargo test --release --locked -p oracle-core --lib
+      - name: Test Rust task utilities
+        run: cargo test --release --locked -p unwasm-xtask -p xtask-support --all-features
       - name: Re-derive every output for this capture
-        run: python3 scripts/mlow/verify.py --capture '${{ matrix.capture }}'
+        run: cargo xt mlow verify --capture '${{ matrix.capture }}'
       - uses: actions/upload-artifact@v4
         if: always()
         with:

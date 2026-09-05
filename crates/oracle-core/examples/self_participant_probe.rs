@@ -7,10 +7,10 @@
 //! inferring them.
 //!
 //! That was impossible while the call context lived in an unexported global.
-//! `scripts/export_globals.py` fixes that:
+//! `cargo xt export-globals` fixes that:
 //!
 //! ```sh
-//! python3 scripts/export_globals.py caps/JgwtTQVeWPm.wasm /tmp/patched/JgwtTQVeWPm.wasm 15
+//! cargo xt export-globals caps/JgwtTQVeWPm.wasm /tmp/patched/JgwtTQVeWPm.wasm 15
 //! WA_WASM_DIR=/tmp/patched cargo run --release --example self_participant_probe
 //! ```
 //!

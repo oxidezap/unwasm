@@ -1,6 +1,6 @@
 //! Discovery of captured modules on disk.
 //!
-//! The captured artifacts are not vendored here. `scripts/fetch-wasm.py` places
+//! The captured artifacts are not vendored here. `cargo xt fetch-wasm` places
 //! them in `wasm/` at the workspace root, verified against the hashes in
 //! `wasm.lock.json`; a copy committed to this repository would drift from the
 //! capture that the protocol notes refer to.
@@ -18,7 +18,7 @@ pub const DIR_ENV: &str = "WA_WASM_DIR";
 /// above the checkout is not mistaken for the capture directory.
 const LOCK_FILE: &str = "wasm.lock.json";
 
-/// Where `fetch-wasm.py` puts the captures, relative to the workspace root.
+/// Where `cargo xt fetch-wasm` puts the captures, relative to the workspace root.
 const FETCH_DIR: &str = "wasm";
 
 /// Where the captures lived first. Kept as a fallback so a working tree that
@@ -56,7 +56,7 @@ fn find_capture_dir() -> Option<PathBuf> {
 
 /// Whether a candidate directory is one worth stopping at.
 ///
-/// Existing is not enough. A `fetch-wasm.py` run that fails or is interrupted
+/// Existing is not enough. A `cargo xt fetch-wasm` run that fails or is interrupted
 /// leaves `wasm/` behind with nothing in it, and that empty directory used to
 /// win over a populated sibling checkout — so the catalogue came back valid and
 /// empty, and every capture-dependent test skipped while the captures were
@@ -102,7 +102,7 @@ impl Catalog {
             None => find_capture_dir().with_context(|| {
                 format!(
                     "no directory holding captured .wasm files was found (an empty `{FETCH_DIR}/` \
-                     does not count — see `holds_a_capture`); run scripts/fetch-wasm.py, or set \
+                     does not count — see `holds_a_capture`); run cargo xt fetch-wasm, or set \
                      {DIR_ENV}"
                 )
             })?,
@@ -205,7 +205,7 @@ mod tests {
         }
     }
 
-    /// The failure this guards: `fetch-wasm.py` creates `wasm/` before it
+    /// The failure this guards: `cargo xt fetch-wasm` creates `wasm/` before it
     /// downloads anything, so an interrupted run leaves an empty directory that
     /// used to win the search — and the catalogue came back valid and empty
     /// while a populated sibling checkout sat one directory further up.

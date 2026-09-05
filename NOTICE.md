@@ -15,7 +15,7 @@ reached, and each of them is recorded in the source next to the test that
 caught it.
 
 Those modules are **not** part of this repository and are **not** covered by its
-licence. They are somebody else's build output. `scripts/fetch-captures.sh`
+licence. They are somebody else's build output. `cargo xt fetch-captures`
 downloads them at test time from the public
 [`oxidezap/whatspec`](https://github.com/oxidezap/whatspec) archive, into
 `fixtures/wasm`, which is git-ignored.

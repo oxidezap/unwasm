@@ -1,0 +1,22 @@
+[package]
+name = "unwasm-xtask"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+oracle-core.workspace = true
+wasmparser.workspace = true
+wasm-encoder.workspace = true
+xtask-support = { path = "../xtask-support", features = ["download", "compression"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+hex = "0.4"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3"

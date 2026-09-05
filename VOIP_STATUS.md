@@ -546,7 +546,7 @@ The participant array sits at `0x24bed0`, 4240 bytes below that shared top.
 
 **Reading a global needs a patched module, and mistaking that for a zero is
 easy.** The capture in `docs/captured-js/wasm` exports **no globals at all** —
-`wasm-tools` finds zero. `scripts/export_globals.py` writes a copy that does, and
+`wasm-tools` finds zero. `cargo xt export-globals` writes a copy that does, and
 the probe was built for that copy; run against the original, `get_export
 ("__global_0")` returns nothing, and code that falls back to `0` reports a zero
 where it should report "not available". Anything below that reads a global was
@@ -798,7 +798,7 @@ knowing:
   `RELOC …` or `STEP …` runs and is recorded and never appears. Two experiments
   were read as "the code did not run" when the code ran fine.
 - **The module exports no globals.** Only the separately patched capture from
-  `scripts/export_globals.py` does. So `get_export("__global_0")` returns `None`
+  `cargo xt export-globals` does. So `get_export("__global_0")` returns `None`
   against the normal capture, and a diagnostic written against it prints nothing
   — silence that reads as "nothing to report". `stackSave` answers the same
   question through an export that actually exists, and `threads.rs` now uses it.
@@ -814,7 +814,7 @@ ever calls it. The flag reads zero before a worker enters its routine, and zero
 again after the one worker that returns cleanly has finished.
 
 Forcing that test to fail — the guard's `i32.load8_u` becomes `drop; i32.const
-0`, same three bytes, `scripts/neutralize_thread_profiler.py` — changes the run
+0`, same three bytes, `cargo xt neutralize-thread-profiler` — changes the run
 from **27 engine log lines and eleven traps to 167 lines and none**, three runs.
 
 That is a proof by construction, and it settles two things at once. The patch
@@ -895,7 +895,7 @@ Naming it did not need the assert at all. Each site sets the same `70008`, and
 `i32.const 70008` is four bytes (`41 f8 a2 04`) — so is `i32.const 70001`
 (`41 f1 a2 04`), because the sleb128 encoding of anything in this range differs
 only in its low seven bits. Give each site its own code and the engine prints
-the answer itself. `scripts/tag_offer_error_sites.py` does that; no control flow
+the answer itself. `cargo xt tag-offer-error-sites` does that; no control flow
 changes, nothing is written to memory, and no offset moves.
 
     wa_call_start_internal, make_and_cache_offer failed: 70003
@@ -1420,7 +1420,7 @@ that still says it.
 
 ### The profiler flag is 5,640 bytes below the main stack
 
-`scripts/neutralize_thread_profiler.py` says the corruption of `0x14B958` is
+`cargo xt neutralize-thread-profiler` says the corruption of `0x14B958` is
 "still unexplained". Here is the geometry it was missing: **`emscripten_stack_
 get_end` is `0x14cf60`**, and `0x14B958` is `0x1608` bytes below it. Static data
 begins where the stack region ends, and the profiler flag is the first
@@ -1720,11 +1720,11 @@ reference for emulating the data path.
 Most of what is above was inferred from disassembly, and inference has a poor
 record here. Two pieces of instrumentation now make parts of it measurable.
 
-**Exported globals.** `scripts/export_globals.py` adds an export for every
+**Exported globals.** `cargo xt export-globals` adds an export for every
 global to a *copy* of a module, so `Runtime::global_i32` can read them:
 
 ```sh
-python3 scripts/export_globals.py caps/D5pLH9sfOOl.wasm /tmp/patched/D5pLH9sfOOl.wasm 15
+cargo xt export-globals caps/D5pLH9sfOOl.wasm /tmp/patched/D5pLH9sfOOl.wasm 15
 WA_WASM_DIR=/tmp/patched cargo run --release --example self_participant_probe
 ```
 

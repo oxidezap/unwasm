@@ -25,7 +25,7 @@ use wasmtime::Val;
 
 /// Pins the exact bytes a derivation runs against.
 ///
-/// Hash before use, like `scripts/fetch-wasm.py`: an oracle that quietly
+/// Hash before use, like `cargo xt fetch-wasm`: an oracle that quietly
 /// answers from a different build is worse than one that does not run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModulePin {

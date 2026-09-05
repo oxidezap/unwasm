@@ -137,7 +137,7 @@ pub struct Plan {
     /// Mark every `return` in each of these functions.
     pub at_returns: Vec<u32>,
     /// The first marker id. Well clear of anything the module passes for real:
-    /// `tag_offer_error_sites.py` used the same base for the same reason.
+    /// `cargo xt tag-offer-error-sites` used the same base for the same reason.
     pub id_base: i32,
     /// The import to call, as `module::name` or as a bare name.
     ///

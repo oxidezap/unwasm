@@ -125,7 +125,7 @@ Concretely:
 
 ### On the real modules
 
-Every WhatsApp Web capture decompiles — the corpus as `scripts/fetch-captures.sh`
+Every WhatsApp Web capture decompiles — the corpus as `cargo xt fetch-captures`
 fetches it today, measured by `cargo test --test captured -- --ignored`:
 
 ```
@@ -901,7 +901,7 @@ cargo test --workspace                                  # 564 tests, ~20s
 cargo clippy --workspace --all-targets -- -D warnings
 cargo llvm-cov --workspace --summary-only
 
-./scripts/fetch-captures.sh                             # ~19 MB, once
+cargo xt fetch-captures                             # ~19 MB, once
 cargo test --test captured -- --ignored --nocapture     # the real modules
 cargo test --test emscripten -- --ignored --nocapture   # the real toolchain
 ```
@@ -932,7 +932,7 @@ it runs on a bare checkout.
 
 The `#[ignore]`d tiers run against the real WhatsApp Web modules. Those are
 megabytes of somebody else's build output, so they are not committed:
-`scripts/fetch-captures.sh` downloads them into `fixtures/wasm` (git-ignored)
+`cargo xt fetch-captures` downloads them into `fixtures/wasm` (git-ignored)
 from the public [`oxidezap/whatspec`](https://github.com/oxidezap/whatspec)
 archive, and checks each one against the sha256 pinned in
 `fixtures/captures.sha256`. A capture that arrives with different bytes is not

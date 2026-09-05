@@ -1,0 +1,2 @@
+[alias]
+xt = "run --quiet --release -p unwasm-xtask --"

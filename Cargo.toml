@@ -1,10 +1,13 @@
 [workspace]
 members = [
+    "tools/xtask",
+    "tools/xtask-support",
     "crates/unwasm-core",
     "crates/unwasm-cli",
     "crates/oracle-core",
     "crates/oracle-cli",
 ]
+default-members = ["crates/unwasm-core", "crates/unwasm-cli", "crates/oracle-core", "crates/oracle-cli"]
 resolver = "3"
 
 [workspace.package]

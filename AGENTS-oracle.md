@@ -30,7 +30,7 @@ A skipped run is not a passing run: check for `skipping:` in
 
 ## Where the modules come from
 
-`python3 scripts/fetch-wasm.py` puts them in `wasm/`, pulled from the whatspec
+`cargo xt fetch-wasm` puts them in `wasm/`, pulled from the whatspec
 `bundle-store` release and verified against the SHA-256s in `wasm.lock.json`.
 Do not commit them — a copy in the repository drifts from the capture the
 protocol notes refer to. `WA_WASM_DIR` overrides the lookup, and a sibling

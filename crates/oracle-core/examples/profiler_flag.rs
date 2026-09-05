@@ -5,7 +5,7 @@
 //! immediately when the byte at `0x14B958` is zero. Nothing in this module ever
 //! writes it: the only writer, `emscripten_thread_profiler_enable`, has no call
 //! sites and no table slots. It should be zero for the whole run, and it was
-//! not: `scripts/neutralize_thread_profiler.py` exists because forcing the test
+//! not: `cargo xt neutralize-thread-profiler` exists because forcing the test
 //! to fail took a run from eleven traps to none.
 //!
 //! **Where it sits.** This example prints the two numbers that frame it:

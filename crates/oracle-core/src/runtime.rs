@@ -474,7 +474,7 @@ impl Runtime {
     /// Most modules export none, and the interesting ones are usually among
     /// them: the VoIP engine keeps its call context in a global that only guest
     /// code can see, which is why so much about that context had to be inferred
-    /// from disassembly rather than read. `scripts/export_globals.py` patches a
+    /// from disassembly rather than read. `cargo xt export-globals` patches a
     /// copy of a module to export its globals, and this reads them back.
     pub fn global_i32(&mut self, name: &str) -> Result<i32> {
         let global = self

@@ -126,7 +126,7 @@ jobs:
           echo "$HOME/emsdk/upstream/emscripten" >> "$GITHUB_PATH"
 
       - name: Fetch the captures
-        run: ./scripts/fetch-captures.sh
+        run: cargo xt fetch-captures
 
       # The whole tier, including the tests that hand generated Rust back to
       # rustc. It used to be thirty-one minutes and only the decompilation was
