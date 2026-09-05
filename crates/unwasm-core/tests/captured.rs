@@ -9,12 +9,12 @@
 //! They are `#[ignore]`d because they are slow, not because they are optional:
 //!
 //! ```sh
-//! ./scripts/fetch-captures.sh
+//! cargo xt fetch-captures
 //! cargo test --test captured -- --ignored --nocapture
 //! ```
 //!
 //! The captures are megabytes of somebody else's build output, so they are not
-//! committed: `scripts/fetch-captures.sh` downloads them into `fixtures/wasm`
+//! committed: `cargo xt fetch-captures` downloads them into `fixtures/wasm`
 //! from the public `oxidezap/whatspec` archive and checks each against a pinned
 //! sha256. `WA_WASM_DIR` points somewhere else.
 //!
@@ -78,7 +78,7 @@ fn every_capture_either_decompiles_or_says_why_not() {
     assert!(
         missing.is_empty(),
         "these captures were not found: {}.\n\
-         Run `scripts/fetch-captures.sh`, or set WA_WASM_DIR to a directory \
+         Run `cargo xt fetch-captures`, or set WA_WASM_DIR to a directory \
          that already holds them.",
         missing.join(", ")
     );

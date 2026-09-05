@@ -895,7 +895,7 @@ pub mod captures {
 }
 
 /// Where the captures are, when `WA_WASM_DIR` does not say otherwise: the
-/// repository's own `fixtures/wasm`, which `scripts/fetch-captures.sh` fills.
+/// repository's own `fixtures/wasm`, which `cargo xt fetch-captures` fills.
 ///
 /// The default used to be a directory in one particular home. A harness that
 /// only finds its corpus on the machine it was written on reports "unavailable"
@@ -921,7 +921,7 @@ pub fn captured(id: &str) -> Option<Vec<u8>> {
 pub fn missing_capture(id: &str) -> String {
     format!(
         "{id} is not in {}.\n\
-         Run `scripts/fetch-captures.sh` to download the captures, or set \
+         Run `cargo xt fetch-captures` to download the captures, or set \
          WA_WASM_DIR to a directory that already holds them.",
         captures_directory().display()
     )

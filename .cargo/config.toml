@@ -1,0 +1,2 @@
+[alias]
+xt = "run --quiet --release --manifest-path tools/xtask/Cargo.toml --"
