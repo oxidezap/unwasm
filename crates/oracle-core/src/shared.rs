@@ -106,6 +106,7 @@ pub struct SharedHost {
     trace: Mutex<Trace>,
     /// The import `patch.rs` markers call, once somebody asks to watch it.
     marker_sink: Mutex<Option<String>>,
+    pub(crate) snapshots: std::sync::OnceLock<crate::snapshot::Recorder>,
     /// Markers seen, as a **ring**: the last [`MAX_MARKERS`], not the first.
     ///
     /// Separate from `trace` on purpose. The trace answers "what did the module
@@ -243,6 +244,7 @@ impl Default for SharedHost {
         Self {
             trace: Mutex::new(Trace::default()),
             marker_sink: Mutex::new(None),
+            snapshots: std::sync::OnceLock::new(),
             markers: Mutex::new(std::collections::VecDeque::new()),
             signaling: Mutex::new(Vec::new()),
             clock_ms: Mutex::new(0.0),

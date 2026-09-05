@@ -127,6 +127,9 @@ pub struct Plan {
     /// which is in the stack". A local rather than a memory read because a
     /// parameter is always in scope at entry and needs no address to be right.
     pub value_entry: Vec<(u32, u32)>,
+    /// Report an i32 local immediately before an instruction (zero-based
+    /// operator ordinal, excluding local declarations) in the original body.
+    pub value_at: Vec<(u32, usize, u32, bool)>,
     /// Mark every call site in `.0` that targets `.1`. A `None` callee marks
     /// *every* direct call the function makes, which is the shape to reach for
     /// when the question is "how far did it get".
@@ -520,6 +523,39 @@ pub fn instrument(bytes: &[u8], plan: &Plan) -> Result<(Vec<u8>, MarkerMap)> {
             kind: "value".to_owned(),
             func,
             detail: format!("local {local} at entry of func {func}"),
+        });
+        next_id += 1;
+    }
+
+    for &(func, instruction, local, float) in &plan.value_at {
+        let ordinal = body_of(func)?;
+        let start = layout.code_starts[ordinal];
+        let end = layout.bodies[ordinal].end;
+        let reader = wasmparser::OperatorsReader::new(wasmparser::BinaryReader::new(
+            &bytes[start..end],
+            start,
+        ));
+        let (_, offset) = reader
+            .into_iter_with_offsets()
+            .nth(instruction)
+            .with_context(|| format!("func {func} has no instruction {instruction}"))??;
+        let mut marker = Vec::new();
+        use wasm_encoder::{Encode, Instruction};
+        Instruction::I32Const(next_id).encode(&mut marker);
+        Instruction::LocalGet(local).encode(&mut marker);
+        if float {
+            Instruction::I32ReinterpretF32.encode(&mut marker);
+        }
+        Instruction::Call(sink).encode(&mut marker);
+        splices.push(Splice {
+            at: offset,
+            bytes: marker,
+        });
+        markers.push(Marker {
+            id: next_id,
+            kind: "value-at".into(),
+            func,
+            detail: format!("local {local} before instruction {instruction}"),
         });
         next_id += 1;
     }

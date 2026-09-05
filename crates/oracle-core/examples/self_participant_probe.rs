@@ -272,7 +272,9 @@ fn main() -> anyhow::Result<()> {
     let region = |r: &Runtime, when: &str| {
         if let Ok(b) = r.read(1_352_680, 224) {
             let words: Vec<String> = b
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .enumerate()
                 .filter(|(_, w)| w.iter().any(|&x| x != 0))
                 .map(|(i, w)| {
@@ -583,7 +585,7 @@ fn main() -> anyhow::Result<()> {
 
     println!("--- low memory around 0x18 ---");
     if let Ok(b) = runtime.read(0, 64) {
-        for (i, w) in b.chunks_exact(4).enumerate() {
+        for (i, w) in b.as_chunks::<4>().0.iter().enumerate() {
             let v = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
             if v != 0 {
                 println!("  [{}] = {v:#x}", i * 4);
@@ -607,7 +609,7 @@ fn main() -> anyhow::Result<()> {
         }
         println!("--- following *({slot}) = {ptr:#x} ---");
         if let Ok(block) = runtime.read(ptr, 64) {
-            for (i, w) in block.chunks_exact(4).enumerate() {
+            for (i, w) in block.as_chunks::<4>().0.iter().enumerate() {
                 let v = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
                 // What an entry *is* decides the diagnosis: a struct pointer and
                 // a `char*` are both plausible-looking words, and the engine

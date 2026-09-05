@@ -276,6 +276,31 @@ pub fn infer_table_slot(bytes: &[u8], slot: u32) -> Result<Option<FunctionAbi>> 
     module.analyse(bytes, &format!("table[{slot}]"), func)
 }
 
+/// Every table slot that points at `func`, in slot order.
+///
+/// The inverse of [`infer_table_slot`]: resolution answers "which function does
+/// this slot call", derivation needs "through which slots is this function
+/// reachable" before it can drive it with `Runtime::call_table`.
+pub fn table_slots_of(bytes: &[u8], func: u32) -> Result<Vec<u32>> {
+    let module = Layout::read(bytes)?;
+    Ok(module
+        .table
+        .iter()
+        .filter(|(_, target)| **target == func)
+        .map(|(slot, _)| *slot)
+        .collect())
+}
+
+/// How many functions the module's function space holds, imports included.
+///
+/// A selector's `index_hint` is checked against this before anything else, so
+/// a hint recorded against one capture fails loudly on a shorter one rather
+/// than resolving to whatever happens to sit there.
+pub fn function_count(bytes: &[u8]) -> Result<usize> {
+    let module = Layout::read(bytes)?;
+    Ok(module.func_types.len())
+}
+
 /// Infers the ABI of one function by its index in the module's function space.
 ///
 /// This is the form a trap needs: a wasm backtrace names the frames by index and

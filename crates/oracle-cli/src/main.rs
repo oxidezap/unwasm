@@ -226,6 +226,49 @@ enum Command {
         #[arg(long, default_value_t = 6)]
         min: usize,
     },
+    /// Derive vectors from a capture, deterministically.
+    ///
+    /// Runs a spec — a small program of allocations, writes, calls and reads
+    /// against the pinned bytes — and writes the outputs plus a `manifest.json`
+    /// recording the module hash, the resolved indices and slots, and every
+    /// output's hash. The same spec over the same bytes yields the same bytes.
+    Derive {
+        /// Path to the spec file (JSON).
+        #[arg(long)]
+        spec: String,
+        /// Directory receiving the outputs and `manifest.json`.
+        #[arg(long, short)]
+        out: String,
+    },
+    /// Carry a derivation spec from one capture to the next.
+    ///
+    /// WhatsApp renumbers every function between rollouts, so a spec pinned
+    /// to one capture answers about different code in the next. This carries
+    /// each selector forward by body fingerprint, re-settles it against its
+    /// string anchor on the new bytes, and writes the migrated spec — plus a
+    /// report saying what carried and what needs a human. Anything that is
+    /// not a unique answer on both sides is refused, never guessed.
+    Migrate {
+        /// Path to the spec file written against the old capture.
+        #[arg(long)]
+        spec: String,
+        /// Old capture: module id (as shown by `list`) or path to a `.wasm`.
+        #[arg(long)]
+        from: String,
+        /// New capture: module id or path to a `.wasm`.
+        #[arg(long)]
+        to: String,
+        /// Expected SHA-256 of the new capture, hex. From a trusted lock —
+        /// a hash that vouches for itself vouches for nothing.
+        #[arg(long = "new-sha")]
+        new_sha: String,
+        /// Expected size of the new capture, in bytes.
+        #[arg(long = "new-size")]
+        new_size: u64,
+        /// Where to write the migrated spec.
+        #[arg(long, short)]
+        out: String,
+    },
     /// Write a copy with trace markers spliced in, and print the marker map.
     ///
     /// A marker is a call to an import the module already declares, so nothing
@@ -318,6 +361,15 @@ fn main() -> Result<()> {
             outputs,
             engine,
         } => run_wasi(&catalog, &target, &args, &files, &outputs, &engine),
+        Command::Derive { spec, out } => derive(&catalog, &spec, &out),
+        Command::Migrate {
+            spec,
+            from,
+            to,
+            new_sha,
+            new_size,
+            out,
+        } => migrate(&catalog, &spec, &from, &to, &new_sha, new_size, &out),
     }
 }
 
@@ -402,6 +454,120 @@ fn run_wasi(
         eprintln!("exit: {code}");
     }
     std::process::exit(code);
+}
+
+/// Runs a derivation spec and reports what resolved and what was written.
+fn derive(catalog: &Catalog, spec: &str, out: &str) -> Result<()> {
+    use std::path::Path;
+
+    let spec_path = Path::new(spec);
+    let out_dir = Path::new(out);
+
+    // Read the pin first so a spec naming an absent module fails before any
+    // directory is created.
+    let raw: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(spec_path).with_context(|| format!("reading {spec}"))?,
+    )
+    .with_context(|| format!("parsing {spec}"))?;
+    let id = raw
+        .get("module")
+        .and_then(|module| module.get("id"))
+        .and_then(|id| id.as_str())
+        .with_context(|| format!("{spec} names no module.id"))?;
+
+    let module = catalog.resolve(id)?;
+    let manifest = oracle_core::derive::run_spec(spec_path, &module.path, out_dir)?;
+
+    println!(
+        "{} @ {} ({} bytes)\n",
+        manifest.module.id,
+        &manifest.module.sha256[..12],
+        manifest.module.size
+    );
+    for (name, resolved) in &manifest.resolutions {
+        println!(
+            "  {name:<24} index {:<6} slots {:?}",
+            resolved.index, resolved.slots
+        );
+    }
+    println!();
+    for output in &manifest.outputs {
+        println!(
+            "  wrote {:<40} {:>10} bytes  {}",
+            output.file,
+            output.bytes,
+            &output.sha256[..12]
+        );
+    }
+    println!("\n  manifest.json  spec {}", &manifest.spec_sha256[..12]);
+    Ok(())
+}
+
+/// Carries a spec onto a new capture and reports what moved.
+fn migrate(
+    catalog: &Catalog,
+    spec: &str,
+    from: &str,
+    to: &str,
+    new_sha: &str,
+    new_size: u64,
+    out: &str,
+) -> Result<()> {
+    use std::path::Path;
+
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(spec).with_context(|| format!("reading {spec}"))?)
+            .with_context(|| format!("parsing {spec}"))?;
+    let parsed: oracle_core::derive::Spec =
+        serde_json::from_value(raw).with_context(|| format!("parsing {spec}"))?;
+
+    let old = catalog.resolve(from)?;
+    let new = catalog.resolve(to)?;
+    let old_bytes =
+        std::fs::read(&old.path).with_context(|| format!("reading {}", old.path.display()))?;
+    let new_bytes =
+        std::fs::read(&new.path).with_context(|| format!("reading {}", new.path.display()))?;
+
+    let new_pin = oracle_core::derive::ModulePin {
+        id: new.id.clone(),
+        sha256: new_sha.to_owned(),
+        size: new_size,
+    };
+    let (migrated, report) =
+        oracle_core::migrate::migrate_spec(&parsed, &old_bytes, &new_bytes, &new_pin, &new.path)?;
+
+    let text = serde_json::to_string_pretty(&migrated).context("encoding migrated spec")?;
+    std::fs::write(Path::new(out), &text).with_context(|| format!("writing {out}"))?;
+
+    println!(
+        "{} ({} functions) -> {} ({}): {} carry one-to-one\n",
+        old.id,
+        report.coverage.old_functions,
+        new.id,
+        report.coverage.new_functions,
+        report.coverage.carried
+    );
+    for (name, answer) in &report.selectors {
+        match answer {
+            oracle_core::migrate::Migrated::Carried {
+                old_index,
+                new_index,
+                ..
+            } => println!("  {name:<24} {old_index} -> {new_index}"),
+            oracle_core::migrate::Migrated::Disambiguated {
+                old_index,
+                new_index,
+                candidates,
+            } => println!(
+                "  {name:<24} {old_index} -> {new_index}  (anchor settled {candidates} sharers — review advised)"
+            ),
+            oracle_core::migrate::Migrated::NeedsHuman { old_index, reason } => {
+                println!("  {name:<24} {old_index} -> STUCK: {reason}")
+            }
+        }
+    }
+    println!("\nwrote {out}");
+    Ok(())
 }
 
 /// Splits `guest=host`, defaulting the guest name to the host file's own name.
@@ -919,6 +1085,7 @@ fn instrument(catalog: &Catalog, target: &str, out: &str, marks: &MarkOpts) -> R
     let plan = Plan {
         entry: marks.entry.clone(),
         value_entry,
+        value_at: Vec::new(),
         before_calls: marks.calls_in.iter().map(|func| (*func, None)).collect(),
         at_returns: marks.returns_in.clone(),
         id_base: patch::DEFAULT_ID_BASE,

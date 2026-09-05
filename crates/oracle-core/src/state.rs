@@ -270,6 +270,9 @@ impl HostState {
 
     /// Records one host call into the shared trace.
     pub fn record(&self, module: &str, name: &str, args: Vec<i64>) {
+        if let Some(recorder) = self.shared.snapshots.get() {
+            recorder.record(self, module, name, &args);
+        }
         self.shared.record(module, name, args);
     }
 }

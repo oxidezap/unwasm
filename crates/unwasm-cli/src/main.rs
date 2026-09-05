@@ -1495,7 +1495,7 @@ fn dump(image: &unwasm_core::analysis::DataImage<'_>, address: i32, length: usiz
 
     if readable >= 4 {
         out.push_str("\nas u32 little-endian:\n");
-        for (word, chunk) in bytes.chunks_exact(4).enumerate() {
+        for (word, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
             let value = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             let note = if value == 0 {
                 "  zero".to_string()

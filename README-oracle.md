@@ -111,6 +111,7 @@ oracle callers <id> <index>                  # walk back up the call graph
 oracle instrument <id> --calls-in N [--sink env::name] -o out.wasm
                                              # trace which call sites ran
 oracle patch <id> --replace F:AT:N:SPEC -o out.wasm
+oracle derive --spec spec.json -o out/   # run a pinned derivation, write outputs + manifest.json
 ```
 
 ## Watching a run, not just reading it
@@ -813,3 +814,11 @@ That covers this harness only. The captured `.wasm` modules it loads are
 WhatsApp's, are not redistributed by this repository, and are not covered by
 either licence. This is an independent interoperability and protocol-research
 tool; it is not affiliated with, authorised by, or endorsed by WhatsApp or Meta.
+
+## Reproducible MLOW oracle corpus
+
+`cargo build --release --locked -p oracle-cli` followed by
+`python3 scripts/mlow/verify.py` re-derives the codec corpus from the pinned
+J/S captures. The lock verifies every output and selector; the capture CI
+runs both modules independently. See [MLOW_DERIVE.md](MLOW_DERIVE.md) for the
+recovered layouts, DSP boundaries, migration refusals and measured results.
