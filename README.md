@@ -1,6 +1,6 @@
 # unwasm
 
-A WebAssembly decompiler that emits Rust — and whose output always compiles,
+A WebAssembly decompiler that emits Rust. Its output always compiles,
 always runs, and is checked against the module it came from.
 
 ```console
@@ -10,8 +10,8 @@ wrote module.rs (50682 lines, 478 functions)
 
 The claim other decompilers cannot make is the one this project is built
 around: **the decompilation is executable, so its faithfulness is measured
-rather than asserted.** Every test below runs the same calls twice — once on the
-wasm module in V8, once on the generated Rust — and compares the returned value,
+rather than asserted.** Every test below runs the same calls twice, once on the
+wasm module in V8 and once on the generated Rust, and compares the returned value,
 the trap, and the final contents of linear memory.
 
 ## Repository boundary
@@ -44,7 +44,7 @@ The field, as of July 2026:
 Nothing maintained targets Rust, and nothing at all treats "does the output
 actually behave like the module" as a property to test rather than a hope.
 
-## What it does today — level 0
+## What it does today. Level 0
 
 A faithful translation. Linear memory is a `Vec<u8>`, wasm's four value types
 are their Rust counterparts, and every trap is a trap:
@@ -65,14 +65,13 @@ fn f2(&mut self, p0: i32) -> i32 {
 ```
 
 That is a `for` loop summing `0..n` in the C source. The decompilation shows
-what the module *does*, which is Gauss's formula — because that is what the
+what the module *does*, which is Gauss's formula, because that is what the
 compiler emitted. Level 0 does not pretend otherwise.
 
 Concretely:
 
 - **Expressions rather than one binding per instruction.** Pure arithmetic
-  folds into whatever consumes it, which is about a third of the emitted lines —
-  and, on the module that needed it most, 1.2 million of them.
+  folds into whatever consumes it, which is about a third of the emitted lines, and, on the module that needed it most, 1.2 million of them.
 - **The whole MVP instruction set**, plus sign extension and the saturating
   truncations: 136 numeric opcodes, all of memory, `call_indirect`, `br_table`,
   passive segments.
@@ -87,19 +86,19 @@ Concretely:
   `NoImports` traps on every call, so "nobody supplied a host" never looks like
   "the host returned 0".
 - **Imports that can only be answered from inside are generated**, not asked
-  for: Emscripten's `invoke_*` trampolines — 134 of the VoIP module's 242
-  function imports — plus `__pthread_create_js`, the main thread's own
+  for: Emscripten's `invoke_*` trampolines, 134 of the VoIP module's 242
+  function imports, plus `__pthread_create_js`, the main thread's own
   initialisation, and the `mmap` family, which allocates out of the module's own
   `memalign` and reads the file through the host's `fd_pread`.
 - **Nothing is skipped.** An opcode with no faithful Rust form is an error
-  naming the construct — never a comment in the output, never a stub.
+  naming the construct, never a comment in the output, never a stub.
 - **No `unsafe`.** `unsafe_code = "forbid"` for this crate and for what it
   emits. A decompiler that needs raw pointers to model a sandbox has lost the
   property that made the sandbox worth reading.
 
 ### On the real modules
 
-Every WhatsApp Web capture decompiles — the corpus as `cargo xt fetch-captures`
+Every WhatsApp Web capture decompiles, the corpus as `cargo xt fetch-captures`
 fetches it today, measured by `cargo test --test captured -- --ignored`:
 
 ```
@@ -117,11 +116,11 @@ trampolines and the atomics; see below.
 `COs9e0Kj0ic` compiles with rustc in about 2.5 seconds and instantiates, which
 runs the module's own `__wasm_call_ctors` and every static initialiser with it.
 
-`ayqr5HQtlkb` — 2.0 MiB of wasm, 3055 functions — compiles and instantiates in
+`ayqr5HQtlkb`, 2.0 MiB of wasm and 3055 functions, compiles and instantiates in
 **23 seconds**. In a single file the same module took **22m49s**.
 
-`D5pLH9sfOOl`, the 9.4 MiB VoIP module — 13347 functions, 2.4M lines of Rust
-across 415 files, a shared imported memory and 1070 atomics — **compiles and
+`D5pLH9sfOOl`, the 9.4 MiB VoIP module, 13347 functions, 2.4M lines of Rust
+across 415 files, a shared imported memory and 1070 atomics. **Compiles and
 instantiates in 13m44s**, and comes up with the 160 pages of memory its import
 declares. Its `start` function runs during instantiation without needing a
 host.
@@ -140,7 +139,7 @@ table: 10762 slots
 nothing was answered with a default
 ```
 
-Ten megabytes of somebody else's wasm, compiled and instantiated — and the last
+Ten megabytes of somebody else's wasm, compiled and instantiated, and the last
 line is the one that matters: its `start` ran through to the end without asking
 the host a single question, so nothing in that run rests on a default. Every
 rustc timing on this page names the build it was measured on.
@@ -159,8 +158,7 @@ becomes one enormous unit. Measured on that capture, same binary each time:
 | 4              | 764   | 10.4s  | 132×         |
 
 The system time is the tell: 1102s for one file against 12.6s for 192. That is
-not work, it is a single codegen unit thrashing. Sixteen is the default —
-53× faster, and still a number of files a person can navigate; going four times
+not work, it is a single codegen unit thrashing. Sixteen is the default, 53× faster, and still a number of files a person can navigate; going four times
 finer buys another 2.5× for four times the files. `--split <n>` overrides it,
 and a module of 512 functions or fewer stays in one file, where it compiles in
 seconds anyway.
@@ -170,7 +168,7 @@ seconds anyway.
 wasm's `block`, `loop` and `if` become Rust's labelled blocks one for one, and
 rustc parses that recursively on an 8 MiB stack. A `br_table` dispatch in the
 VoIP module nests **2466** blocks, and rustc dies on it with `SIGSEGV` and a
-backtrace through its own parser — which reads as a compiler bug rather than as
+backtrace through its own parser, which reads as a compiler bug rather than as
 a file that needs a bigger stack:
 
 ```console
@@ -188,14 +186,13 @@ note: function #12919 nests 2466 blocks, and rustc parses nesting recursively.
 
 The indentation stops at 32 levels for the same reason it exists at all. Two
 thousand levels of leading space is not readable, and it is not free: uncapped,
-one part file of that module came to 650 MB — 644 MB of which was whitespace —
-and the module to 1.8 GB of Rust. Capped it is 227 MB. The labels are what say
+one part file of that module came to 650 MB, 644 MB of which was whitespace, and the module to 1.8 GB of Rust. Capped it is 227 MB. The labels are what say
 where a `break` goes; `'b2465` is exact where the indentation was only wide.
 
 ### What the module says about itself
 
 Level 0 translates. Alongside it, a small analysis pass *reads*, and annotates
-the output with what the module states about itself — never with a guess:
+the output with what the module states about itself, never with a guess:
 
 ```rust
 /// Global #0 (mutable).
@@ -211,7 +208,7 @@ let t0: i32 = 211967i32 /* "called `Option::unwrap()` on a `None` value" */;
 ```
 
 Both claims carry their evidence. The stack pointer is found by an exported
-name where one survives, and otherwise by counting prologues — one match is a
+name where one survives, and otherwise by counting prologues. One match is a
 coincidence, two hundred is a calling convention. Static strings are quoted from
 the data segments, and where the code passes a pointer with a length beside it
 (how Rust passes `&str`) the length is used, so an unterminated string stops
@@ -221,11 +218,11 @@ An address that holds no text but that dozens of functions reference is pointed
 out too: `1352840i32 /* address, in 72 functions */`. A context pointer reads as
 noise in each function separately and as shared state once you notice it is the
 same number everywhere. What counts as an address is decided by the span the
-module's own data segments occupy — otherwise `2147483647` comes out as the
+module's own data segments occupy, otherwise `2147483647` comes out as the
 most widely shared address in the module, and it is arithmetic.
 
 On the mozjpeg capture that recovers 247 strings, including the Rust panic
-messages that name the failing function — which is how `wa-wasm-oracle` worked
+messages that name the failing function, which is how `wa-wasm-oracle` worked
 out that module's calling convention in the first place.
 
 ### Names, where the module never wrote any
@@ -244,7 +241,7 @@ pub(crate) fn f458_fill_user_info_from_participant(&mut self, ..)
 **3313 of its 13347 functions get a name this way**, from two sources:
 
 - **`__assert_fail(expr, file, line, func)`**, whose last argument is
-  `__func__` — the compiler writing the name into the binary. That is not a
+  `__func__`, the compiler writing the name into the binary. That is not a
   guess, and it beats everything else. 17 functions in the VoIP module.
 - **The messages the function logs**, ranked by *how often* it references them.
 
@@ -271,7 +268,7 @@ costs a misleading suffix rather than a lost thread.
 
 It is not a general technique, and the numbers say so plainly: 2654 names in the
 VoIP module, 25 in the next one, and 0 in two others. It works where code logs
-with a function prefix — which the WhatsApp code does and mozjpeg does not.
+with a function prefix, which the WhatsApp code does and mozjpeg does not.
 
 #### Reaching the strings at all
 
@@ -284,13 +281,13 @@ before the `memory.init`, and resolving them turned 0 quoted strings into
 
 Placements are recorded only in that plainest form. Per-thread storage is placed
 at a computed `base + offset`, and a segment placed at two different constant
-addresses is dropped rather than picked between — both are true, so neither can
+addresses is dropped rather than picked between, both are true, so neither can
 resolve an address back to text.
 
 ### The API the module publishes
 
 embind is how a C++ module tells JavaScript what it exposes. The registration
-runs at startup — but its arguments are constants, including the pointer to
+runs at startup, but its arguments are constants, including the pointer to
 each name *and the pointer to the array of type ids*, so the whole thing reads
 statically:
 
@@ -304,8 +301,7 @@ class_constructor Uint8List::Uint8List()
 
 Each type id is the address of a `std::type_info` that some other registration
 names, so `std::string` and `bool` come back as themselves rather than as `i32`.
-**This is the only place in a stripped module where a type has a name at all** —
-everything else this crate recovers is what the compiler left behind, and this
+**This is the only place in a stripped module where a type has a name at all**. Everything else this crate recovers is what the compiler left behind, and this
 is what the author published. 114 registrations in `JgwtTQVeWPm`, 81 named, 40
 with full signatures.
 
@@ -313,8 +309,7 @@ Three details that each cost a wrong answer before they were right: a class
 registers three ids for itself (the class, a pointer, a const pointer), so a
 method returning the second is returning the class; the types can be registered
 *after* the function that uses them, so it takes two passes; and `int` is three
-characters, which the general text reader refuses as too short to be a string —
-losing the most common type in any module.
+characters, which the general text reader refuses as too short to be a string, losing the most common type in any module.
 
 ### The shadow stack
 
@@ -341,17 +336,17 @@ bytes refers to.
 Two things it reports honestly rather than glossing over:
 
 - **When the address escapes.** If the frame is passed to a call, stored into
-  memory, or copied to another local, the summary says so — the slots listed
+  memory, or copied to another local, the summary says so. The slots listed
   are then only the accesses that could be followed, not the whole frame.
 - **When a frame is never published.** A leaf function at `-O0` computes
   `sp - 32`, uses it, and never writes it back, because nothing else will
-  allocate while it runs. Requiring the write — which this did at first — misses
+  allocate while it runs. Requiring the write, which this did at first, misses
   every leaf function in a module.
 
 Turning those slots into Rust variables is `--level 1`, and it is opt-in
 because it stops the decompilation being byte-exact: the bytes a promoted slot
 used to leave in linear memory are no longer there. That is a real property to
-give up and not one to give up quietly, so the level says it is doing so — at
+give up and not one to give up quietly, so the level says it is doing so, at
 every function it changed, and at every function it refused and why:
 
 ```rust
@@ -363,7 +358,7 @@ every function it changed, and at every function it refused and why:
 /// exactness level 1 gives up, and it is given up here.
 ```
 
-The answers still match the engine — that is tested, on a struct of `int`,
+The answers still match the engine. That is tested on a struct of `int`,
 `short`, `signed char` and `unsigned char`, because a narrow binding has to mask
 on store and sign-extend on load. The memory does not, and the test reports the
 difference rather than hiding it.
@@ -380,13 +375,13 @@ frames with anything promotable at all:
 | `rogm88TRRiw` | 2 of 1211 | 3 of 13858 |
 | `JgwtTQVeWPm` | 53 of 4916 | 87 of 30980 |
 
-Compiled C reaches its own frames constantly — it passes `&point` to something,
-indexes an array in it, or packs two variables into a word — and what survives
+Compiled C reaches its own frames constantly. It passes `&point` to something,
+indexes an array in it, or packs two variables into a word, and what survives
 all of that is a minority.
 
 ### The classes the module declares
 
-`--level 2` is names, and the names are not inferred from behaviour — they are
+`--level 2` is names, and the names are not inferred from behaviour. They are
 read out of a declaration the compiler wrote down. The Itanium ABI puts a
 `type_info` in the data segments for every polymorphic class and a vtable beside
 it, and both are byte layouts: `{vptr, name}` for the first, `{offset-to-top,
@@ -405,22 +400,21 @@ type_info*, slots…}` for the second. `unwasm classes` prints what that says:
 A vtable slot is a function, so a class with a vtable names the functions in it:
 `f9821` becomes `f9821_WasmShimErrorHandler_v3`, with a doc comment giving the
 `type_info`'s address, the mangled string, the vtable's address and the slot.
-**The method's own name is nowhere in the module** — only its position is — so
+**The method's own name is nowhere in the module**, only its position is, so
 that is what the name carries, and the index stays in it.
 
 Four refusals keep it honest:
 
 - **A vtable pointer only a couple of `type_info`s share is not one.** Itanium
-  gives every `type_info` a vptr, and a program has a handful — one per *kind*.
+  gives every `type_info` a vptr, and a program has a handful, one per *kind*.
   A pointer 384 candidates agree on is `__class_type_info`; a pointer one
   candidate has is two words that happened to line up. The floor is 3, swept
   over the corpus: at 2 two of the three C modules report a class that is not
   there, at 3 all three report none, and at 4 the VoIP module starts losing
   real ones.
 - **A function in more than one vtable is named after none of them.**
-  Inheritance puts a base's method in every derived vtable — 204 of the VoIP
-  module's 1813 vtable functions are shared, one of them across 333 vtables —
-  and picking one owner would be a claim the bytes do not make.
+  Inheritance puts a base's method in every derived vtable, 204 of the VoIP
+  module's 1813 vtable functions are shared, one of them across 333 vtables, and picking one owner would be a claim the bytes do not make.
 - **A name that cannot be demangled stays mangled.** Template arguments need
   Itanium's substitution table, and a substitution resolved wrongly is a name
   that says something the module did not, so `I…E` comes out as `<…>`: the
@@ -429,7 +423,7 @@ Four refusals keep it honest:
 - **What the module says about itself wins.** A function the name section
   already names, or a catalogue already recognised, keeps that name.
 
-Measured across the corpus — where the three C modules are the control, and
+Measured across the corpus, where the three C modules are the control, and
 their zeroes are what give the rest their meaning:
 
 | capture | classes | with vtables | kinds | functions named |
@@ -443,13 +437,13 @@ their zeroes are what give the rest their meaning:
 
 Level 2 gives up nothing. Level 1 trades byte-exactness for readability and says
 so; level 2 is identifiers and comments, and the differential test runs the
-whole thing again with the names on — same calls, same trap, same linear memory.
+whole thing again with the names on. Same calls, same trap, same linear memory.
 A class name that changed a result would be a bug of the same severity as wrong
 arithmetic.
 
 ### What is left for a host
 
-After decompiling, what remains is the part only a host can answer — and half
+After decompiling, what remains is the part only a host can answer, and half
 of it is not application-specific at all. `unwasm host` writes both: the
 mechanical imports, implemented, and the rest as `todo!()`.
 
@@ -464,8 +458,8 @@ $ cargo run
 hello 42 1.500
 ```
 
-That `printf` went through the module's own musl — formatting, the stdio
-buffer, the iovec array — and came out of the generated `fd_write`. The
+That `printf` went through the module's own musl, formatting, the stdio
+buffer and the iovec array, and came out of the generated `fd_write`. The
 filesystem it writes to is a `BTreeMap<String, Vec<u8>>` in the host struct;
 nothing escapes to the real one, because a module you are running to find out
 what it does should not be able to open `/etc/passwd`. Randomness and the
@@ -501,8 +495,8 @@ impl Imports for Host {
 
 Every method takes a `rt::Caller` as well as its arguments. A wasm import is
 handed numbers, and almost every interesting one is a number *into* linear
-memory — `fd_write` gets the address of an iovec array, `__assert_fail` the
-address of a string — so without the memory a host cannot answer at all. The
+memory, `fd_write` gets the address of an iovec array, `__assert_fail` the
+address of a string, so without the memory a host cannot answer at all. The
 `Caller` carries it, and is a struct rather than a bare `&mut Memory` because
 it is where the next capability goes: adding a field costs nothing, while
 adding a parameter changes every host ever written.
@@ -510,7 +504,7 @@ adding a parameter changes every host ever written.
 Grouped by where each import comes from, because 106 methods in one list is a
 wall and the same 106 split into "these are WASI", "these are the C++ runtime"
 and "these are yours" is a plan. What is left is `todo!()` rather than a stub
-returning zero — a stub compiles, runs, and is wrong, and the module cannot
+returning zero, a stub compiles, runs, and is wrong, and the module cannot
 tell "not written yet" from "answered 0".
 
 An implementation is emitted only when the signature matches exactly.
@@ -554,12 +548,12 @@ calls 38:
 
 Each function carries the same in its doc comment, and a function nothing calls
 says which kind of nothing: exported, reached only through the table, or
-neither — an entry point or dead code.
+neither, an entry point or dead code.
 
 The *sites* are counted as well as the callers, and the difference is the point:
 one caller that calls from a loop body is one caller and many sites. A function
 reached from 58 sites is one whose body must not be instrumented to answer a
-question about one of them — the measurement would be of whichever site ran.
+question about one of them. The measurement would be of whichever site ran.
 
 **`--instrument-stores`** turns "who wrote this address?" from a day into a
 run. The output executes, so the question is one the machine can answer:
@@ -580,7 +574,7 @@ A hit names the *instruction*, not only the function: a function with fifty
 stores in it leaves the next question open, and `unwasm bytes voip.wasm 4667241
 8` prints the one that fired.
 
-Every write goes through the check — including `memory.fill` and
+Every write goes through the check, including `memory.fill` and
 `memory.copy`, since a `memset` is the usual answer to "who zeroed it" and it
 is not a store. A hit records the function that did it, the address, the width
 and which kind of write it was; `stop` panics at the write instead, so the
@@ -589,7 +583,7 @@ and the plain output does not route through the check at all.
 
 **`unwasm frames --outside`** is the static half of the same question. The
 prologue says how big the frame is and the walk records where each store went,
-so a store at or past the end — an overrun into the caller's frame — is a
+so a store at or past the end, an overrun into the caller's frame, is a
 finding the analysis already has the numbers for:
 
 ```console
@@ -600,7 +594,7 @@ f10284                          1168 bytes  47 slots  (address escapes)
 226 of 4375 frames write outside themselves or through a computed address
 ```
 
-Constant overruns are rare — zero in the VoIP module, since a compiler would
+Constant overruns are rare, zero in the VoIP module, since a compiler would
 have to emit one on purpose. What the list is really for is the second line:
 an indexed write into a frame array, whose offset is not knowable statically.
 226 of 4375 is a short enough list to read.
@@ -608,7 +602,7 @@ an indexed write into a frame array, whose offset is not knowable statically.
 **`--offsets`** writes `offsets.json` beside the output: for each generated
 line, the offset and length of the wasm bytes that produced it. Patching a
 module by hand otherwise means computing an LEB encoding and counting bytes,
-and a slip there does not look like a slip — the pattern is simply not found,
+and a slip there does not look like a slip. The pattern is simply not found,
 which reads as "the code changed" rather than "the arithmetic was wrong".
 
 ```console
@@ -621,9 +615,9 @@ $ unwasm bytes voip.wasm 390 7
 A line's span covers every operator lowered since the previous line, so the
 operands folded into it are inside the span rather than missing from the map.
 `unwasm bytes` answers the other half: what is actually there, and whether the
-sequence is unique — which is what decides if a pattern patch is safe.
+sequence is unique, which is what decides if a pattern patch is safe.
 
-**`unwasm constants`** finds every site that pushes a value — all of them,
+**`unwasm constants`** finds every site that pushes a value, all of them,
 which is the point. An error code that turns up 481 times is not the nine sites
 a `grep` of the decompiled output finds, and an account built on the nine is
 guessing:
@@ -637,8 +631,7 @@ f11198_make_and_cache_offer  i32.const at 5095372 + 4 bytes
 
 Each site comes with its offset and its encoded length, which is what a
 same-length replacement needs: give all 482 a distinct value, run, and the
-engine's own log says which one fired. The data count is separate on purpose —
-counting the bytes of a number is not counting the sites that push it.
+engine's own log says which one fired. The data count is separate on purpose. Counting the bytes of a number is not counting the sites that push it.
 
 **`--only … --with-callees`** brings the functions a function calls along with
 it. One level, not the transitive closure: reading a function and needing the
@@ -659,7 +652,7 @@ Each function also says where it sits: `/// In the function table at slot 7897`.
 
 Most of a 9 MiB module is not the application: it is libc, libc++ and whatever
 else was linked in. Those halves have names in a module you build yourself, and
-none at all in a shipped one — but the bodies are the same code. A **signature
+none at all in a shipped one, but the bodies are the same code. A **signature
 catalogue** carries the names across.
 
 ```console
@@ -671,7 +664,7 @@ $ unwasm decompile voip.wasm -o out/ --signatures libc.sigs
 
 A fingerprint is the opcode sequence with everything a rebuild renumbers left
 out: constants, load and store offsets, callee indices, global and data-segment
-indices. What stays is the shape — the operators, the control flow, and the
+indices. What stays is the shape, the operators, the control flow, and the
 *kind* of each access, since a byte load and a word load are not the same
 function however alike the rest reads.
 
@@ -684,13 +677,13 @@ The measurements, because the honest answer is "narrower than it sounds":
 
 End to end, a catalogue of the 14 functions one `printf` drags in, applied to a
 236 KiB capture built by a different emscripten version, names two of its 478:
-`__towrite` and `frexp` — both leaves, both plausible, and both a rounding error
+`__towrite` and `frexp`, both leaves, both plausible, and both a rounding error
 against the module. `tests/captured.rs` runs exactly that.
 
 So a match is strong evidence and a miss is no evidence at all. This names
 functions; it never marks one as unrecognised, and it never overrides a name the
 module gave itself. A fingerprint two differently-named functions share is
-dropped rather than resolved — the constants were what told them apart, and the
+dropped rather than resolved. The constants were what told them apart, and the
 constants are exactly what a fingerprint leaves out. Functions shorter than
 twenty instructions are not catalogued at all, since every *return the first
 argument* in a module fingerprints alike.
@@ -714,7 +707,7 @@ Finished in 11.10s
 ```
 
 **11 seconds instead of 21 minutes.** The functions left out keep their names
-and signatures and become `unimplemented!()`, so the result still builds — and
+and signatures and become `unimplemented!()`, so the result still builds, and
 a run that reaches one stops and says which function it wanted, which is a
 worklist rather than a wrong answer:
 
@@ -725,7 +718,7 @@ not implemented: function #229 was not decompiled: --only
 Without `--direct-only` the set is complete and useless: `call_indirect` names
 a type rather than a target, so every table slot with a matching signature
 joins it, and on this module that is 98% of the functions. That number is worth
-knowing rather than hiding — it is what "could run" honestly means here.
+knowing rather than hiding. It is what "could run" honestly means here.
 
 `start` always comes along, since instantiation runs it before anything the
 caller asked for.
@@ -764,15 +757,15 @@ $ unwasm constants module.wasm 5103 --data # and where the data holds it
 *guest*, which is a different number: the segment that covers it decides the
 mapping, and a threaded module's segments are passive and carry no address at
 all until the `memory.init` calls have been resolved. `data` says which segment
-covers the address, the file offset of the byte — the number `bytes` and `patch`
-take — the hex, and the words as u32 with the strings they point at. An address
+covers the address, the file offset of the byte, the number `bytes` and `patch`
+take, the hex, and the words as u32 with the strings they point at. An address
 no segment covers is not an error; it is memory the module never initialises,
 and it reads as zero at run time.
 
 `vtable` reads the same bytes as a table of function pointers: table index,
 function, signature. **A slot holding 0 is a pure virtual function**, and a
 `call_indirect` reaching one takes table index 0, mismatches its signature and
-traps — which kills the thread rather than returning an error anybody catches.
+traps, which kills the thread rather than returning an error anybody catches.
 From the outside that looks like the engine dying for no reason; here it is one
 line. The read stops at the first word that is neither a live table index nor a
 null run a live index follows, so it does not report the next object's bytes as
@@ -781,7 +774,7 @@ methods. `--class` takes a name `classes` printed and finds the address itself.
 
 `stores` answers "who writes byte +846 of this struct". It follows the constant
 displacements a function applies to its own parameters and locals, so a field
-written through `base = p - 8` as `+854` is still found at 846 — a grep of
+written through `base = p - 8` as `+854` is still found at 846, a grep of
 decompiled output finds neither the number nor the write. `--exact` is the
 literal search, `--kind load|store|both` picks the direction, and functions
 whose operand stack the walk lost are named rather than silently skipped.
@@ -805,10 +798,10 @@ index   name                                     file        first    last
 compiles. `--bare` drops them, and the runtime and the imports with them: the
 result does not compile and is a hundred lines instead of a million. `--spans`
 prints where each function starts and ends in the file that would be written,
-which is what a slice needs — searching for the next `fn f<n>` stops at the
+which is what a slice needs. Searching for the next `fn f<n>` stops at the
 wrong closing brace, and a truncated body reads as a complete one.
 
-The output is a self-contained Rust module — no dependencies, runtime embedded:
+The output is a self-contained Rust module with no dependencies and the runtime embedded:
 
 ```rust
 mod generated;
@@ -837,14 +830,14 @@ let mut instance = generated::Instance::with_host(Host);
 a module, decompiles it, builds the result with rustc, and runs both sides:
 
 - **136 opcodes, one at a time** (`tests/opcodes.rs`), each over a spread of
-  values chosen where the semantics turn — zero, the minimum, a shift count past
+  values chosen where the semantics turn, zero, the minimum, a shift count past
   the width, NaN, both zeros, the infinities.
 - **C fixtures at every optimisation level** (`tests/differential.rs`), `-O0`
   through `-Oz`, since `-O0` keeps everything in the shadow stack and `-Oz`
   restructures the control flow.
 - **Emscripten modules** (`tests/emscripten.rs`), built by the toolchain the
-  captured modules were built with. These run its real libc — `malloc`, `free`,
-  `memcpy`, `strlen` — its libm, and C++ virtual dispatch, where the vtable
+  captured modules were built with. These run its real libc, `malloc`, `free`,
+  `memcpy`, `strlen`, its libm, and C++ virtual dispatch, where the vtable
   lands in an element segment and the call goes through `call_indirect`. Tens of
   thousands of instructions the fixtures never reach, and they agreed on the
   first run.
@@ -857,7 +850,7 @@ Three bugs this caught that reading would not have:
    crosses a block boundary; a Rust `let` does not. Found by the first real
    module, in three functions.
 2. **`data.drop` is observable.** The bytes are a `const` in the output, so
-   dropping looks like a no-op — but a later `memory.init` from a dropped
+   dropping looks like a no-op, but a later `memory.init` from a dropped
    segment traps in every engine. The comment in the source said the opposite
    until the harness disagreed.
 3. **A constant initialiser was read as its first operator.** `(i32.const 1)
@@ -865,7 +858,7 @@ Three bugs this caught that reading would not have:
    address, with nothing reported.
 
 Two more the harness caught about *itself*: f64 bit patterns lose precision
-through a JSON number, and NaN payloads are not determined by the spec — so
+through a JSON number, and NaN payloads are not determined by the spec, so
 those are compared as `nan`, not as bits.
 
 ## Building and testing
@@ -887,20 +880,19 @@ green as a run that compared everything.
 
 **The clang version matters**, and it is the one requirement that is not
 obvious. `read_prologue` knows four spellings of the shadow-stack prologue,
-each found by reading what clang actually emits at `-O0` — so which frames the
+each found by reading what clang actually emits at `-O0`, so which frames the
 analysis can see is a property of the compiler that built the fixture. clang 22
 is what these tests were written against and what CI pins; Ubuntu 24.04's
 clang 18 emits the fourth spelling, where every intermediate value goes through
 a local of its own, and the frame tests in `backend.rs` pass under both. A
-fifth compiler may well have a fifth spelling — before concluding that a module
+fifth compiler may well have a fifth spelling. Before concluding that a module
 has no frames, check what built it.
 
 `emcc` for a C++ fixture is `em++`. The driver decides which runtime to link,
 and `emcc` links libc only: on Emscripten 6 a `.cpp` fixture given to `emcc`
 fails the link with `undefined symbol: __cxa_throw`.
 
-`cargo test --workspace` needs none of the above beyond those four tools —
-it runs on a bare checkout.
+`cargo test --workspace` needs none of the above beyond those four tools. It runs on a bare checkout.
 
 ### The captures
 
@@ -914,19 +906,18 @@ the module the tests pin their numbers to, and is refused rather than used.
 
 WhatsApp rolls these payloads: a module is reissued under a new id and the old
 id stops being served. When that happens the corpus moves to the build that
-succeeded it and every number a test pins is re-read against the new module —
-which is why the counts in `captured.rs` and the ones quoted throughout this
+succeeded it and every number a test pins is re-read against the new module, which is why the counts in `captured.rs` and the ones quoted throughout this
 README can name different builds. Each figure below says which.
 
 `emcc` is needed only by the `#[ignore]`d Emscripten tests. On Arch the
-`emscripten` package provides it — note that it replaces `binaryen`, which it
+`emscripten` package provides it. Note that it replaces `binaryen`, which it
 also provides, and puts `emcc` in `/usr/lib/emscripten`; the harness looks
 there as well as on `PATH`, since the packaged `profile.d` entry only reaches
 shells started afterwards.
 
 ### Coverage
 
-**99.68% of lines** — 30 of 9438, counted from `cargo llvm-cov --workspace
+**99.68% of lines**, 30 of 9438, counted from `cargo llvm-cov --workspace
 --lcov` on a checkout, with the `#[ignore]`d tiers not running:
 
 | file | lines | missed |
@@ -946,7 +937,7 @@ gap is all of it:
 - the `other =>` arms over wasmparser's `#[non_exhaustive]` enums. The compiler
   requires them; the only value that reaches one is from a proposal no
   toolchain we target emits, and which `wasm-tools` will not assemble.
-- two checks that the function and code sections agree — which the decoder
+- two checks that the function and code sections agree, which the decoder
   guarantees by three separate routes, each with a test asserting the decoder's
   message.
 
@@ -958,26 +949,26 @@ Those are kept. Deleting a defence to raise a percentage is how a decoder change
 becomes a panic two years later. The rest is ordinary uncovered code and is not
 claimed to be anything else.
 
-Measure with LCOV rather than the text report — `cargo llvm-cov --workspace
+Measure with LCOV rather than the text report. `cargo llvm-cov --workspace
 --lcov` and count `DA:` records with a zero. The per-file text view misses lines
 and reads as better than it is.
 
 ### Atomics on one thread
 
 A decompilation runs one thread, and under one thread almost every atomic does
-exactly what its plain counterpart does — there is nobody to interleave with.
+exactly what its plain counterpart does. There is nobody to interleave with.
 Three things are not "almost":
 
 - **Alignment.** An atomic access must be naturally aligned or it traps, where a
   plain one is happy anywhere. That is a real behavioural difference and it is
   in the runtime, with tests on both sides of it.
-- **`memory.atomic.notify`** wakes zero threads. Not a stub returning zero — the
+- **`memory.atomic.notify`** wakes zero threads. Not a stub returning zero, the
   correct answer when nobody else is running.
 - **`memory.atomic.wait32`/`wait64`** is exactly right in two of its three
   outcomes: the value already changed (`1`, and no waiting was needed), or the
   timeout was zero (`2`, which expires immediately whoever is running). The
   third would end only when another thread notifies, and there is no other
-  thread — so it traps, saying that. Returning "timed out" there would be
+  thread, so it traps, saying that. Returning "timed out" there would be
   inventing an event that did not happen.
 
 All 67 are compared instruction by instruction against V8 running a real shared
@@ -997,8 +988,8 @@ function invoke_vii(index, a, b) {
 }
 ```
 
-Every part of that is already in the module — the table, the stack pointer, and
-its own exported `setThrew` — so it is generated rather than left as one more
+Every part of that is already in the module, the table, the stack pointer, and
+its own exported `setThrew`, so it is generated rather than left as one more
 thing for a host to write. **`D5pLH9sfOOl`'s 227 function imports become 100.**
 
 ```rust
@@ -1042,14 +1033,14 @@ import stays the host's to implement.
   Rust across 455 files plus a 106-method host, built in 11m23s and
   instantiating 160 pages of shared memory in 1.45 seconds, with nothing
   answered by a default. Most of that host is written for you: `unwasm host`
-  answers **68 of its 103 methods** — WASI over an in-memory filesystem, the
+  answers **68 of its 103 methods**, WASI over an in-memory filesystem, the
   C++ runtime, Emscripten's runtime, the clock and `strftime`, embind's
-  registrations — and leaves 35. Twenty-two of those are WhatsApp's own
+  registrations, and leaves 35. Twenty-two of those are WhatsApp's own
   callbacks, six are the C++ catch-matching entry points this refuses to guess
   at, two are `emscripten_asm_const_*`, which runs JavaScript the module
   carries, and the rest are a browser canvas, `gethostbyname` and `longjmp`.
-  The ones that had to reach back into the instance — the pthread glue and the
-  `mmap` family — are generated rather than asked for.
+  The ones that had to reach back into the instance, the pthread glue and the
+  `mmap` family, are generated rather than asked for.
 - **Its allocator runs, and agrees with the engine.** `captured.rs` decompiles
   the 42 functions `malloc`, `free` and `memalign` reach, compiles them, and
   compares against V8 running the whole 10.2 MiB file: the pointers returned
@@ -1061,7 +1052,7 @@ import stays the host's to implement.
 
 ### Calling what a module only published by number
 
-A module built with embind exports almost nothing directly — its API is a list
+A module built with embind exports almost nothing directly. Its API is a list
 of registrations, and each one is a pair of table slots. Running it produces
 that list, and `invoke_slot` uses it:
 
@@ -1071,8 +1062,8 @@ let call = instance.host.embind.function("startVoipCall").unwrap().call().unwrap
 instance.invoke_slot(call.invoker, &[i64::from(call.context), argument]);
 ```
 
-On the VoIP module that list is **328 entries** — `initVoipStack`,
-`setHideMyIp`, `class Uint8List`, `class_function push_back` — read from the
+On the VoIP module that list is **328 entries**, `initVoipStack`,
+`setHideMyIp`, `class Uint8List`, `class_function push_back`, read from the
 module as it registers them. The static reader finds 78 of the same
 registrations without running anything, which is the subset whose arguments are
 constants sitting immediately before the call; the two can be checked against
@@ -1085,7 +1076,7 @@ answers `None` for a registration that is a type rather than something to call.
 ### Threads
 
 A module built with pthreads declares a `shared` memory, and its threads are
-instances of the same module over it — each with its own globals, its own
+instances of the same module over it, each with its own globals, its own
 `__stack_pointer` above all. That is what the output models:
 
 ```rust
@@ -1095,7 +1086,7 @@ worker.set_stack(0x20000);                       // its own, not the main one's
 std::thread::spawn(move || worker.thread_entry(arg));
 ```
 
-The memory is an `Arc<[AtomicU8]>` every instance holds a handle to — no
+The memory is an `Arc<[AtomicU8]>` every instance holds a handle to, no
 `unsafe`, and a plain wasm access on a shared memory *is* a relaxed atomic, so
 that is the faithful model rather than a conservative one. `memory.atomic.wait`
 and `notify` are real: a wait blocks until another thread notifies it, and
@@ -1124,19 +1115,19 @@ std::thread::spawn(move || {
 });
 ```
 
-Those two offsets — 48 and 52 — are the one *layout* in this: Emscripten's own
+Those two offsets, 48 and 52, are the one *layout* in this: Emscripten's own
 `C_STRUCTS.pthread.stack` and `.stack_size`, which its `establishStackSpace`
 reads. `Analysis::PTHREAD_STACK_OFFSETS` is where they are written down, so a
 build that moved them is corrected in one place rather than debugged. Leave out
 the stack and threads destroy each other's frames; leave out the exit and
-`pthread_join` never returns — both happened while this was being written.
+`pthread_join` never returns. Both happened while this was being written.
 
 A threaded module's `Imports` is `Clone + Send + 'static`, and its generated
 host keeps its state behind `Arc<Mutex<_>>`: a copy per thread would be four
 filesystems that agree about nothing.
 
 A thread needs a stack of its own, and that is the host's job: the globals are
-per instance, so `__stack_pointer` is the thread's own — but only if somebody
+per instance, so `__stack_pointer` is the thread's own, but only if somebody
 sets it. Measured on an Emscripten `-pthread` build, four threads left on the
 module's initial stack pointer destroyed each other's frames completely (the
 worst came back with **0 of its 64 fields intact**); with 64 KiB each, every
@@ -1146,30 +1137,30 @@ because "a race must happen" is not something a test can demand.
 The table is copied into each thread rather than shared, and that is not the
 divergence it looks like: this decompiler has no `table.set`, `table.grow`,
 `table.fill` or `table.copy`, and an opcode it does not model is refused by
-name rather than dropped — so a module that mutated its table would not have
+name rather than dropped, so a module that mutated its table would not have
 decompiled at all. None of the six captured modules contains one, and the VoIP
 module's table is declared `9291 9291`, which cannot grow.
 
 ## Where it goes
 
-- **Level 1 — structured.** Half in: `--level 1` turns the frame slots it can
+- **Level 1. Structured.** Half in: `--level 1` turns the frame slots it can
   place into Rust bindings, opt-in and saying so. What is still to come is the
-  other half — parameter roles read from how the code uses them, in the manner
+  other half, parameter roles read from how the code uses them, in the manner
   of `wa-wasm-oracle`'s `abi.rs`: dereferenced means pointer, and the access
   width says what it points at.
-- **Level 2 — idiomatic.** Half in as well, and it is the half that is not
+- **Level 2. Idiomatic.** Half in as well, and it is the half that is not
   speculative at all: `--level 2` names classes and their virtual methods from
   the C++ RTTI in the data segments, and the embind registrations are read
   whatever the level. Both are things the binary declares about itself. What is
-  still to come is the part that must be inferred — structs from access
+  still to come is the part that must be inferred, structs from access
   patterns, and which `call_indirect` sites a vtable slot answers.
 - **Recognising more library code.** `--signatures` names it and
   `--stub-recognised` now leaves the bodies out, so the size of the cut is
-  exactly the catalogue's recall — ~91% across builds of one toolchain and a
+  exactly the catalogue's recall, ~91% across builds of one toolchain and a
   handful across emscripten versions. The mechanism is not the limit; the
   fingerprint is.
 
 What remains in those is a guess about intent, and only worth attempting on top
-of something already known to run — which is what level 0 is for, and why it
+of something already known to run, which is what level 0 is for, and why it
 came first. What is already in was worth doing first for the opposite reason:
 a name the module wrote down costs nothing to be right about.
